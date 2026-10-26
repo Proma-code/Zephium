@@ -65,7 +65,9 @@ impl Drop for Job {
 // Drop is intentionally blocking: cancellation/panic never releases actual
 // profile/image resources while the process or stdin writer is still alive.
 struct ChildGuard<'a> {
-    process: OwnedHandle,
+    process: Option<OwnedHandle>,
+    #[cfg(feature = "native-fixtures")]
+    store: Option<super::account_store::ActiveStore>,
     job: &'a Job,
     writer: Option<std::thread::JoinHandle<bool>>,
     finished: Arc<AtomicBool>,
@@ -73,7 +75,10 @@ struct ChildGuard<'a> {
 }
 impl AsRawHandle for ChildGuard<'_> {
     fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
-        self.process.as_raw_handle()
+        self.process
+            .as_ref()
+            .expect("created child handle")
+            .as_raw_handle()
     }
 }
 impl ChildGuard<'_> {
@@ -91,16 +96,23 @@ impl ChildGuard<'_> {
         joined.unwrap_or(false)
     }
 }
-impl Drop for ChildGuard<'_> {
-    fn drop(&mut self) {
+impl ChildGuard<'_> {
+    fn settle_physical(&mut self) {
         self.finished.store(true, Ordering::Release);
-        terminate_and_reap(self.job, &self.process);
-        if let Some(probe) = &self.panic_probe {
-            probe.reaped.store(true, Ordering::Release);
+        if let Some(process) = &self.process {
+            terminate_and_reap(self.job, process);
+            if let Some(probe) = &self.panic_probe {
+                probe.reaped.store(true, Ordering::Release);
+            }
         }
         if self.writer.is_some() {
             let _ = self.join_writer();
         }
+    }
+}
+impl Drop for ChildGuard<'_> {
+    fn drop(&mut self) {
+        self.settle_physical();
     }
 }
 // Only debug synthetic qualification constructs a fault probe. No command,
@@ -177,6 +189,7 @@ fn no_inherit(value: &OwnedHandle) -> Result<(), &'static str> {
         .map_err(|_| "pipe inheritance isolation failed")
 }
 
+#[derive(Clone)]
 pub(super) struct Layout {
     pub(super) root: PathBuf,
     pub(super) work: PathBuf,
@@ -222,6 +235,8 @@ pub(super) enum Command {
 #[cfg(feature = "native-fixtures")]
 #[derive(Clone, Copy)]
 pub(super) enum Fixture {
+    StoreWrite,
+    StoreReplace,
     NetworkBaseline,
     NetworkRegistryRead,
     HandleProbe,
@@ -256,7 +271,9 @@ impl Command {
                 | Fixture::TokenLpacControl,
             ) => false,
             Self::Fixture(
-                Fixture::NetworkRegistryRead
+                Fixture::StoreWrite
+                | Fixture::StoreReplace
+                | Fixture::NetworkRegistryRead
                 | Fixture::HandleProbe
                 | Fixture::LoginInput
                 | Fixture::LoginExit
@@ -289,7 +306,9 @@ impl Command {
                 | Fixture::TokenLpacControl,
             ) => false,
             Self::Fixture(
-                Fixture::HandleProbe
+                Fixture::StoreWrite
+                | Fixture::StoreReplace
+                | Fixture::HandleProbe
                 | Fixture::LoginInput
                 | Fixture::LoginExit
                 | Fixture::VendorVersion
@@ -321,6 +340,8 @@ impl Command {
             Self::Vendor(operation) => CommandPlan::for_operation(operation).arguments(),
             #[cfg(feature = "native-fixtures")]
             Self::Fixture(mode) => match mode {
+                Fixture::StoreWrite => &["--child", "store-config-write"],
+                Fixture::StoreReplace => &["--child", "store-config-replace"],
                 Fixture::NetworkBaseline | Fixture::NetworkRegistryRead => {
                     &["--child", "network-control"]
                 }
@@ -414,6 +435,71 @@ pub(super) struct Output {
     pub(super) stderr: Vec<u8>,
     pub(super) stopped: Option<&'static str>,
 }
+struct RunResult {
+    output: Output,
+    #[cfg(feature = "native-fixtures")]
+    store: Option<super::account_store::ActiveStore>,
+}
+#[cfg(feature = "native-fixtures")]
+pub(super) struct SettledStoreCall {
+    operation: super::store_session::Operation,
+    active: super::account_store::ActiveStore,
+    output: Output,
+}
+#[cfg(feature = "native-fixtures")]
+impl SettledStoreCall {
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        super::account_store::ActiveStore,
+        Output,
+        super::store_session::Operation,
+    ) {
+        (self.active, self.output, self.operation)
+    }
+}
+/// Fixed synthetic normal-config operation, never a vendor or arbitrary command.
+#[cfg(feature = "native-fixtures")]
+pub(super) fn run_store_config(
+    active: super::account_store::ActiveStore,
+    image: &HeldImage,
+    layout: &Layout,
+    operation: super::store_session::Operation,
+) -> Result<SettledStoreCall, &'static str> {
+    let profile = active
+        .fixture_profile()
+        .map_err(|_| "active profile proof unavailable")?;
+    let mut layout = layout.clone();
+    layout.config = active
+        .config_path()
+        .map_err(|_| "active config proof unavailable")?;
+    let request = serde_json::to_vec(&serde_json::json!({"config": layout.config}))
+        .map_err(|_| "synthetic config request unavailable")?;
+    let mut result = run_owned(
+        &profile,
+        image,
+        &layout,
+        Command::Fixture(match operation {
+            super::store_session::Operation::Write => Fixture::StoreWrite,
+            super::store_session::Operation::Replace => Fixture::StoreReplace,
+        }),
+        Input::Once(zeroize::Zeroizing::new(request)),
+        Fence::Atomic(&AtomicBool::new(false)),
+        FixtureHooks {
+            store: Some(active),
+            ..FixtureHooks::default()
+        },
+    )?;
+    let active = result
+        .store
+        .take()
+        .ok_or("settled store custody unavailable")?;
+    Ok(SettledStoreCall {
+        operation,
+        active,
+        output: result.output,
+    })
+}
 /// Exclusive native resources for a single fresh-status qualification. This is
 /// not a persistent-store constructor and cannot run any other vendor operation.
 #[cfg(feature = "native-fixtures")]
@@ -454,6 +540,7 @@ impl FreshSession {
                 Fence::Admitted(control),
                 FixtureHooks::default(),
             )
+            .map(|result| result.output)
         };
         // run_owned returns only after never-created or physical settlement.
         // A panic/uncertain wait cannot mint this receipt. Its exclusive borrow
@@ -521,6 +608,7 @@ pub(super) fn run_login_fixture(
             ..FixtureHooks::default()
         },
     )
+    .map(|result| result.output)
 }
 /// Deliberately unwind only fixed synthetic child stages, and verify actual
 /// guard reap/join observations. No arbitrary panic/crash counts as success.
@@ -638,9 +726,12 @@ pub(super) fn run(
         Fence::Atomic(cancelled),
         FixtureHooks::default(),
     )
+    .map(|result| result.output)
 }
 #[derive(Default)]
 struct FixtureHooks {
+    #[cfg(feature = "native-fixtures")]
+    store: Option<super::account_store::ActiveStore>,
     events: Option<SyncSender<LoginFixtureEvent>>,
     panic: Option<Arc<PanicProbe>>,
 }
@@ -652,10 +743,12 @@ fn run_owned(
     input: Input,
     control: Fence<'_>,
     hooks: FixtureHooks,
-) -> Result<Output, &'static str> {
+) -> Result<RunResult, &'static str> {
     let FixtureHooks {
         events: fixture_events,
         panic: panic_probe,
+        #[cfg(feature = "native-fixtures")]
+        store,
     } = hooks;
     // Before creation/preparation, never after spawn.
     let started = Instant::now();
@@ -815,6 +908,15 @@ fn run_owned(
     let mut info = PROCESS_INFORMATION::default();
     // Allocate before creation, so installing the physical guard cannot allocate.
     let writer_finished = Arc::new(AtomicBool::new(false));
+    let mut pending = ChildGuard {
+        process: None,
+        job: &job,
+        writer: None,
+        finished: Arc::clone(&writer_finished),
+        panic_probe: panic_probe.clone(),
+        #[cfg(feature = "native-fixtures")]
+        store,
+    };
     // Security capability storage is live until process creation and token check.
     let create =
         |capabilities: &SECURITY_CAPABILITIES| -> Result<(ChildGuard<'_>, OwnedHandle), &'static str> {
@@ -856,10 +958,8 @@ fn run_owned(
             })?;
             let process = unsafe { OwnedHandle::from_raw_handle(info.hProcess.0) };
             let thread = unsafe { OwnedHandle::from_raw_handle(info.hThread.0) };
-            let process = ChildGuard {
-                process, job: &job, writer: None,
-                finished: Arc::clone(&writer_finished), panic_probe: panic_probe.clone(),
-            };
+            pending.process = Some(process);
+            let process = pending;
             // Attribute values must outlive the list, not only CreateProcessW.
             // This FnOnce owns the list; the physical guard is already installed
             // before its destruction or any subsequent inspection can unwind.
@@ -900,12 +1000,15 @@ fn run_owned(
         let mut code = 0;
         unsafe { GetExitCodeProcess(handle(&process), &mut code) }
             .map_err(|_| "token control exit unavailable")?;
-        return Ok(Output {
-            turn: None,
-            code: code as i32,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-            stopped: Some("suspended token control completed"),
+        return Ok(RunResult {
+            output: Output {
+                turn: None,
+                code: code as i32,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                stopped: Some("suspended token control completed"),
+            },
+            store: None,
         });
     }
     // Parent must close every child-side pipe before any join or EOF observation.
@@ -1066,12 +1169,21 @@ fn run_owned(
     } else {
         None
     };
-    Ok(Output {
-        turn,
-        code,
-        stdout: out,
-        stderr: err,
-        stopped,
+    // No retained store can leave actual guard custody while even parent output
+    // handles remain open. Reap/join is confirmed again before moving its owner.
+    drop(stdout);
+    drop(stderr);
+    process.settle_physical();
+    Ok(RunResult {
+        output: Output {
+            turn,
+            code,
+            stdout: out,
+            stderr: err,
+            stopped,
+        },
+        #[cfg(feature = "native-fixtures")]
+        store: process.store.take(),
     })
 }
 // Even failed setup retains the held image/profile/job and process custody until
@@ -1288,6 +1400,8 @@ mod research_admission_tests {
             assert!(!Command::Fixture(fixture).fixture_profile_environment());
         }
         for fixture in [
+            Fixture::StoreWrite,
+            Fixture::StoreReplace,
             Fixture::VendorVersion,
             Fixture::VendorHelp,
             Fixture::VendorLoginHelp,
@@ -1326,6 +1440,8 @@ mod research_admission_tests {
             assert!(!Command::Fixture(fixture).fixture_registry_runtime());
         }
         for fixture in [
+            Fixture::StoreWrite,
+            Fixture::StoreReplace,
             Fixture::NetworkRegistryRead,
             Fixture::VendorVersion,
             Fixture::VendorHelp,

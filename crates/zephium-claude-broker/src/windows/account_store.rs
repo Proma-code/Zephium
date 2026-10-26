@@ -205,6 +205,15 @@ impl FixtureStoreOwner {
 }
 
 impl StoreLease {
+    /// Read-only failed-operation observation; never grants cleanup authority.
+    pub(super) fn fixture_failed_dirty(&self) -> Result<(), Error> {
+        if !self.inner.quarantined.load(Ordering::Acquire)
+            || !*self.inner.active.lock().map_err(|_| Error::Quarantined)?
+        {
+            return Err(Error::Invalid);
+        }
+        self.inner.require_state(DIRTY)
+    }
     /// Exact in-process reopen only. Missing nodes and dirty state are not repaired.
     pub(super) fn reopen(
         receipt: &InProcessFixtureReceipt,
@@ -292,12 +301,73 @@ pub(super) struct WorkerSettled {
     _private: (),
 }
 
+/// Opaque lifetime extension, not an extractable Arc or new-profile authority.
+pub(super) struct FixtureProfile(Arc<Profile>);
+impl std::ops::Deref for FixtureProfile {
+    type Target = Profile;
+    fn deref(&self) -> &Profile {
+        &self.0
+    }
+}
+
 /// Independently retains every lease/ancestor even after all views/owners drop.
 pub(super) struct ActiveStore {
     inner: Arc<Inner>,
     settled: bool,
 }
 impl ActiveStore {
+    /// Same retained principal only; Profile itself cannot be cloned/adopted into
+    /// a new store. This call borrow survives movement into the native guard.
+    pub(super) fn fixture_profile(&self) -> Result<FixtureProfile, Error> {
+        self.inner.verify()?;
+        Ok(FixtureProfile(Arc::clone(&self.inner.receipt.0.profile)))
+    }
+    pub(super) fn fixture_key(&self) -> FixtureKey {
+        self.inner.receipt.0.key
+    }
+    /// Only the fixed native return carrying its OWN active operation can clean.
+    /// Neither a caller boolean nor a separate owner/token is accepted.
+    pub(super) fn finish_config_fixture(
+        call: super::process::SettledStoreCall,
+    ) -> Result<(), &'static str> {
+        use std::{io::Read, os::windows::fs::OpenOptionsExt};
+        let (active, mut output, operation) = call.into_parts();
+        let stdout = zeroize::Zeroizing::new(std::mem::take(&mut output.stdout));
+        let stderr = zeroize::Zeroizing::new(std::mem::take(&mut output.stderr));
+        if let Err(failure) =
+            super::store_session::validate(output.code, output.stopped.is_some(), &stdout, &stderr)
+        {
+            super::diagnostic("store-normal-config-failed-stage", failure.stage);
+            super::diagnostic("store-normal-config-failed-code", failure.code);
+            // Drop retains DIRTY/quarantined custody, including compatibility
+            // errors. Exit alone or partial ordinary writes never mint CLEAN.
+            return Err("normal config process contract failed");
+        }
+        let config = active
+            .config_path()
+            .map_err(|_| "normal config owner proof failed")?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .custom_flags(0x0020_0000)
+            .open(config.join("synthetic-settings.json"))
+            .map_err(|_| "normal config payload unavailable")?;
+        native::identity(&file, false).map_err(|_| "normal config payload identity rejected")?;
+        let mut bytes = Vec::new();
+        file.take(128)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "normal config payload read failed")?;
+        if bytes != operation.expected() {
+            return Err("normal config payload mismatch");
+        }
+        match std::fs::symlink_metadata(config.join(".synthetic-settings.tmp")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err("normal config temporary was not replaced"),
+        }
+        active
+            .settle(WorkerSettled { _private: () })
+            .map_err(|_| "normal config clean settlement failed")
+    }
     /// Path observation is available only under active, independently held custody.
     pub(super) fn config_path(&self) -> Result<PathBuf, Error> {
         self.inner.verify()?;

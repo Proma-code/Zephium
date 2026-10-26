@@ -9,7 +9,23 @@ mod port;
 mod process;
 mod security;
 mod signature;
+#[cfg(all(debug_assertions, feature = "native-fixtures"))]
+mod store_session;
 mod token_access;
+
+#[cfg(all(debug_assertions, feature = "native-fixtures"))]
+pub(super) fn store_config() -> Result<(), &'static str> {
+    store_session::controls()
+}
+
+#[cfg(all(debug_assertions, feature = "native-fixtures"))]
+pub(super) fn store_config_child(replace: bool) -> Result<(), &'static str> {
+    store_session::child(if replace {
+        store_session::Operation::Replace
+    } else {
+        store_session::Operation::Write
+    })
+}
 
 use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
 fn wide(value: &OsStr) -> Result<Vec<u16>, &'static str> {

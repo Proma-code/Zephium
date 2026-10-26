@@ -19,6 +19,10 @@ pub mod plan;
 #[cfg(all(test, not(windows)))]
 #[path = "windows/port.rs"]
 mod portable_port;
+#[cfg(all(test, not(windows)))]
+#[allow(dead_code)]
+#[path = "windows/store_session.rs"]
+mod portable_store_session;
 pub mod protocol;
 mod strict_json;
 #[cfg(any(test, windows))]
@@ -76,6 +80,19 @@ pub fn qualify_store_custody() -> Result<(), &'static str> {
 #[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
 pub fn qualify_store_custody_child() -> Result<(), &'static str> {
     windows::store_custody_child()
+}
+
+/// Debug-only normal configuration I/O on an exclusively fresh retained store.
+/// No real account, persisted profile adoption or vendor operation is admitted.
+#[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
+pub fn qualify_store_config() -> Result<(), &'static str> {
+    windows::store_config()
+}
+
+/// Fixed debug-only synthetic normal-config child, never a vendor operation.
+#[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
+pub fn qualify_store_config_child(replace: bool) -> Result<(), &'static str> {
+    windows::store_config_child(replace)
 }
 
 /// Debug-only actual suspended AC/LPAC token ACL controls. Neither control is

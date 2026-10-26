@@ -71,6 +71,7 @@ fn main() {
     }));
     let args: Vec<_> = std::env::args().skip(1).collect();
     let result = match args.as_slice() {
+        [mode] if mode == "store-config" => zephium_claude_broker::qualify_store_config(),
         [mode] if mode == "store-custody" => zephium_claude_broker::qualify_store_custody(),
         [flag, mode, _root, _lock, _state]
             if flag == "--child"
@@ -120,6 +121,8 @@ fn main() {
 fn child(mode: &str) -> Result<(), &'static str> {
     use std::io::{Read, Write};
     match mode {
+        "store-config-write" => zephium_claude_broker::qualify_store_config_child(false)?,
+        "store-config-replace" => zephium_claude_broker::qualify_store_config_child(true)?,
         "network-control" => zephium_claude_broker::research_network_child()?,
         "login-input" | "login-exit" => {
             std::io::stdout()
