@@ -165,6 +165,7 @@ pub(super) enum Fixture {
     VendorLoginHelp,
     VendorStatusHelp,
     VendorLogoutHelp,
+    VendorFreshStatus,
     Echo,
     Argv,
     Isolation,
@@ -195,6 +196,7 @@ impl Command {
                 | Fixture::VendorLoginHelp
                 | Fixture::VendorStatusHelp
                 | Fixture::VendorLogoutHelp
+                | Fixture::VendorFreshStatus
                 | Fixture::Echo
                 | Fixture::Argv
                 | Fixture::Isolation
@@ -226,6 +228,7 @@ impl Command {
                 | Fixture::VendorLoginHelp
                 | Fixture::VendorStatusHelp
                 | Fixture::VendorLogoutHelp
+                | Fixture::VendorFreshStatus
                 | Fixture::Echo
                 | Fixture::Argv
                 | Fixture::Isolation
@@ -263,6 +266,7 @@ impl Command {
                 Fixture::VendorLoginHelp => &["auth", "login", "--help"],
                 Fixture::VendorStatusHelp => &["auth", "status", "--help"],
                 Fixture::VendorLogoutHelp => &["auth", "logout", "--help"],
+                Fixture::VendorFreshStatus => &["auth", "status"],
                 Fixture::Echo => &["--child", "echo"],
                 Fixture::Argv => &["--child", "argv", "", "end\\", "a\"b"],
                 Fixture::Isolation => &["--child", "isolation"],
@@ -278,6 +282,8 @@ impl Command {
             Self::Vendor(operation) => CommandPlan::for_operation(operation).deadline(),
             #[cfg(feature = "native-fixtures")]
             Self::Fixture(Fixture::Stall) => Duration::from_secs(5),
+            #[cfg(feature = "native-fixtures")]
+            Self::Fixture(Fixture::VendorFreshStatus) => Duration::from_secs(10),
             #[cfg(feature = "native-fixtures")]
             Self::Fixture(_) => Duration::from_secs(15),
         }
@@ -971,6 +977,12 @@ fn inspect_identity(
 mod research_admission_tests {
     use super::*;
     #[test]
+    fn fresh_status_has_only_fixed_read_command_and_bound() {
+        let command = Command::Fixture(Fixture::VendorFreshStatus);
+        assert_eq!(command.arguments(), ["auth", "status"]);
+        assert_eq!(command.deadline(), Duration::from_secs(10));
+    }
+    #[test]
     fn auth_metadata_has_no_variant_without_help() {
         for (mode, command) in [
             (Fixture::VendorLoginHelp, "login"),
@@ -1007,6 +1019,7 @@ mod research_admission_tests {
             Fixture::VendorLoginHelp,
             Fixture::VendorStatusHelp,
             Fixture::VendorLogoutHelp,
+            Fixture::VendorFreshStatus,
             Fixture::HandleProbe,
             Fixture::LoginInput,
             Fixture::LoginExit,
@@ -1045,6 +1058,7 @@ mod research_admission_tests {
             Fixture::VendorLoginHelp,
             Fixture::VendorStatusHelp,
             Fixture::VendorLogoutHelp,
+            Fixture::VendorFreshStatus,
             Fixture::Isolation,
             Fixture::LoginInput,
             Fixture::LoginExit,

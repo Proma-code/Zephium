@@ -22,7 +22,9 @@ Portable checks are not Windows runtime evidence. The debug-only Windows
 if those pass does it download—not install—the exact original Claude 2.1.310
 Windows x64 image, verify its pinned bytes and signature, and run `--version`
 and restricted safe `--help`, then fixed `auth login/status/logout --help` metadata.
-It never performs login, status/logout or inference. Credential-free pinned
+After help succeeds and its fixture is cleaned up, it checks signed-out status
+in another exclusively fresh, empty profile. It never reads an existing account
+or performs login, logout or inference. Credential-free pinned
 version/global-help startup has passed the disposable Windows fixture; account
 behavior is still unqualified.
 No vendor binary is checked in; this is not an updater or production approval.

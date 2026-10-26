@@ -1,4 +1,4 @@
-//! Fixed synthetic tests only; never Claude executable/login/account activity.
+//! Fixed debug-only synthetic and signed-client qualification; no real credentials.
 use super::{
     process::{self, Command, Fixture, Layout},
     security::{self, HeldImage, Profile},
@@ -25,7 +25,10 @@ impl Root {
         Ok(Self(path, true))
     }
     pub(super) fn cleanup(mut self) -> Result<(), &'static str> {
-        std::fs::remove_dir_all(&self.0).map_err(|_| "private fixture cleanup failed")?;
+        std::fs::remove_dir_all(&self.0).map_err(|error| {
+            super::diagnostic("private-root-cleanup", error.raw_os_error().unwrap_or(-1));
+            "private fixture cleanup failed"
+        })?;
         self.1 = false;
         Ok(())
     }
@@ -462,7 +465,7 @@ pub(crate) fn token_controls() -> Result<(), &'static str> {
 }
 
 /// Read-only local startup of the exact signed vendor image, without an install,
-/// actual account status/login or inference. Fixed metadata argv and fresh directories.
+/// existing-account reads, login or inference. Fixed metadata and fresh-empty status.
 pub(crate) fn vendor_probe(source: &std::path::Path) -> Result<(), &'static str> {
     use super::signature;
     let original = HeldImage::open(source, signature::CANDIDATE_SHA256)?;
@@ -575,8 +578,82 @@ pub(crate) fn vendor_probe(source: &std::path::Path) -> Result<(), &'static str>
     drop(image);
     profile.close()?;
     root.cleanup()?;
+    fresh_empty_status(&original)?;
     drop(original);
-    std::io::stdout().write_all(b"pinned signed Claude 2.1.310 version and global/auth help metadata ran under LPAC; actual login/status/logout/inference NOT qualified\n").map_err(|_| "vendor receipt failed")?;
+    std::io::stdout().write_all(b"pinned signed Claude 2.1.310 version/help and fresh-empty signed-out status ran under LPAC; real account login/status/logout/inference NOT qualified\n").map_err(|_| "vendor receipt failed")?;
+    Ok(())
+}
+
+// This is not a read of an existing account. A different, exclusively new
+// AppContainer and empty private layout are provisioned after help succeeds.
+fn fresh_empty_status(original: &HeldImage) -> Result<(), &'static str> {
+    use super::signature;
+    let suffix = format!(
+        "{}.{}.FreshStatus",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "clock unavailable")?
+            .as_nanos()
+    );
+    let profile = Profile::create(&format!("Zephium.ClaudeFixture.{suffix}"))?;
+    let root = Root::create(
+        std::env::temp_dir().join(format!("Zephium.ClaudeFixture.{suffix}")),
+        &profile,
+    )?;
+    let layout = Layout::create(&root.0, &profile)?;
+    // Every credential/configuration search root supplied in the fresh process
+    // environment starts empty. No prior CLI child has run in this identity.
+    for path in [
+        &layout.config,
+        &layout.home,
+        &layout.appdata,
+        &layout.localappdata,
+        &layout.temporary,
+        &layout.work,
+    ] {
+        if std::fs::read_dir(path)
+            .map_err(|_| "fresh status empty-root proof failed")?
+            .next()
+            .is_some()
+        {
+            return Err("fresh status root was not empty; no status admitted");
+        }
+    }
+    let expected_directory = layout
+        .config
+        .to_str()
+        .ok_or("fresh status path not UTF-8")?;
+    let target = root.0.join("claude.exe");
+    profile.copy_image(&original.path, &target)?;
+    let image = HeldImage::open(&target, signature::CANDIDATE_SHA256)?;
+    signature::verify(&image)?;
+    let mut output = process::run(
+        &profile,
+        &image,
+        &layout,
+        Command::Fixture(Fixture::VendorFreshStatus),
+        Vec::new(),
+        &AtomicBool::new(false),
+    )?;
+    receipt("fresh-empty-status", &output);
+    let stdout = zeroize::Zeroizing::new(std::mem::take(&mut output.stdout));
+    let stderr = zeroize::Zeroizing::new(std::mem::take(&mut output.stderr));
+    if output.stopped.is_some() || !stderr.is_empty() {
+        return Err("fresh status did not settle cleanly");
+    }
+    if let Err(reason) = crate::fresh_status::validate(&stdout, output.code, expected_directory) {
+        super::diagnostic("fresh-status-rejected", reason as i32);
+        return Err("fresh status was not an empty signed-out receipt");
+    }
+    // Raw status/stderr is never printed or retained. Generic JSON parsing can
+    // make temporary copies; this is not a claim of full process-memory erasure.
+    drop(stdout);
+    drop(stderr);
+    drop(image);
+    profile.close()?;
+    root.cleanup()?;
+    super::diagnostic("fresh-status-signed-out", 1);
     Ok(())
 }
 

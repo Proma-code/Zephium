@@ -12,6 +12,8 @@ mod account;
 mod auth;
 pub mod custody;
 #[cfg(any(test, all(windows, feature = "native-fixtures")))]
+mod fresh_status;
+#[cfg(any(test, all(windows, feature = "native-fixtures")))]
 mod help_metadata;
 pub mod plan;
 pub mod protocol;
@@ -85,7 +87,8 @@ pub fn research_network_child() -> Result<(), &'static str> {
 }
 
 /// Debug-only startup probe of one exact hash-pinned, Authenticode-verified vendor
-/// image. Version/global/auth-command `--help` metadata only; no account operations.
+/// image. Version/help metadata and a separate fresh-empty signed-out receipt;
+/// no existing-account reads, login, logout or inference.
 #[cfg(all(windows, feature = "native-fixtures"))]
 pub fn qualify_vendor_startup(image: &std::path::Path) -> Result<(), &'static str> {
     windows::fixtures::vendor_probe(image)
