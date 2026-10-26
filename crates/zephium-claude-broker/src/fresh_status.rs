@@ -7,9 +7,15 @@ pub(crate) enum Rejected {
     Protocol = 1,
     UnexpectedFields = 2,
     UnexpectedProvider = 3,
+    PinnedMetadataMismatch = 4,
 }
 
-pub(crate) fn validate(stdout: &[u8], exit: i32, expected_directory: &str) -> Result<(), Rejected> {
+pub(crate) fn validate(
+    stdout: &[u8],
+    exit: i32,
+    expected_directory: &str,
+    expected_projects: &str,
+) -> Result<(), Rejected> {
     if protocol::parse_status(stdout, exit, expected_directory)
         != Ok(protocol::AuthStatus::SignedOut)
     {
@@ -23,7 +29,12 @@ pub(crate) fn validate(stdout: &[u8], exit: i32, expected_directory: &str) -> Re
     if object.keys().any(|key| {
         !matches!(
             key.as_str(),
-            "loggedIn" | "authMethod" | "configDirectory" | "apiProvider"
+            "loggedIn"
+                | "authMethod"
+                | "configDirectory"
+                | "apiProvider"
+                | "analyticsDisabled"
+                | "projectsDirectory"
         )
     }) {
         return Err(Rejected::UnexpectedFields);
@@ -33,6 +44,20 @@ pub(crate) fn validate(stdout: &[u8], exit: i32, expected_directory: &str) -> Re
         .is_some_and(|value| !value.is_null() && value.as_str() != Some("firstParty"))
     {
         return Err(Rejected::UnexpectedProvider);
+    }
+    // Observed in the pinned 2.1.310 fresh-empty receipt. This literal telemetry
+    // metadata is not, by itself, a guarantee about effective network traffic.
+    if object
+        .get("analyticsDisabled")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+        || expected_projects.is_empty()
+        || object
+            .get("projectsDirectory")
+            .and_then(serde_json::Value::as_str)
+            != Some(expected_projects)
+    {
+        return Err(Rejected::PinnedMetadataMismatch);
     }
     Ok(())
 }
@@ -93,8 +118,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn check(stdout: &[u8], exit: i32, directory: &str) -> Result<(), Rejected> {
+        validate(stdout, exit, directory, &format!("{directory}/projects"))
+    }
     fn signed_out() -> serde_json::Value {
-        json!({"loggedIn":false,"authMethod":"none","configDirectory":"synthetic-owned"})
+        json!({"loggedIn":false,"authMethod":"none","configDirectory":"synthetic-owned","analyticsDisabled":true,"projectsDirectory":"synthetic-owned/projects"})
     }
     #[test]
     fn shape_reports_only_fixed_booleans_counts_and_never_relaxes_validation() {
@@ -111,10 +139,7 @@ mod tests {
                 identity_fields: 0
             })
         );
-        assert_eq!(
-            validate(&bytes, 1, "synthetic-owned"),
-            Err(Rejected::UnexpectedFields)
-        );
+        assert_eq!(check(&bytes, 1, "synthetic-owned"), Ok(()));
         assert_eq!(
             shape(&bytes, "other-profile/projects").unwrap().known_extra,
             31
@@ -129,10 +154,62 @@ mod tests {
         assert_eq!(facts.extra_keys, 4);
         assert_eq!(facts.extra_nulls, 1);
         assert_eq!(facts.identity_fields, 1);
+        assert_eq!(
+            check(&serde_json::to_vec(&value).unwrap(), 1, "synthetic-owned"),
+            Err(Rejected::UnexpectedFields)
+        );
         assert!(!format!("{facts:?}").contains("synthetic"));
         assert_eq!(
             shape(&vec![b' '; protocol::MAX_STATUS_BYTES + 1], "synthetic"),
             None
+        );
+    }
+    #[test]
+    fn pinned_metadata_requires_exact_literal_and_native_projects_path() {
+        for field in ["analyticsDisabled", "projectsDirectory"] {
+            let mut value = signed_out();
+            value.as_object_mut().unwrap().remove(field);
+            assert_eq!(
+                check(&serde_json::to_vec(&value).unwrap(), 1, "synthetic-owned"),
+                Err(Rejected::PinnedMetadataMismatch)
+            );
+        }
+        for analytics in [
+            json!(false),
+            json!("true"),
+            json!(1),
+            serde_json::Value::Null,
+        ] {
+            let mut value = signed_out();
+            value["analyticsDisabled"] = analytics;
+            assert_eq!(
+                check(&serde_json::to_vec(&value).unwrap(), 1, "synthetic-owned"),
+                Err(Rejected::PinnedMetadataMismatch)
+            );
+        }
+        for path in [
+            json!("other-profile/projects"),
+            json!("synthetic-owned/projects/"),
+            json!("synthetic-owned/./projects"),
+            json!("SYNTHETIC-owned/projects"),
+            json!(true),
+            serde_json::Value::Null,
+        ] {
+            let mut value = signed_out();
+            value["projectsDirectory"] = path;
+            assert_eq!(
+                check(&serde_json::to_vec(&value).unwrap(), 1, "synthetic-owned"),
+                Err(Rejected::PinnedMetadataMismatch)
+            );
+        }
+        let bytes = serde_json::to_vec(&signed_out()).unwrap();
+        assert_eq!(
+            validate(&bytes, 1, "synthetic-owned", ""),
+            Err(Rejected::PinnedMetadataMismatch)
+        );
+        assert_eq!(
+            validate(&bytes, 1, "synthetic-owned", "other-profile/projects"),
+            Err(Rejected::PinnedMetadataMismatch)
         );
     }
     #[test]
@@ -147,15 +224,9 @@ mod tests {
                 value["apiProvider"] = provider;
             }
             let bytes = serde_json::to_vec(&value).unwrap();
-            assert_eq!(validate(&bytes, 1, "synthetic-owned"), Ok(()));
-            assert_eq!(
-                validate(&bytes, 0, "synthetic-owned"),
-                Err(Rejected::Protocol)
-            );
-            assert_eq!(
-                validate(&bytes, 1, "other-profile"),
-                Err(Rejected::Protocol)
-            );
+            assert_eq!(check(&bytes, 1, "synthetic-owned"), Ok(()));
+            assert_eq!(check(&bytes, 0, "synthetic-owned"), Err(Rejected::Protocol));
+            assert_eq!(check(&bytes, 1, "other-profile"), Err(Rejected::Protocol));
         }
     }
     #[test]
@@ -178,7 +249,7 @@ mod tests {
                 let mut value = signed_out();
                 value[key] = extra;
                 assert_eq!(
-                    validate(&serde_json::to_vec(&value).unwrap(), 1, "synthetic-owned"),
+                    check(&serde_json::to_vec(&value).unwrap(), 1, "synthetic-owned"),
                     Err(Rejected::UnexpectedFields)
                 );
             }
@@ -190,7 +261,7 @@ mod tests {
             let mut value = signed_out();
             value["apiProvider"] = provider;
             assert_eq!(
-                validate(&serde_json::to_vec(&value).unwrap(), 1, "synthetic-owned"),
+                check(&serde_json::to_vec(&value).unwrap(), 1, "synthetic-owned"),
                 Err(Rejected::UnexpectedProvider)
             );
         }
@@ -205,7 +276,7 @@ mod tests {
             value["loggedIn"] = json!(true);
             value["authMethod"] = json!(method);
             assert_eq!(
-                validate(&serde_json::to_vec(&value).unwrap(), 0, "synthetic-owned"),
+                check(&serde_json::to_vec(&value).unwrap(), 0, "synthetic-owned"),
                 Err(Rejected::Protocol)
             );
         }
@@ -219,13 +290,10 @@ mod tests {
             b"{} {}",
             &[255],
         ] {
-            assert_eq!(
-                validate(bytes, 1, "synthetic-owned"),
-                Err(Rejected::Protocol)
-            );
+            assert_eq!(check(bytes, 1, "synthetic-owned"), Err(Rejected::Protocol));
         }
         assert_eq!(
-            validate(
+            check(
                 &vec![b' '; protocol::MAX_STATUS_BYTES + 1],
                 1,
                 "synthetic-owned"

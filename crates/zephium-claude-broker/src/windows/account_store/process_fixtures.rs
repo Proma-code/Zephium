@@ -6,8 +6,12 @@ use super::super::security::{self, HeldImage};
 use super::*;
 use std::{
     ffi::OsString,
+    fs::OpenOptions,
     mem::{size_of, size_of_val},
-    os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle},
+    os::windows::{
+        fs::{MetadataExt, OpenOptionsExt},
+        io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle},
+    },
     time::{Duration, Instant},
 };
 use windows::{
@@ -18,6 +22,7 @@ use windows::{
             HANDLE_FLAG_INHERIT, WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         Security::SECURITY_ATTRIBUTES,
+        Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION},
         System::{
             JobObjects::{
                 CreateJobObjectW, JobObjectBasicAccountingInformation,
@@ -148,14 +153,43 @@ fn request(arguments: &[OsString]) -> Result<(Mode, Bindings), &'static str> {
     ))
 }
 
+fn copy_source_shape(file: bool, attributes: u32, bytes: u64, links: u32) -> bool {
+    file && attributes & 0x400 == 0 && bytes <= 512 * 1024 * 1024 && links > 0
+}
+
 fn fresh() -> Result<(FixtureStoreOwner, StoreLease, HeldImage), &'static str> {
     let path = std::env::current_exe().map_err(|_| "store fixture image unavailable")?;
     if path.file_name() != Some(std::ffi::OsStr::new("claude-broker-fixture.exe")) {
         return Err("store fixture image identity invalid");
     }
-    let expected =
-        security::hash(&mut File::open(&path).map_err(|_| "store fixture image unavailable")?)?;
-    let image = HeldImage::open(&path, expected)?;
+    // Cargo may hardlink its public bin to the deps output. This source is only
+    // our own fixed helper, held read-only through a fresh CREATE_NEW copy. It is
+    // never admitted directly as the child image or as a vendor executable.
+    let mut source = OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .custom_flags(0x0020_0000)
+        .open(&path)
+        .map_err(|_| "store fixture source hold failed")?;
+    let metadata = source
+        .metadata()
+        .map_err(|_| "store fixture source metadata failed")?;
+    let mut identity = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle(&source), &mut identity) }
+        .map_err(|_| "store fixture source link query failed")?;
+    super::super::diagnostic(
+        "store-source-link-count",
+        i32::try_from(identity.nNumberOfLinks).unwrap_or(i32::MAX),
+    );
+    if !copy_source_shape(
+        metadata.is_file(),
+        metadata.file_attributes(),
+        metadata.len(),
+        identity.nNumberOfLinks,
+    ) {
+        return Err("store fixture source shape rejected");
+    }
+    let expected = security::hash(&mut source)?;
     let suffix = native::fresh_name().map_err(|_| "store fixture nonce unavailable")?;
     let suffix = suffix
         .strip_prefix("Zephium.ClaudeStoreFixture.")
@@ -163,6 +197,21 @@ fn fresh() -> Result<(FixtureStoreOwner, StoreLease, HeldImage), &'static str> {
     let profile = Profile::create(&format!("Zephium.ClaudeFixture.{suffix}"))?;
     let (owner, lease) =
         FixtureStoreOwner::create(profile, KEY).map_err(|_| "store fixture creation failed")?;
+    let root = &lease
+        .inner
+        .chain
+        .last()
+        .ok_or("store fixture root unavailable")?
+        .file;
+    let target = native::canonical_parent(root)
+        .map_err(|_| "store fixture image directory proof failed")?
+        .join("store-fixture.exe");
+    lease.inner.receipt.0.profile.copy_image(&path, &target)?;
+    // The child still requires the unchanged strict single-link/ancestor/hash
+    // admission. Copying never grants an exception to HeldImage::open.
+    let image = HeldImage::open(&target, expected)?;
+    super::super::diagnostic("store-private-image-verified", 0);
+    drop(source);
     Ok((owner, lease, image))
 }
 
@@ -727,6 +776,15 @@ fn run_child(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_fixed_source_copy_can_have_cargo_aliases() {
+        assert!(copy_source_shape(true, 0x20, 1024, 1));
+        assert!(copy_source_shape(true, 0x20, 1024, 2));
+        assert!(!copy_source_shape(false, 0x10, 1024, 1));
+        assert!(!copy_source_shape(true, 0x400, 1024, 1));
+        assert!(!copy_source_shape(true, 0x20, 512 * 1024 * 1024 + 1, 1));
+        assert!(!copy_source_shape(true, 0x20, 1024, 0));
+    }
     #[test]
     fn deadline_boundary_never_becomes_a_success_after_settlement() {
         let limit = Duration::from_millis(250);

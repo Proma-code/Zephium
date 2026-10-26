@@ -642,13 +642,15 @@ fn fresh_empty_status(original: &HeldImage) -> Result<(), &'static str> {
     if output.stopped.is_some() || !stderr.is_empty() {
         return Err("fresh status did not settle cleanly");
     }
-    if let Err(reason) = crate::fresh_status::validate(&stdout, output.code, expected_directory) {
+    let projects = layout.config.join("projects");
+    let expected_projects = projects
+        .to_str()
+        .ok_or("fresh status projects path not UTF-8")?;
+    if let Err(reason) =
+        crate::fresh_status::validate(&stdout, output.code, expected_directory, expected_projects)
+    {
         super::diagnostic("fresh-status-rejected", reason as i32);
-        let projects = layout.config.join("projects");
-        if let Some(facts) = projects
-            .to_str()
-            .and_then(|expected| crate::fresh_status::shape(&stdout, expected))
-        {
+        if let Some(facts) = crate::fresh_status::shape(&stdout, expected_projects) {
             super::diagnostic("fresh-status-extra-keys", facts.extra_keys);
             super::diagnostic("fresh-status-extra-nulls", facts.extra_nulls);
             super::diagnostic("fresh-status-known-extra-shape", facts.known_extra);
