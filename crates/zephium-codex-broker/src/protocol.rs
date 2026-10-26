@@ -147,3 +147,153 @@ mod tests {
         }
     }
 }
+
+/// Only the pinned server's mandatory post-initialize notification is admitted.
+/// Source: app-server/src/lib.rs:1264-1288 and protocol/common.rs:2103-2113.
+/// This is a phase transition, not a generic notification skip path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum StartupFault {
+    Envelope = 1,
+    ConfigWarning = 2,
+    OtherNotification = 3,
+    ServerRequest = 4,
+    ReplyInstead = 5,
+    RemoteNotDisabled = 6,
+    MetadataShape = 7,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct StartupNotification {
+    method: String,
+    params: RemoteStatus,
+    emitted_at_ms: i64,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RemoteStatus {
+    status: String,
+    server_name: String,
+    installation_id: String,
+    // Value (not Option) keeps omission distinct from an explicit null.
+    environment_id: Value,
+}
+pub(crate) fn accept_startup_status(bytes: &[u8]) -> Result<(), StartupFault> {
+    if bytes.is_empty() || bytes.len() > MAX_REPLY_BYTES {
+        return Err(StartupFault::Envelope);
+    }
+    // This first parse only assigns closed failure categories. Successful
+    // admission uses deny_unknown_fields structs, including duplicate-key checks.
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| StartupFault::Envelope)?;
+    let object = value.as_object().ok_or(StartupFault::Envelope)?;
+    if object.contains_key("id") {
+        return Err(if object.contains_key("method") {
+            StartupFault::ServerRequest
+        } else {
+            StartupFault::ReplyInstead
+        });
+    }
+    match object.get("method").and_then(Value::as_str) {
+        Some("remoteControl/status/changed") => {}
+        Some("configWarning") => return Err(StartupFault::ConfigWarning),
+        Some(_) => return Err(StartupFault::OtherNotification),
+        None => return Err(StartupFault::Envelope),
+    }
+    let notification: StartupNotification =
+        serde_json::from_slice(bytes).map_err(|_| StartupFault::Envelope)?;
+    if notification.method != "remoteControl/status/changed" {
+        return Err(StartupFault::OtherNotification);
+    }
+    if notification.params.status != "disabled" || !notification.params.environment_id.is_null() {
+        return Err(StartupFault::RemoteNotDisabled);
+    }
+    if notification.emitted_at_ms <= 0
+        || [
+            &notification.params.server_name,
+            &notification.params.installation_id,
+        ]
+        .iter()
+        .any(|s| s.is_empty() || s.len() > 1024 || s.chars().any(char::is_control))
+    {
+        return Err(StartupFault::MetadataShape);
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    fn good() -> Value {
+        json!({"method":"remoteControl/status/changed","emittedAtMs":1,"params":{"status":"disabled","serverName":"synthetic-host","installationId":"synthetic-installation","environmentId":null}})
+    }
+    fn accept(value: &Value) -> Result<(), StartupFault> {
+        accept_startup_status(&serde_json::to_vec(value).unwrap())
+    }
+    #[test]
+    fn exact_disabled_initial_status_is_a_separate_phase() {
+        let status = serde_json::to_vec(&good()).unwrap();
+        assert_eq!(accept_startup_status(&status), Ok(()));
+        // Duplicated/late startup status is not an account or config reply.
+        assert_eq!(reply(&status, 2), Err(Fault::Envelope));
+        assert_eq!(reply(&status, 3), Err(Fault::Envelope));
+        assert_eq!(
+            accept_startup_status(br#"{"id":2,"result":{}}"#),
+            Err(StartupFault::ReplyInstead)
+        );
+    }
+    #[test]
+    fn warnings_other_methods_and_server_requests_never_advance() {
+        assert_eq!(
+            accept(&json!({"method":"configWarning","params":{}})),
+            Err(StartupFault::ConfigWarning)
+        );
+        assert_eq!(
+            accept(&json!({"method":"account/updated","params":{}})),
+            Err(StartupFault::OtherNotification)
+        );
+        let mut request = good();
+        request["id"] = json!(7);
+        assert_eq!(accept(&request), Err(StartupFault::ServerRequest));
+        let mut wrong = good();
+        wrong["method"] = json!(true);
+        assert_eq!(accept(&wrong), Err(StartupFault::Envelope));
+    }
+    #[test]
+    fn active_remote_or_missing_null_environment_is_refused() {
+        for status in ["connecting", "connected", "errored", "unknown"] {
+            let mut value = good();
+            value["params"]["status"] = json!(status);
+            assert_eq!(accept(&value), Err(StartupFault::RemoteNotDisabled));
+        }
+        let mut value = good();
+        value["params"]["environmentId"] = json!("synthetic");
+        assert_eq!(accept(&value), Err(StartupFault::RemoteNotDisabled));
+        value["params"]
+            .as_object_mut()
+            .unwrap()
+            .remove("environmentId");
+        assert_eq!(accept(&value), Err(StartupFault::Envelope));
+    }
+    #[test]
+    fn timestamp_identity_bounds_and_unknown_fields_are_checked() {
+        for timestamp in [json!(0), json!(-1), json!("1"), Value::Null] {
+            let mut value = good();
+            value["emittedAtMs"] = timestamp;
+            assert!(accept(&value).is_err());
+        }
+        for identity in [json!(""), json!("x\n"), json!("x".repeat(1025)), json!(0)] {
+            let mut value = good();
+            value["params"]["installationId"] = identity;
+            assert!(accept(&value).is_err());
+        }
+        let mut value = good();
+        value["params"]["extra"] = Value::Null;
+        assert_eq!(accept(&value), Err(StartupFault::Envelope));
+        let mut value = good();
+        value["extra"] = Value::Null;
+        assert_eq!(accept(&value), Err(StartupFault::Envelope));
+    }
+    #[test]
+    fn duplicate_envelope_or_status_keys_cannot_hide_activation() {
+        for bytes in [br#"{"method":"remoteControl/status/changed","method":"remoteControl/status/changed","emittedAtMs":1,"params":{"status":"disabled","serverName":"s","installationId":"i","environmentId":null}}"#.as_slice(),br#"{"method":"remoteControl/status/changed","emittedAtMs":1,"params":{"status":"connected","status":"disabled","serverName":"s","installationId":"i","environmentId":null}}"#] { assert_eq!(accept_startup_status(bytes),Err(StartupFault::Envelope)); }
+    }
+}

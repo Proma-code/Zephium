@@ -44,6 +44,19 @@ fn run(image: Arc<PinnedImage>, runtime: Arc<RuntimePaths>) -> Result<(), &'stat
     session
         .send_frame(&protocol::initialized(), deadline, &cancel)
         .map_err(|_| "initialized-send")?;
+    // The exact original server always queues this after its initialize reply.
+    // Receive exactly once before sending any account request; never skip unknown
+    // messages or extend the absolute RPC deadline.
+    let mut startup = session
+        .recv_frame(deadline, &cancel)
+        .map_err(|_| "startup-receive")?;
+    let accepted = protocol::accept_startup_status(&startup);
+    startup.fill(0);
+    if let Err(category) = accepted {
+        println!("codex-startup-fault={}", category as u8);
+        return Err("startup-notification");
+    }
+    println!("codex-stage=remote-disabled; code=0");
     let account = exchange(&mut session, protocol::account(), 2, deadline, &cancel)?;
     protocol::accept_account(&account).map_err(|_| "unexpected-account")?;
     println!("codex-stage=signed-out; code=0");

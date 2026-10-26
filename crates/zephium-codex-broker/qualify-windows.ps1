@@ -74,7 +74,7 @@ foreach ($pin in $pins) {
     $code=$LASTEXITCODE
     $output | Write-Output
     if ($code -ne 0) { throw "Fixed $($pin.Kind) qualification failed." }
-    foreach ($marker in @('image-verified','owned-process','initialized','signed-out','owned-config','requirements-empty','exit-zero-job-empty','runtime-cleaned','cancelled-reaped-cleaned')) {
+    foreach ($marker in @('image-verified','owned-process','initialized','remote-disabled','signed-out','owned-config','requirements-empty','exit-zero-job-empty','runtime-cleaned','cancelled-reaped-cleaned')) {
         if (@($output | Where-Object { $_ -ceq "codex-stage=$marker; code=0" }).Count -ne 1) { throw 'Required fixed qualification receipt missing or repeated.' }
     }
     Write-Output "codex-original-kind=$($pin.Kind); qualification=passed"
