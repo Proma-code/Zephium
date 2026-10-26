@@ -229,6 +229,30 @@ pub(crate) fn qualify() -> Result<(), &'static str> {
             super::diagnostic("synthetic-panic-process-runtime", 101)
         }
         b"fixture-panic=unclassified\n" => super::diagnostic("synthetic-panic-unclassified", 101),
+        b"claude-broker-fixture: private HOME path mismatch\n" => {
+            super::diagnostic("synthetic-home-path-mismatch", 1)
+        }
+        b"claude-broker-fixture: private USERPROFILE path mismatch\n" => {
+            super::diagnostic("synthetic-userprofile-path-mismatch", 1)
+        }
+        b"claude-broker-fixture: private APPDATA path mismatch\n" => {
+            super::diagnostic("synthetic-appdata-path-mismatch", 1)
+        }
+        b"claude-broker-fixture: private LOCALAPPDATA path mismatch\n" => {
+            super::diagnostic("synthetic-localappdata-path-mismatch", 1)
+        }
+        b"claude-broker-fixture: private work directory mismatch\n" => {
+            super::diagnostic("synthetic-work-path-mismatch", 1)
+        }
+        b"claude-broker-fixture: private work directory unavailable\n" => {
+            super::diagnostic("synthetic-work-path-unavailable", 1)
+        }
+        b"claude-broker-fixture: private config not writable\n" => {
+            super::diagnostic("synthetic-config-write-failed", 1)
+        }
+        b"claude-broker-fixture: empty work directory was writable\n" => {
+            super::diagnostic("synthetic-work-write-succeeded", 1)
+        }
         _ => {}
     }
     if output.code != 0

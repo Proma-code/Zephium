@@ -330,7 +330,13 @@ fn child(mode: &str) -> Result<(), &'static str> {
             ] {
                 let value = std::env::var_os(variable).ok_or("private environment path missing")?;
                 if std::path::Path::new(&value) != std::path::Path::new(path(field)?) {
-                    return Err("private environment path mismatch");
+                    return Err(match variable {
+                        "HOME" => "private HOME path mismatch",
+                        "USERPROFILE" => "private USERPROFILE path mismatch",
+                        "APPDATA" => "private APPDATA path mismatch",
+                        "LOCALAPPDATA" => "private LOCALAPPDATA path mismatch",
+                        _ => "private environment path mismatch",
+                    });
                 }
             }
             if std::env::current_dir().map_err(|_| "private work directory unavailable")?
