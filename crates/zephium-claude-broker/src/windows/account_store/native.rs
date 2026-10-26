@@ -56,7 +56,13 @@ const ALL: u32 = 0x001f_01ff;
 // Compile-time safety contract: package data authority must never include
 // security administration, root deletion or delete-child authority.
 const PACKAGE_DIRECTORY_DATA: u32 = READ | WRITE | 0x20; // Directory traverse, not deletion.
-const PACKAGE_FILE_DATA: u32 = READ | WRITE; // No execute or atomic-replace DELETE yet.
+                                                         // No execute or atomic-replace DELETE in the ordinary data policy.
+const PACKAGE_FILE_DATA: u32 = READ | WRITE;
+// Explicit fresh-only differential. This is not the default data policy.
+const PACKAGE_FILE_REPLACE: u32 = PACKAGE_FILE_DATA | 0x0001_0000;
+const _: () = assert!(PACKAGE_FILE_REPLACE == 0x0013_019f);
+const _: () = assert!(PACKAGE_FILE_REPLACE ^ PACKAGE_FILE_DATA == 0x0001_0000);
+const _: () = assert!(PACKAGE_FILE_REPLACE & 0x000c_0060 == 0);
 const OWNER_READ_CONTROL: u32 = 0x0002_0000;
 const _: () = assert!(PACKAGE_DIRECTORY_DATA & 0x000d_0040 == 0);
 const _: () = assert!(PACKAGE_FILE_DATA & 0x000d_0060 == 0);
@@ -206,12 +212,19 @@ impl Policy {
             READ_EXECUTE
         };
         let file = if writable { PACKAGE_FILE_DATA } else { READ };
+        Self::directory_masks(owner, package, directory, file)
+    }
+    /// Only newly created synthetic candidate stores use this file-only delta.
+    pub(super) fn replace_directory(owner: &str, package: &str) -> Self {
+        Self::directory_masks(owner, package, PACKAGE_DIRECTORY_DATA, PACKAGE_FILE_REPLACE)
+    }
+    fn directory_masks(owner: &str, package: &str, directory: u32, file: u32) -> Self {
         // OWNER RIGHTS suppresses owner-implicit READ_CONTROL/WRITE_DAC. Only
         // explicit broker user/SYSTEM entries retain ACL administration. Actual
         // LPAC user/package-intersection denial still needs native qualification.
         // Separate file inheritance avoids granting FILE_EXECUTE via the same
-        // bit used for directory traverse. No package DELETE/DELETE_CHILD grant
-        // is assumed necessary before official-client compatibility is measured.
+        // bit used for directory traverse. The explicit replacement fixture adds
+        // DELETE to OIIO payload files only, never to directories or defaults.
         Self { sddl: format!("O:{owner}D:P(A;OICI;0x{ALL:08x};;;{owner})(A;OICI;0x{ALL:08x};;;SY)(A;OICI;0x{OWNER_READ_CONTROL:08x};;;OW)(A;CI;0x{directory:08x};;;{package})(A;OIIO;0x{file:08x};;;{package})S:(ML;OICI;NW;;;LW)") }
     }
     pub(super) fn broker_file(owner: &str) -> Self {
@@ -262,6 +275,21 @@ impl Policy {
         Ok(actual)
     }
 }
+#[cfg(test)]
+#[test]
+fn replacement_fixture_changes_only_file_inherit_delete_bit() {
+    let baseline = Policy::directory("S-1-5-21-1", "S-1-15-2-1", true);
+    let candidate = Policy::replace_directory("S-1-5-21-1", "S-1-15-2-1");
+    let old = "(A;OIIO;0x0012019f;;;S-1-15-2-1)";
+    let new = "(A;OIIO;0x0013019f;;;S-1-15-2-1)";
+    assert_eq!(baseline.sddl.matches(old).count(), 1);
+    assert_eq!(baseline.sddl.replace(old, new), candidate.sddl);
+    assert!(candidate.sddl.contains("(A;CI;0x001201bf;;;S-1-15-2-1)"));
+    assert!(!Policy::directory("S-1-5-21-1", "S-1-15-2-1", false)
+        .sddl
+        .contains(new));
+}
+
 // Closed mismatch categories: count, ACE kind, flags, mask, or SID. Never
 // serialize either descriptor or its identities into qualification diagnostics.
 fn acl_difference(actual: &[Ace], expected: &[Ace]) -> i32 {

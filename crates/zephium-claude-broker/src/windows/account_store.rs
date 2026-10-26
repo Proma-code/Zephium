@@ -52,10 +52,25 @@ pub(super) struct FixtureKey {
     pub(super) incarnation: u128,
 }
 
+#[derive(Clone, Copy)]
+enum FixturePayload {
+    Data,
+    Replace,
+}
+impl FixturePayload {
+    fn policy(self, owner: &str, package: &str) -> Policy {
+        match self {
+            Self::Data => Policy::directory(owner, package, true),
+            Self::Replace => Policy::replace_directory(owner, package),
+        }
+    }
+}
+
 struct Receipt {
     parent: PathBuf,
     root_name: String,
     key: FixtureKey,
+    payload: FixturePayload,
     chain: Vec<native::DirectoryReceipt>,
     config: Identity,
     lock: Identity,
@@ -109,6 +124,21 @@ impl FixtureStoreOwner {
     /// Creates exactly one new random synthetic child of the held temp chain.
     /// No retry/adoption/fallback follows a collision or ambiguous publication.
     pub(super) fn create(profile: Profile, key: FixtureKey) -> Result<(Self, StoreLease), Error> {
+        Self::create_with_payload(profile, key, FixturePayload::Data)
+    }
+    /// Fresh synthetic comparison only. No existing store or ordinary caller is
+    /// upgraded; the immutable in-process receipt binds this exact policy.
+    pub(super) fn create_replace_fixture(
+        profile: Profile,
+        key: FixtureKey,
+    ) -> Result<(Self, StoreLease), Error> {
+        Self::create_with_payload(profile, key, FixturePayload::Replace)
+    }
+    fn create_with_payload(
+        profile: Profile,
+        key: FixtureKey,
+        payload: FixturePayload,
+    ) -> Result<(Self, StoreLease), Error> {
         // Consume the non-Clone fresh Profile. Two fixture keys cannot share a
         // package principal by passing the same Arc into separate store roots.
         let profile = Arc::new(profile);
@@ -163,11 +193,7 @@ impl FixtureStoreOwner {
         )?;
         let config = stage(
             "store-create-config",
-            native::create_directory(
-                root,
-                CONFIG,
-                &Policy::directory(&owner_sid, &package_sid, true),
-            ),
+            native::create_directory(root, CONFIG, &payload.policy(&owner_sid, &package_sid)),
         )?;
         stage(
             "store-create-config-parent-sync",
@@ -177,6 +203,7 @@ impl FixtureStoreOwner {
             parent,
             root_name,
             key,
+            payload,
             chain: chain.iter().map(HeldDirectory::receipt).collect(),
             config: config.identity,
             lock: native::identity(&lock, false)?,
@@ -254,7 +281,9 @@ impl StoreLease {
         let config = native::open_directory(
             parent,
             CONFIG,
-            &Policy::directory(&expected.owner_sid, &expected.package_sid, true),
+            &expected
+                .payload
+                .policy(&expected.owner_sid, &expected.package_sid),
         )?;
         let inner = Arc::new(Inner {
             receipt: receipt.clone(),
@@ -422,7 +451,9 @@ impl Inner {
             parent,
             CONFIG,
             &self.config,
-            &Policy::directory(&receipt.owner_sid, &receipt.package_sid, true),
+            &receipt
+                .payload
+                .policy(&receipt.owner_sid, &receipt.package_sid),
         )?;
         if self.config.identity != receipt.config {
             return Err(Error::Invalid);

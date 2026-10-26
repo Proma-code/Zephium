@@ -448,6 +448,15 @@ pub(super) struct SettledStoreCall {
 }
 #[cfg(feature = "native-fixtures")]
 impl SettledStoreCall {
+    /// Observation only: cannot detach the active store or grant CLEAN.
+    pub(super) fn fixture_result(&self) -> Result<(), super::store_session::Failure> {
+        super::store_session::validate(
+            self.output.code,
+            self.output.stopped.is_some(),
+            &self.output.stdout,
+            &self.output.stderr,
+        )
+    }
     pub(super) fn into_parts(
         self,
     ) -> (
@@ -465,6 +474,7 @@ pub(super) fn run_store_config(
     image: &HeldImage,
     layout: &Layout,
     operation: super::store_session::Operation,
+    foreign: &super::store_session::ForeignSentinel,
 ) -> Result<SettledStoreCall, &'static str> {
     let profile = active
         .fixture_profile()
@@ -473,8 +483,12 @@ pub(super) fn run_store_config(
     layout.config = active
         .config_path()
         .map_err(|_| "active config proof unavailable")?;
-    let request = serde_json::to_vec(&serde_json::json!({"config": layout.config}))
-        .map_err(|_| "synthetic config request unavailable")?;
+    foreign.verify()?;
+    let request = serde_json::to_vec(&serde_json::json!({
+        "config": layout.config,
+        "foreign": foreign.path(),
+    }))
+    .map_err(|_| "synthetic config request unavailable")?;
     let mut result = run_owned(
         &profile,
         image,
