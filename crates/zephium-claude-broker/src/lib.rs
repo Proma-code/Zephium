@@ -58,6 +58,20 @@ pub fn qualify_synthetic_fixture() -> Result<(), &'static str> {
     windows::fixtures::qualify()
 }
 
+/// Debug-only fresh cooperating-process lock and dirty-state qualification.
+/// No vendor, account, persistent receipt or caller-selected path is admitted.
+#[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
+pub fn qualify_store_custody() -> Result<(), &'static str> {
+    windows::store_custody()
+}
+
+/// Fixed child of the debug-only cooperating-process store qualification.
+/// Its complete finite arguments and inherited handle are checked natively.
+#[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
+pub fn qualify_store_custody_child() -> Result<(), &'static str> {
+    windows::store_custody_child()
+}
+
 /// Debug-only actual suspended AC/LPAC token ACL controls. Neither control is
 /// resumed; these measurements do not enable vendor or production execution.
 #[cfg(all(windows, feature = "native-fixtures"))]

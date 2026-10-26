@@ -104,6 +104,32 @@ impl HeldDirectory {
 pub(super) struct Policy {
     sddl: String,
 }
+
+/// Fixed synthetic handle handoff only, never a persisted receipt or path import.
+/// Bind the same identity and security tuple used by ordinary store verification.
+pub(super) fn fixture_binding(file: &File, directory: bool) -> Result<([u8; 32], String), Error> {
+    use sha2::{Digest, Sha256};
+    let identity = identity(file, directory)?;
+    let security = snapshot(file)?;
+    let mut hash = Sha256::new();
+    hash.update(b"Zephium.ClaudeStoreFixture.Handle.v1");
+    hash.update([u8::from(directory)]);
+    hash.update(identity.volume.to_le_bytes());
+    hash.update(identity.file);
+    hash.update((security.owner.len() as u64).to_le_bytes());
+    hash.update(security.owner.as_bytes());
+    hash.update(security.control.to_le_bytes());
+    for entries in [&security.dacl, &security.labels] {
+        hash.update((entries.len() as u64).to_le_bytes());
+        for entry in entries {
+            hash.update([entry.kind, entry.flags]);
+            hash.update(entry.mask.to_le_bytes());
+            hash.update((entry.sid.len() as u64).to_le_bytes());
+            hash.update(entry.sid.as_bytes());
+        }
+    }
+    Ok((hash.finalize().into(), security.owner))
+}
 impl Policy {
     pub(super) fn directory(owner: &str, package: &str, writable: bool) -> Self {
         let directory = if writable {

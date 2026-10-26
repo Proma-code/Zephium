@@ -19,6 +19,7 @@ use std::{
 };
 
 mod native;
+pub(super) mod process_fixtures;
 use native::{HeldDirectory, Identity, Policy};
 
 const LOCK: &str = "custody.lock";
@@ -283,9 +284,10 @@ impl StoreLease {
     }
 }
 
-/// Only this opaque type can clear an active record. There is intentionally no
-/// native constructor: the real owning-worker return boundary is not integrated.
-/// A future constructor must live in the actual process owner, never UI/Ports.
+/// Only this opaque type can clear an active record. There is no production or
+/// original-client constructor: that owning-worker adapter is not integrated.
+/// The fixed debug synthetic runner can construct it only after native settlement;
+/// no renderer, general Port or boolean can grant this authority.
 pub(super) struct WorkerSettled {
     _private: (),
 }
@@ -377,36 +379,44 @@ impl Inner {
             self.quarantined.store(true, Ordering::Release);
             Error::Quarantined
         })?;
-        let mut file = &*guard;
-        if file.metadata().map_err(|_| Error::Io)?.len() != expected.len() as u64 {
-            return Err(Error::Dirty);
-        }
-        file.seek(SeekFrom::Start(0)).map_err(|_| Error::Io)?;
-        let mut state = [0; CLEAN.len()];
-        file.read_exact(&mut state).map_err(|_| Error::Io)?;
-        if &state != expected {
-            return Err(Error::Dirty);
-        }
-        Ok(())
+        require_file_state(&guard, expected)
     }
 
     fn write_state(&self, state: &[u8; 9]) -> Result<(), Error> {
         let result = (|| {
             let guard = self.state.lock().map_err(|_| Error::Quarantined)?;
-            let mut file = &*guard;
-            if file.metadata().map_err(|_| Error::Io)?.len() != state.len() as u64 {
-                return Err(Error::Dirty);
-            }
-            file.seek(SeekFrom::Start(0)).map_err(|_| Error::Io)?;
-            file.write_all(state).map_err(|_| Error::Io)?;
-            file.sync_all().map_err(|_| Error::Io)?;
-            Ok(())
+            write_file_state(&guard, state)
         })();
         if result.is_err() {
             self.quarantined.store(true, Ordering::Release);
         }
         result
     }
+}
+
+// Callers must own exclusive store custody and serialize the shared file cursor.
+// The fixed cooperating-process fixture uses these same exact marker operations.
+fn require_file_state(mut file: &File, expected: &[u8; 9]) -> Result<(), Error> {
+    if file.metadata().map_err(|_| Error::Io)?.len() != expected.len() as u64 {
+        return Err(Error::Dirty);
+    }
+    file.seek(SeekFrom::Start(0)).map_err(|_| Error::Io)?;
+    let mut state = [0; CLEAN.len()];
+    file.read_exact(&mut state).map_err(|_| Error::Io)?;
+    if &state != expected {
+        return Err(Error::Dirty);
+    }
+    Ok(())
+}
+
+fn write_file_state(mut file: &File, state: &[u8; 9]) -> Result<(), Error> {
+    if file.metadata().map_err(|_| Error::Io)?.len() != state.len() as u64 {
+        return Err(Error::Dirty);
+    }
+    file.seek(SeekFrom::Start(0)).map_err(|_| Error::Io)?;
+    file.write_all(state).map_err(|_| Error::Io)?;
+    file.sync_all().map_err(|_| Error::Io)?;
+    Ok(())
 }
 
 #[cfg(test)]

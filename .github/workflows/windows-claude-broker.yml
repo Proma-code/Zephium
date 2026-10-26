@@ -50,6 +50,16 @@ jobs:
           if ($fixtures.Count -ne 14) { throw 'Expected exactly 14 reviewed synthetic store fixtures.' }
           cargo test -p zephium-claude-broker --locked --features native-fixtures --lib windows::account_store::tests -- --ignored --test-threads=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Fresh cooperating-process custody (five fixed synthetic scenarios)
+        if: ${{ !cancelled() && steps.fixture_build.outcome == 'success' }}
+        run: |
+          $output = & ./target/debug/claude-broker-fixture.exe store-custody
+          $code = $LASTEXITCODE
+          $output | Write-Output
+          if ($code -ne 0) { exit $code }
+          foreach ($marker in @('store-process-parent-custody', 'store-process-clean-release', 'store-process-dirty-refusal', 'store-process-timeout-dirty', 'store-process-overflow-dirty')) {
+            if (@($output | Where-Object { $_ -ceq "fixture-stage=$marker; native-code=0" }).Count -ne 1) { throw 'A required fixed store custody scenario did not complete exactly once.' }
+          }
       - name: Synthetic fixtures then exact original client startup (no login or inference)
         if: ${{ !cancelled() && steps.fixture_build.outcome == 'success' }}
         run: pwsh -NoProfile -File crates/zephium-claude-broker/qualify-windows.ps1

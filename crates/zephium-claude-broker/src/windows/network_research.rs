@@ -4,6 +4,8 @@ use super::{
     process::{self, Command, Fixture, Layout},
     security::{self, HeldImage, Profile},
 };
+#[path = "listener_research.rs"]
+mod listener_research;
 #[path = "registry_research.rs"]
 mod registry_research;
 use serde::{Deserialize, Serialize};
@@ -57,6 +59,7 @@ struct Observation {
     job_limit: u32,
     job_flags: u32,
     public_connected: bool,
+    listener: Option<listener_research::Observation>,
     registry: registry_research::Observation,
 }
 
@@ -68,6 +71,7 @@ impl Observation {
             && self.loopback_error.is_none()
             && !self.loopback_timeout
             && !self.public_connected
+            && self.listener.is_none()
             && self.child_quota_denied()
             && self.registry.denied()
     }
@@ -76,6 +80,10 @@ impl Observation {
             && self.catalog_write_open == 5
             && self.winsock_startup == 0
             && self.public_connected
+            && self
+                .listener
+                .as_ref()
+                .is_some_and(listener_research::Observation::measured)
             && ((self.loopback_error == Some(10013) && !self.loopback_timeout)
                 || (matches!(self.loopback_error, None | Some(10060)) && self.loopback_timeout))
             && self.child_quota_denied()
@@ -236,6 +244,11 @@ pub(crate) fn controls() -> Result<(), &'static str> {
         .accept()
         .map_err(|_| "research loopback positive accept failed")?;
     drop((accepted, parent_connection));
+    let local_listener = listener_research::measure();
+    local_listener.report();
+    if !local_listener.positive() {
+        return Err("research parent local-listener control failed");
+    }
     let request = serde_json::to_vec(&Request {
         outside: outside_path.clone(),
         foreign: foreign_path.clone(),
@@ -296,6 +309,9 @@ pub(crate) fn controls() -> Result<(), &'static str> {
             "network-research-public-tcp",
             i32::from(result.public_connected),
         );
+        if let Some(listener) = result.listener.as_ref() {
+            listener.report();
+        }
         result.registry.report();
         registry.verify()?;
         for path in [&foreign_path, &outside_path] {
@@ -419,6 +435,7 @@ pub(crate) fn child() -> Result<(), &'static str> {
         job_limit: limits.BasicLimitInformation.ActiveProcessLimit,
         job_flags: limits.BasicLimitInformation.LimitFlags.0,
         public_connected: false,
+        listener: None,
         registry: registry_research::child(&request.registry)?,
     };
     struct Winsock;
@@ -436,6 +453,7 @@ pub(crate) fn child() -> Result<(), &'static str> {
         if data.wVersion != 0x0202 {
             return Err("research Winsock version mismatch");
         }
+        result.listener = Some(listener_research::measure());
         result.public_connected =
             TcpStream::connect_timeout(&request.public, Duration::from_secs(3)).is_ok();
         match TcpStream::connect_timeout(&request.loopback, Duration::from_millis(750)) {
@@ -472,8 +490,18 @@ mod tests {
             job_limit: 1,
             job_flags: 0x2108,
             public_connected: true,
+            listener: Some(listener_research::Observation::positive_fixture()),
             registry: registry_research::Observation::denied_fixture(),
         }
+    }
+    #[test]
+    fn listener_measurement_is_required_but_not_a_callback_or_login_proof() {
+        let value = candidate();
+        assert!(value.candidate_matches());
+        assert!(serde_json::to_vec(&value).unwrap().len() <= 1024);
+        let mut missing = candidate();
+        missing.listener = None;
+        assert!(!missing.candidate_matches());
     }
     #[test]
     fn startup_failure_is_not_network_denial() {
@@ -488,6 +516,7 @@ mod tests {
             job_limit: 1,
             job_flags: 0x2108,
             public_connected: false,
+            listener: None,
             registry: registry_research::Observation::denied_fixture(),
         };
         assert!(baseline.baseline_matches());

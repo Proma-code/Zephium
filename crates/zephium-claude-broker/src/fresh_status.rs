@@ -37,6 +37,57 @@ pub(crate) fn validate(stdout: &[u8], exit: i32, expected_directory: &str) -> Re
     Ok(())
 }
 
+/// Content-free shape diagnostics only. They do not change schema acceptance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Shape {
+    pub(crate) extra_keys: i32,
+    pub(crate) extra_nulls: i32,
+    pub(crate) known_extra: i32,
+    pub(crate) identity_fields: i32,
+}
+pub(crate) fn shape(stdout: &[u8], expected_projects: &str) -> Option<Shape> {
+    if stdout.len() > protocol::MAX_STATUS_BYTES {
+        return None;
+    }
+    let value = strict_json::parse(stdout).ok()?;
+    let object = value.as_object()?;
+    let extras = object.iter().filter(|(key, _)| {
+        !matches!(
+            key.as_str(),
+            "loggedIn" | "authMethod" | "configDirectory" | "apiProvider"
+        )
+    });
+    let extra_keys = extras.clone().count() as i32;
+    let extra_nulls = extras.filter(|(_, value)| value.is_null()).count() as i32;
+    let analytics = object.get("analyticsDisabled");
+    let projects = object.get("projectsDirectory");
+    let facts = [
+        analytics.is_some(),
+        analytics.is_some_and(serde_json::Value::is_boolean),
+        analytics.and_then(serde_json::Value::as_bool) == Some(true),
+        projects.is_some(),
+        projects.is_some_and(serde_json::Value::is_string),
+        !expected_projects.is_empty()
+            && projects.and_then(serde_json::Value::as_str) == Some(expected_projects),
+    ];
+    let known_extra = facts
+        .into_iter()
+        .enumerate()
+        .fold(0, |bits, (i, yes)| bits | (i32::from(yes) << i));
+    let identity_fields = ["email", "orgId", "orgName", "subscriptionType"]
+        .into_iter()
+        .enumerate()
+        .fold(0, |bits, (i, key)| {
+            bits | (i32::from(object.contains_key(key)) << i)
+        });
+    Some(Shape {
+        extra_keys,
+        extra_nulls,
+        known_extra,
+        identity_fields,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,6 +95,45 @@ mod tests {
 
     fn signed_out() -> serde_json::Value {
         json!({"loggedIn":false,"authMethod":"none","configDirectory":"synthetic-owned"})
+    }
+    #[test]
+    fn shape_reports_only_fixed_booleans_counts_and_never_relaxes_validation() {
+        let mut value = signed_out();
+        value["analyticsDisabled"] = json!(true);
+        value["projectsDirectory"] = json!("synthetic-owned/projects");
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert_eq!(
+            shape(&bytes, "synthetic-owned/projects"),
+            Some(Shape {
+                extra_keys: 2,
+                extra_nulls: 0,
+                known_extra: 63,
+                identity_fields: 0
+            })
+        );
+        assert_eq!(
+            validate(&bytes, 1, "synthetic-owned"),
+            Err(Rejected::UnexpectedFields)
+        );
+        assert_eq!(
+            shape(&bytes, "other-profile/projects").unwrap().known_extra,
+            31
+        );
+        value["email"] = json!("synthetic-never-print");
+        value["synthetic-key-never-print"] = serde_json::Value::Null;
+        let facts = shape(
+            &serde_json::to_vec(&value).unwrap(),
+            "synthetic-owned/projects",
+        )
+        .unwrap();
+        assert_eq!(facts.extra_keys, 4);
+        assert_eq!(facts.extra_nulls, 1);
+        assert_eq!(facts.identity_fields, 1);
+        assert!(!format!("{facts:?}").contains("synthetic"));
+        assert_eq!(
+            shape(&vec![b' '; protocol::MAX_STATUS_BYTES + 1], "synthetic"),
+            None
+        );
     }
     #[test]
     fn accepts_only_bound_signed_out_receipt() {

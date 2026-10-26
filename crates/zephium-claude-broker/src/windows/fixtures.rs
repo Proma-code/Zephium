@@ -644,6 +644,16 @@ fn fresh_empty_status(original: &HeldImage) -> Result<(), &'static str> {
     }
     if let Err(reason) = crate::fresh_status::validate(&stdout, output.code, expected_directory) {
         super::diagnostic("fresh-status-rejected", reason as i32);
+        let projects = layout.config.join("projects");
+        if let Some(facts) = projects
+            .to_str()
+            .and_then(|expected| crate::fresh_status::shape(&stdout, expected))
+        {
+            super::diagnostic("fresh-status-extra-keys", facts.extra_keys);
+            super::diagnostic("fresh-status-extra-nulls", facts.extra_nulls);
+            super::diagnostic("fresh-status-known-extra-shape", facts.known_extra);
+            super::diagnostic("fresh-status-identity-fields", facts.identity_fields);
+        }
         return Err("fresh status was not an empty signed-out receipt");
     }
     // Raw status/stderr is never printed or retained. Generic JSON parsing can

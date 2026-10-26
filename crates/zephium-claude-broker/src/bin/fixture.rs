@@ -71,6 +71,20 @@ fn main() {
     }));
     let args: Vec<_> = std::env::args().skip(1).collect();
     let result = match args.as_slice() {
+        [mode] if mode == "store-custody" => zephium_claude_broker::qualify_store_custody(),
+        [flag, mode, _root, _lock, _state]
+            if flag == "--child"
+                && matches!(
+                    mode.as_str(),
+                    "store-custody-busy"
+                        | "store-custody-clean"
+                        | "store-custody-abandon"
+                        | "store-custody-timeout"
+                        | "store-custody-overflow"
+                ) =>
+        {
+            zephium_claude_broker::qualify_store_custody_child()
+        }
         [mode] if mode == "token-controls" => zephium_claude_broker::qualify_token_controls(),
         [mode] if mode == "auth-inputs" => zephium_claude_broker::qualify_synthetic_auth_inputs(),
         [mode] if mode == "network-controls" => zephium_claude_broker::research_network_controls(),

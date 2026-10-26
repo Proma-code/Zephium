@@ -32,3 +32,13 @@ fn diagnostic(stage: &'static str, code: i32) {
     #[cfg(not(feature = "native-fixtures"))]
     let _ = (stage, code);
 }
+
+#[cfg(all(debug_assertions, feature = "native-fixtures"))]
+pub(super) fn store_custody() -> Result<(), &'static str> {
+    account_store::process_fixtures::controls()
+}
+
+#[cfg(all(debug_assertions, feature = "native-fixtures"))]
+pub(super) fn store_custody_child() -> Result<(), &'static str> {
+    account_store::process_fixtures::child()
+}
