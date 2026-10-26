@@ -153,6 +153,7 @@ pub(super) enum Command {
 #[cfg(feature = "native-fixtures")]
 #[derive(Clone, Copy)]
 pub(super) enum Fixture {
+    HandleProbe,
     LoginInput,
     LoginExit,
     TokenAppContainerControl,
@@ -181,6 +182,7 @@ impl Command {
             Self::Vendor(operation) => CommandPlan::for_operation(operation).arguments(),
             #[cfg(feature = "native-fixtures")]
             Self::Fixture(mode) => match mode {
+                Fixture::HandleProbe => &["--child", "handle-probe"],
                 Fixture::LoginInput => &["--child", "login-input"],
                 Fixture::LoginExit => &["--child", "login-exit"],
                 Fixture::TokenAppContainerControl | Fixture::TokenLpacControl => {

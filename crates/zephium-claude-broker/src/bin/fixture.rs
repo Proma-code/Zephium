@@ -108,6 +108,71 @@ fn child(mode: &str) -> Result<(), &'static str> {
                     .map_err(|_| "fixture flood stopped")?;
             }
         }
+        "handle-probe" => {
+            use std::os::windows::io::AsRawHandle;
+            use windows::Win32::{
+                Foundation::{GetHandleInformation, HANDLE},
+                System::{
+                    SystemServices::PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY,
+                    Threading::{
+                        GetCurrentProcess, GetProcessMitigationPolicy,
+                        ProcessStrictHandleCheckPolicy,
+                    },
+                },
+            };
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .take(9)
+                .read_to_end(&mut bytes)
+                .map_err(|_| "handle fixture input failed")?;
+            let bytes: [u8; 8] = bytes
+                .try_into()
+                .map_err(|_| "handle fixture input invalid")?;
+            let inherited = usize::try_from(u64::from_le_bytes(bytes))
+                .map_err(|_| "handle fixture value invalid")?;
+            if inherited == 0 || inherited == usize::MAX {
+                return Err("handle fixture value invalid");
+            }
+            let mut flags = 0u32;
+            unsafe { GetHandleInformation(HANDLE(std::io::stdout().as_raw_handle()), &mut flags) }
+                .map_err(|_| "known pipe handle control failed")?;
+            let mut policy = PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY::default();
+            unsafe {
+                GetProcessMitigationPolicy(
+                    GetCurrentProcess(),
+                    ProcessStrictHandleCheckPolicy,
+                    (&raw mut policy).cast(),
+                    std::mem::size_of_val(&policy),
+                )
+            }
+            .map_err(|_| "handle mitigation query failed")?;
+            let policy = unsafe { policy.Anonymous.Flags };
+            if policy & !3 != 0 {
+                return Err("handle mitigation flags unknown");
+            }
+            let marker: &[u8] = if policy & 1 != 0 {
+                b"known-handle-ok\nstrict-handles=1\nprobe-ready\n"
+            } else {
+                b"known-handle-ok\nstrict-handles=0\nprobe-ready\n"
+            };
+            std::io::stdout()
+                .write_all(marker)
+                .map_err(|_| "handle probe marker failed")?;
+            std::io::stdout()
+                .flush()
+                .map_err(|_| "handle probe marker flush failed")?;
+            // This exact negative query is intentionally the only operation after
+            // the marker. Strict-handle policy may raise STATUS_INVALID_HANDLE;
+            // it is not disabled and no generic child crash is accepted.
+            match unsafe { GetHandleInformation(HANDLE(inherited as *mut _), &mut flags) } {
+                Ok(()) => return Err("unlisted inheritable handle was present"),
+                Err(error) if error.code().0 as u32 == 0x8007_0006 => {}
+                Err(_) => return Err("handle probe returned unexpected error"),
+            }
+            std::io::stdout()
+                .write_all(b"not-inherited\n")
+                .map_err(|_| "handle probe receipt failed")?;
+        }
         "isolation" => {
             let mut bytes = Vec::new();
             std::io::stdin()
@@ -122,23 +187,6 @@ fn child(mode: &str) -> Result<(), &'static str> {
                     .and_then(serde_json::Value::as_str)
                     .ok_or("fixture field missing")
             };
-            let inherited = input
-                .get("inheritable_handle")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or("fixture handle missing")?;
-            let mut flags = 0u32;
-            // SAFETY: probing an opaque numeric handle cannot dereference memory;
-            // this known fixture event must not exist in the child's handle table.
-            if unsafe {
-                windows::Win32::Foundation::GetHandleInformation(
-                    windows::Win32::Foundation::HANDLE(inherited as usize as *mut _),
-                    &mut flags,
-                )
-            }
-            .is_ok()
-            {
-                return Err("unlisted inheritable handle escaped");
-            }
             if std::fs::read(path("sentinel")?).is_ok()
                 || std::fs::write(path("sentinel")?, b"modified").is_ok()
                 || std::fs::read_dir(path("outside")?).is_ok()

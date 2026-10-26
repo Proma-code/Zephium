@@ -150,7 +150,40 @@ pub(crate) fn qualify() -> Result<(), &'static str> {
     }
     .map_err(|_| "inherited-handle fixture unavailable")?;
     let event = unsafe { OwnedHandle::from_raw_handle(event.0) };
-    let request = serde_json::json!({"sentinel":sentinel_file,"outside":sentinel.0,"loopback":address.to_string(),"image":image_path,"inheritable_handle":event.as_raw_handle() as usize as u64,"config":layout.config,"home":layout.home,"work":layout.work,"appdata":layout.appdata,"localappdata":layout.localappdata});
+    let mut flags = 0u32;
+    unsafe {
+        windows::Win32::Foundation::GetHandleInformation(
+            windows::Win32::Foundation::HANDLE(event.as_raw_handle()),
+            &mut flags,
+        )
+    }
+    .map_err(|_| "parent event handle control failed")?;
+    if flags & windows::Win32::Foundation::HANDLE_FLAG_INHERIT.0 == 0 {
+        return Err("parent event was not inheritable");
+    }
+    let handle_probe = process::run(
+        &profile,
+        &image,
+        &layout,
+        Command::Fixture(Fixture::HandleProbe),
+        (event.as_raw_handle() as usize as u64)
+            .to_le_bytes()
+            .to_vec(),
+        &cancelled,
+    )?;
+    receipt("handle-probe", &handle_probe);
+    let strict_denial = crate::plan::fixture_handle_denial(
+        handle_probe.code,
+        handle_probe.stopped.is_some(),
+        &handle_probe.stdout,
+        &handle_probe.stderr,
+    )
+    .ok_or("unlisted handle denial was not established")?;
+    super::diagnostic(
+        "unlisted-handle-denial-established",
+        i32::from(strict_denial),
+    );
+    let request = serde_json::json!({"sentinel":sentinel_file,"outside":sentinel.0,"loopback":address.to_string(),"image":image_path,"config":layout.config,"home":layout.home,"work":layout.work,"appdata":layout.appdata,"localappdata":layout.localappdata});
     let output = process::run(
         &profile,
         &image,

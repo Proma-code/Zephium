@@ -231,3 +231,77 @@ mod tests {
         );
     }
 }
+
+// Fixed synthetic handle-probe receipts only, never provider-output recognition.
+// A crash without the positive control and exact pre-call policy marker is not
+// evidence of denial. `Some(true)` identifies the strict exception form.
+#[cfg(any(test, feature = "native-fixtures"))]
+pub(crate) fn fixture_handle_denial(
+    code: i32,
+    stopped: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Option<bool> {
+    if stopped || !stderr.is_empty() {
+        return None;
+    }
+    if code == 0
+        && matches!(
+            stdout,
+            b"known-handle-ok\nstrict-handles=0\nprobe-ready\nnot-inherited\n"
+                | b"known-handle-ok\nstrict-handles=1\nprobe-ready\nnot-inherited\n"
+        )
+    {
+        Some(false)
+    } else if code as u32 == 0xc000_0008
+        && stdout == b"known-handle-ok\nstrict-handles=1\nprobe-ready\n"
+    {
+        Some(true)
+    } else {
+        None
+    }
+}
+#[cfg(test)]
+mod handle_fixture_tests {
+    use super::fixture_handle_denial as denied;
+    #[test]
+    fn only_exact_proven_negative_handle_receipts_are_accepted() {
+        let ready = b"known-handle-ok\nstrict-handles=1\nprobe-ready\n";
+        let invalid = 0xc000_0008u32 as i32;
+        assert_eq!(denied(invalid, false, ready, b""), Some(true));
+        assert_eq!(
+            denied(
+                0,
+                false,
+                b"known-handle-ok\nstrict-handles=0\nprobe-ready\nnot-inherited\n",
+                b""
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            denied(
+                0,
+                false,
+                b"known-handle-ok\nstrict-handles=1\nprobe-ready\nnot-inherited\n",
+                b""
+            ),
+            Some(false)
+        );
+        for code in [0, 1, 101, 0xc000_0005u32 as i32, 0xc000_0409u32 as i32] {
+            assert_eq!(denied(code, false, ready, b""), None);
+        }
+        assert_eq!(denied(invalid, true, ready, b""), None);
+        assert_eq!(denied(invalid, false, ready, b"unexpected"), None);
+        for incomplete in [
+            b"".as_slice(),
+            b"probe-ready\n",
+            b"strict-handles=1\nprobe-ready\n",
+            b"known-handle-ok\nstrict-handles=0\nprobe-ready\n",
+        ] {
+            assert_eq!(denied(invalid, false, incomplete, b""), None);
+        }
+        let mut extra = ready.to_vec();
+        extra.extend_from_slice(b"other-operation\n");
+        assert_eq!(denied(invalid, false, &extra, b""), None);
+    }
+}
