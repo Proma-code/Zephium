@@ -111,7 +111,7 @@ mod live {
                     zephium_opencode_go::vault::SystemVault::new(VAULT_NAMESPACE)
                         .map_err(|_| Fault::Vault)?,
                 ),
-                Arc::new(|| zephium_app::work_models::go_session_changed()),
+                Arc::new(zephium_app::work_models::go_session_changed),
             )?);
             service.set_foreground(
                 self.foreground.read().ok().is_some_and(|current| {
@@ -225,37 +225,6 @@ mod live {
             }))
         }
     }
-    #[cfg(test)]
-    mod registry_tests {
-        use super::*;
-
-        #[test]
-        fn subscription_registry_cannot_create_first_service_after_shutdown() {
-            let profile = ProfileId::parse("00000000000000000000000001").unwrap();
-            let registry = Registry {
-                services: Mutex::new(HashMap::new()),
-                foreground: std::sync::RwLock::new(Some(profile.to_string())),
-                scope_epoch: std::sync::atomic::AtomicU64::new(0),
-                closed: std::sync::atomic::AtomicBool::new(false),
-            };
-            let old_scope = registry.capture_scope(&profile.to_string()).unwrap();
-            registry.close();
-            assert!(!registry.owns_scope(&profile.to_string(), old_scope));
-            assert!(matches!(
-                registry.service(profile, true),
-                Err(Fault::Cancelled)
-            ));
-            assert!(matches!(
-                registry.service(profile, false),
-                Err(Fault::Cancelled)
-            ));
-            assert!(registry.get(profile).is_none());
-            assert!(registry.services.lock().unwrap().is_empty());
-            registry.close();
-            assert!(registry.capture_scope(&profile.to_string()).is_none());
-        }
-    }
-
     pub(super) fn install() {
         let registry = REGISTRY.get_or_init(|| {
             Arc::new(Registry {
@@ -526,6 +495,36 @@ mod live {
             return GoViewV1::unavailable(expected);
         }
         view(expected, &service, result.err(), quota_error)
+    }
+    #[cfg(test)]
+    mod registry_tests {
+        use super::*;
+
+        #[test]
+        fn subscription_registry_cannot_create_first_service_after_shutdown() {
+            let profile = ProfileId::parse("00000000000000000000000001").unwrap();
+            let registry = Registry {
+                services: Mutex::new(HashMap::new()),
+                foreground: std::sync::RwLock::new(Some(profile.to_string())),
+                scope_epoch: std::sync::atomic::AtomicU64::new(0),
+                closed: std::sync::atomic::AtomicBool::new(false),
+            };
+            let old_scope = registry.capture_scope(&profile.to_string()).unwrap();
+            registry.close();
+            assert!(!registry.owns_scope(&profile.to_string(), old_scope));
+            assert!(matches!(
+                registry.service(profile, true),
+                Err(Fault::Cancelled)
+            ));
+            assert!(matches!(
+                registry.service(profile, false),
+                Err(Fault::Cancelled)
+            ));
+            assert!(registry.get(profile).is_none());
+            assert!(registry.services.lock().unwrap().is_empty());
+            registry.close();
+            assert!(registry.capture_scope(&profile.to_string()).is_none());
+        }
     }
 }
 

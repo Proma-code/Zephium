@@ -124,7 +124,7 @@ mod live {
                     zephium_chatgpt::vault::SystemVault::new(VAULT_NAMESPACE)
                         .map_err(|_| Fault::Vault)?,
                 ),
-                Arc::new(|| zephium_app::work_models::chatgpt_session_changed()),
+                Arc::new(zephium_app::work_models::chatgpt_session_changed),
             )?);
             service.set_foreground(
                 self.foreground.read().ok().is_some_and(|current| {
