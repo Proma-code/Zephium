@@ -204,9 +204,10 @@ impl Profile {
         };
         operation(&capabilities)
     }
-    /// Synthetic differential only. Never selected by vendor operations.
+    /// Fixed debug-only synthetic/startup candidate. Never selected by real account
+    /// or conversation operations; registryRead is not catalog-scoped.
     #[cfg(feature = "native-fixtures")]
-    pub(super) fn with_registry_research_capabilities<T>(
+    pub(super) fn with_fixture_runtime_capabilities<T>(
         &self,
         operation: impl FnOnce(&SECURITY_CAPABILITIES) -> T,
     ) -> Result<T, &'static str> {

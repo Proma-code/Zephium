@@ -172,8 +172,32 @@ pub(super) enum Fixture {
 }
 impl Command {
     #[cfg(feature = "native-fixtures")]
-    fn registry_research(self) -> bool {
-        matches!(self, Self::Fixture(Fixture::NetworkRegistryRead))
+    fn fixture_registry_runtime(self) -> bool {
+        // Fixed debug-only candidate list, never a fallback or caller-supplied
+        // capability. Real operations and differential baselines remain separate.
+        match self {
+            Self::Vendor(_) => false,
+            Self::Fixture(
+                Fixture::NetworkBaseline
+                | Fixture::TokenAppContainerControl
+                | Fixture::TokenLpacControl,
+            ) => false,
+            Self::Fixture(
+                Fixture::NetworkRegistryRead
+                | Fixture::HandleProbe
+                | Fixture::LoginInput
+                | Fixture::LoginExit
+                | Fixture::VendorVersion
+                | Fixture::VendorHelp
+                | Fixture::Echo
+                | Fixture::Argv
+                | Fixture::Isolation
+                | Fixture::Flood
+                | Fixture::StderrFlood
+                | Fixture::CancelWait
+                | Fixture::Stall,
+            ) => true,
+        }
     }
     #[cfg(feature = "native-fixtures")]
     fn token_probe(self) -> Option<bool> {
@@ -543,8 +567,8 @@ fn run_owned(
             Ok((process, thread))
         };
     #[cfg(feature = "native-fixtures")]
-    let created = if command.registry_research() {
-        profile.with_registry_research_capabilities(create)?
+    let created = if command.fixture_registry_runtime() {
+        profile.with_fixture_runtime_capabilities(create)?
     } else {
         profile.with_capabilities(create)
     }?;
@@ -890,28 +914,39 @@ fn inspect_identity(
 mod research_admission_tests {
     use super::*;
     #[test]
-    fn registry_capability_is_never_a_vendor_or_default_mode() {
+    fn fixture_runtime_capability_is_never_a_real_operation_or_baseline() {
         for operation in [
             Operation::ReadStatus,
             Operation::StartLogin,
             Operation::Logout,
             Operation::TextTurn,
         ] {
-            assert!(!Command::Vendor(operation).registry_research());
+            assert!(!Command::Vendor(operation).fixture_registry_runtime());
         }
         for fixture in [
             Fixture::NetworkBaseline,
+            Fixture::TokenLpacControl,
+            Fixture::TokenAppContainerControl,
+        ] {
+            assert!(!Command::Fixture(fixture).fixture_registry_runtime());
+        }
+        for fixture in [
+            Fixture::NetworkRegistryRead,
             Fixture::VendorVersion,
             Fixture::VendorHelp,
             Fixture::Isolation,
             Fixture::LoginInput,
             Fixture::LoginExit,
-            Fixture::TokenLpacControl,
-            Fixture::TokenAppContainerControl,
+            Fixture::HandleProbe,
+            Fixture::Echo,
+            Fixture::Argv,
+            Fixture::Flood,
+            Fixture::StderrFlood,
+            Fixture::CancelWait,
+            Fixture::Stall,
         ] {
-            assert!(!Command::Fixture(fixture).registry_research());
+            assert!(Command::Fixture(fixture).fixture_registry_runtime());
         }
-        assert!(Command::Fixture(Fixture::NetworkRegistryRead).registry_research());
         assert_eq!(
             Command::Fixture(Fixture::NetworkRegistryRead).arguments(),
             &["--child", "network-control"]

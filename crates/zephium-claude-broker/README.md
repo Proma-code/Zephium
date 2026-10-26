@@ -23,6 +23,9 @@ if those pass does it download—not install—the exact original Claude 2.1.310
 Windows x64 image, verify its pinned bytes and signature, and run `--version`
 and restricted safe `--help`. It never runs login, status/logout or inference.
 No vendor binary is checked in; this is not an updater or production approval.
+The debug runtime also evaluates `registryRead`, which is broader than a single
+registry catalog. Passing fixtures does not establish safety for every registry
+key or enable a production connection.
 
 Account linking, real conversation behavior and app integration remain pending.
 Any real account grant or inference requires separate explicit authorization.
