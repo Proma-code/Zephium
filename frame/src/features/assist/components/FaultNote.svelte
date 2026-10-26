@@ -13,8 +13,9 @@
   const view = $derived(faultView(fault));
   let left = $state(0);
   $effect(() => {
-    left = view.retry === "wait" ? Math.max(1, Math.min(view.wait ?? 20, 300)) : 0;
-    if (left <= 0) return;
+    const seconds = view.retry === "wait" ? (view.wait ?? 0) : 0;
+    left = seconds;
+    if (seconds <= 0) return;
     const timer = setInterval(() => {
       left -= 1;
       if (left <= 0) clearInterval(timer);

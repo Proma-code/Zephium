@@ -572,6 +572,10 @@ fn harness(turns: Vec<Turn>) -> Harness {
 }
 
 fn harness_with(turns: Vec<Turn>, tools: bool) -> Harness {
+    harness_entry(turns, entry(tools))
+}
+
+fn harness_entry(turns: Vec<Turn>, model: WorkModelEntry) -> Harness {
     let page = Arc::new(FakePage::default());
     {
         let mut state = page.lock();
@@ -608,7 +612,7 @@ fn harness_with(turns: Vec<Turn>, tools: bool) -> Harness {
         page: page.clone(),
         tabs: tabs.clone(),
         models: Arc::new(FakeModels {
-            entry: entry(tools),
+            entry: model,
             client: client.clone(),
         }),
         events: sink.clone(),
@@ -1437,4 +1441,137 @@ async fn go_to_follows_the_link_in_the_tab_being_worked_in() {
         (steps[0].label.as_str(), steps[0].state),
         ("Go to emudhra.com", PageAssistStepStateV1::Done)
     );
+}
+
+fn protected_entries() -> Vec<WorkModelEntry> {
+    [
+        (
+            WorkModelProvider::OpenAi,
+            "chatgpt/model",
+            WorkModelWire::OpenAiResponses,
+        ),
+        (
+            WorkModelProvider::OpenCodeGo,
+            "opencode-go/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/model",
+            WorkModelWire::ChatCompletions,
+        ),
+        (
+            WorkModelProvider::Compatible,
+            "gateway/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/model",
+            WorkModelWire::ChatCompletions,
+        ),
+    ]
+    .into_iter()
+    .map(|(provider, id, wire)| {
+        let mut model = entry(true);
+        model.id = id.into();
+        model.model.provider = provider;
+        model.model.wire = wire;
+        model
+    })
+    .collect()
+}
+
+#[tokio::test]
+async fn protected_source_limits_end_without_retry_fallback_tools_or_claimed_cost() {
+    use zephium_core::work::model::{ChatGptModelFault, GatewayModelFault, OpenCodeGoModelFault};
+    let errors = [
+        WorkModelError::ChatGpt {
+            fault: ChatGptModelFault::UsageLimit,
+        },
+        WorkModelError::OpenCodeGo {
+            fault: OpenCodeGoModelFault::RateLimited,
+            usage_unknown: true,
+        },
+        WorkModelError::Gateway {
+            fault: GatewayModelFault::RateLimited,
+            usage_unknown: true,
+        },
+    ];
+    for (model, error) in protected_entries().into_iter().zip(errors) {
+        let h = harness_entry(
+            vec![
+                Turn {
+                    error: Some(error),
+                    ..Turn::default()
+                },
+                say("must not retry"),
+            ],
+            model,
+        );
+        h.ask("Hi", false).await.unwrap();
+        h.settle().await;
+        let PageAssistMessageV1::Reply {
+            state, fault, cost, ..
+        } = h.reply().await
+        else {
+            panic!()
+        };
+        assert_eq!(state, PageAssistReplyStateV1::Failed);
+        assert_eq!(
+            fault,
+            Some(PageAssistFaultV1::Model {
+                fault: WorkModelFaultV1::RateLimited,
+                retry_after_ms: None
+            })
+        );
+        assert!(
+            cost.is_none(),
+            "a failure is not a zero or confirmed charge"
+        );
+        assert_eq!(h.client.requests.lock().unwrap().len(), 1);
+        assert_eq!(h.client.turns.lock().unwrap().len(), 1);
+        assert!(h.work.0.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn protected_source_cancellation_drops_the_call_without_retry_or_cost() {
+    for model in protected_entries() {
+        let h = harness_entry(
+            vec![
+                Turn {
+                    hang: true,
+                    ..Turn::default()
+                },
+                say("must not retry"),
+            ],
+            model,
+        );
+        h.ask("Hi", false).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while h.client.requests.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(h.service.stop(SPACE));
+        h.settle().await;
+        let PageAssistMessageV1::Reply { state, cost, .. } = h.reply().await else {
+            panic!()
+        };
+        assert_eq!(state, PageAssistReplyStateV1::Cancelled);
+        assert!(cost.is_none());
+        assert!(h.client.dropped.load(Ordering::Acquire));
+        assert_eq!(h.client.requests.lock().unwrap().len(), 1);
+        assert_eq!(h.client.turns.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn protected_source_completed_reply_has_unknown_external_cost_not_free_or_api_price() {
+    for model in protected_entries() {
+        let h = harness_entry(vec![say("Hello")], model);
+        h.ask("Hi", false).await.unwrap();
+        h.settle().await;
+        let PageAssistMessageV1::Reply { state, cost, .. } = h.reply().await else {
+            panic!()
+        };
+        assert_eq!(state, PageAssistReplyStateV1::Done);
+        assert!(matches!(
+            cost,
+            Some(PageAssistCostV1::Byok { usd: None, .. })
+        ));
+    }
 }

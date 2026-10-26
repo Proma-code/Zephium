@@ -26,9 +26,10 @@ const models = (label: string): FaultFix => ({ label, command: "settings.ai" });
 export function faultView(reason: PageAssistFaultV1): FaultView {
   if (reason.reason !== "model") return pageFault(reason.reason);
   const view = modelFault(reason.fault);
-  return reason.retry_after_ms === null
-    ? view
-    : { ...view, wait: Math.ceil(reason.retry_after_ms / 1000) };
+  const milliseconds = reason.retry_after_ms;
+  if (milliseconds !== null && Number.isSafeInteger(milliseconds) && milliseconds > 0)
+    return { ...view, wait: Math.ceil(milliseconds / 1000) };
+  return view.retry === "wait" ? { ...view, retry: "now", wait: null } : view;
 }
 
 function modelFault(fault: Extract<PageAssistFaultV1, { reason: "model" }>["fault"]): FaultView {

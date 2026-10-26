@@ -11,7 +11,7 @@ export function costLine(cost: PageAssistCostV1): string {
   if (cost.kind === "local") return m.assist_cost_local({ model: cost.model });
   if (cost.kind === "byok")
     return cost.usd === null
-      ? m.assist_cost_confirming({ model: cost.model })
+      ? m.assist_cost_unavailable({ model: cost.model })
       : m.assist_cost_own({ model: cost.model, amount: `$${cost.usd}`, provider: cost.provider });
   if (cost.credits === null) return m.assist_cost_confirming({ model: cost.model });
   return cost.credits === "1"

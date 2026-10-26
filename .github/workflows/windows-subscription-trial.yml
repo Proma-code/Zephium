@@ -59,6 +59,7 @@ jobs:
       - name: Real Chromium account and picker component regressions
         run: >-
           pnpm --dir frame run test:component
+          src/features/assist/tests/FaultNote.component.test.ts
           src/features/settings/tests/AiSubscriptions.component.test.ts
           src/features/settings/tests/ChatGptAccount.component.test.ts
           src/features/settings/tests/LocalGateway.component.test.ts
@@ -92,6 +93,12 @@ jobs:
           cargo test -p zephium-agentic --features provider-transport --locked opencode_go::
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p zephium-agentic --features provider-transport --locked local_gateway::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p zephium-work-composition --test page_assist_faults --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p zephium-work-composition --features durable-runtime --lib --locked page_assist::tests::protected_source_
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo check -p zephium-agent-controller --all-targets --features provider-transport --locked
       - name: Protected native trial identity test (no user profile)
         run: cargo test -p zephium-private-fs --lib --locked subscription_trial_has_a_distinct_closed_native_storage_component
       - name: Compile and lint the Windows trial including test targets

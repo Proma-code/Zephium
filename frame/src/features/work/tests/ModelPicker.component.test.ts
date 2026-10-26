@@ -1064,7 +1064,7 @@ test("Go setup uses its own settings flow, not the generic API-key or Custom for
   const onsettings = vi.fn();
   const screen = await render(ModelPicker, { profile: PROFILE, onsettings });
   await screen.getByRole("button", { name: "Connect a model" }).click();
-  await screen.getByRole("tab", { name: /^OpenCode Go/u }).click();
+  await screen.getByRole("tab", { name: "OpenCode Go, choose a connection", exact: true }).click();
   await expect.element(screen.getByText("No OpenCode Go key saved")).toBeVisible();
   await expect
     .element(screen.getByRole("button", { name: "Add key", exact: true }))
@@ -1086,7 +1086,7 @@ test("Go quota refresh leaves model choice untouched and stale quota remains dis
   );
   const screen = await render(ModelPicker, { profile: PROFILE, onsettings: vi.fn() });
   await screen.getByRole("button", { name: "Connect a model" }).click();
-  await screen.getByRole("tab", { name: /^OpenCode Go/u }).click();
+  await screen.getByRole("tab", { name: "OpenCode Go, choose a connection", exact: true }).click();
   expect(go.quota).not.toHaveBeenCalled();
   const choices = native.choose.mock.calls.length;
   await screen.getByRole("button", { name: "Refresh Go quota" }).click();
@@ -1108,7 +1108,11 @@ test("Go quota refresh leaves model choice untouched and stale quota remains dis
     .toBeVisible();
   await expect.element(screen.getByText("80% remaining", { exact: false })).toBeVisible();
   expect(native.choose).toHaveBeenCalledTimes(choices);
-  await screen.getByRole("tab", { name: "OpenAI", exact: true }).click();
+  const apiSeat = screen.getByRole("tab", { name: "OpenAI, choose a connection", exact: true });
+  await expect.element(apiSeat).toHaveAttribute("data-provider", "open_ai");
+  await expect.element(apiSeat).toHaveAttribute("data-standing", "key");
+  await apiSeat.click();
+  await expect.element(apiSeat).toHaveAttribute("aria-selected", "true");
   await expect.element(screen.getByText("80% remaining", { exact: false })).not.toBeInTheDocument();
   expect(native.choose).toHaveBeenCalledTimes(choices);
 });

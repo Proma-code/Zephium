@@ -45,3 +45,6 @@ zephium-core = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json.workspace = true
+zephium-core.workspace = true
+zephium-ipc.workspace = true
+zephium-page-assist.workspace = true

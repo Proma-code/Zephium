@@ -64,3 +64,17 @@ test("a page still loading is asked again, not called unavailable", () => {
   expect(view.message).toContain("still loading");
   expect(faultView({ reason: "invalid" }).retry).toBe("no");
 });
+
+test("a provider limit without a native deadline offers manual retry without an invented countdown", () => {
+  const view = model("rate_limited");
+  expect(view).toMatchObject({ retry: "now", wait: null, fix: null });
+  expect(view.message).toBe("The selected provider has limited this request. Try again later.");
+  expect(view.message).not.toContain("Zephium AI");
+});
+
+test("only a valid positive native retry interval becomes a countdown, without a fabricated cap", () => {
+  for (const interval of [0, -1, NaN, Infinity, 1.5])
+    expect(model("rate_limited", interval)).toMatchObject({ retry: "now", wait: null });
+  expect(model("rate_limited", 1501)).toMatchObject({ retry: "wait", wait: 2 });
+  expect(model("rate_limited", 900_000)).toMatchObject({ retry: "wait", wait: 900 });
+});
