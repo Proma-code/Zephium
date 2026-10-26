@@ -100,7 +100,13 @@ fn io_failure(stage: IoStage, error: std::io::Error) -> Error {
     let _ = (stage, error);
     Error::Io
 }
+#[cfg(test)]
+thread_local! {
+    static LAST_NATIVE_FAILURE: std::cell::Cell<Option<(u8, u32)>> = const { std::cell::Cell::new(None) };
+}
 fn win_failure(stage: IoStage, error: windows::core::Error) -> Error {
+    #[cfg(test)]
+    LAST_NATIVE_FAILURE.set(Some((stage as u8, error.code().0 as u32)));
     #[cfg(test)]
     eprintln!(
         "owned-profile-io: stage={} hresult={:#010x}",
@@ -1096,5 +1102,247 @@ mod tests {
         drop(candidate);
         drop(profile);
         parent.close().unwrap();
+    }
+}
+
+// Run only by the explicit isolated/serial diagnostic command. This does not
+// change the nine strict production recovery/differential expectations above.
+#[cfg(all(test, debug_assertions, feature = "native-fixtures"))]
+mod directory_pin_diagnostic {
+    use super::*;
+
+    fn write_denied(path: &Path) {
+        assert_eq!(
+            OpenOptions::new()
+                .write(true)
+                .share_mode(7)
+                .open(path)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(32)
+        );
+    }
+    fn delete_denied(path: &Path) {
+        assert_eq!(
+            OpenOptions::new()
+                .access_mode(0x0001_0080)
+                .share_mode(7)
+                .custom_flags(0x0220_0000)
+                .open(path)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(32)
+        );
+    }
+    // Relative target is explicitly bound to the already-held home directory.
+    fn rename_relative(file: &File, directory: &File, leaf: &OsStr) -> Result<(), Error> {
+        let mut name = wide(leaf)?;
+        name.pop();
+        let bytes = name
+            .len()
+            .checked_mul(size_of::<u16>())
+            .ok_or(Error::Invalid)?;
+        let length = offset_of!(FILE_RENAME_INFO, FileName)
+            .checked_add(bytes)
+            .ok_or(Error::Invalid)?
+            .max(size_of::<FILE_RENAME_INFO>());
+        let mut storage = vec![0usize; length.div_ceil(size_of::<usize>())];
+        let rename = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        unsafe {
+            (*rename).Anonymous.ReplaceIfExists = true;
+            (*rename).RootDirectory = HANDLE(directory.as_raw_handle());
+            (*rename).FileNameLength = u32::try_from(bytes).map_err(|_| Error::Invalid)?;
+            std::ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                (*rename).FileName.as_mut_ptr(),
+                name.len(),
+            );
+            SetFileInformationByHandle(
+                HANDLE(file.as_raw_handle()),
+                FileRenameInfo,
+                storage.as_ptr().cast(),
+                u32::try_from(length).map_err(|_| Error::Invalid)?,
+            )
+        }
+        .map_err(|error| win_failure(IoStage::RenameByHandle, error))
+    }
+    fn observer(path: &Path) -> File {
+        OpenOptions::new()
+            .read(true)
+            .share_mode(5)
+            .custom_flags(0x0020_0000)
+            .open(path)
+            .unwrap()
+    }
+    #[test]
+    #[ignore = "isolated serial owned directory-pin causal matrix; no account/provider calls"]
+    fn isolates_containing_directory_pin_without_changing_production_policy() {
+        // 0=A absolute/all pins, 1=B relative leaf/held home root/all pins,
+        // 2=C absolute/only containing pin released, 3=D absolute/containing
+        // guard READ|WRITE sharing while still denying DELETE. Each is fresh.
+        let mut observations = Vec::new();
+        for case in 0u8..4 {
+            let parent = tempfile::tempdir().unwrap();
+            let id = ProfileId::from_native(random_id().unwrap()).unwrap();
+            let mut profile = ProfileLease::fixture(parent.path(), id).unwrap();
+            let owner = owner_sid().unwrap();
+            let home = profile.root.join("codex-home");
+            let source = home.join("matrix-source");
+            let target = home.join("matrix-target");
+            let old = b"owned-old-metadata";
+            let new = b"owned-new-metadata";
+            write_new(&source, &owner, new).unwrap();
+            write_new(&target, &owner, old).unwrap();
+            let mut staged = OpenOptions::new()
+                .access_mode(0x8001_0000)
+                .share_mode(5)
+                .custom_flags(0x0020_0000)
+                .open(&source)
+                .unwrap();
+            verify_file(&staged, &owner).unwrap();
+            let source_id = identity(&staged).unwrap();
+            let target_id = identity(&open_read(&target).unwrap()).unwrap();
+            let home_id = profile.record.nodes[1];
+            let matching: Vec<_> = profile
+                ._pins
+                .iter()
+                .enumerate()
+                .filter_map(|(index, pin)| (identity(pin).unwrap() == home_id).then_some(index))
+                .collect();
+            assert_eq!(matching.len(), 1);
+            let home_index = matching[0];
+            let other_ids: Vec<_> = profile
+                ._pins
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != home_index)
+                .map(|(_, pin)| identity(pin).unwrap())
+                .collect();
+            let lease_id = identity(&profile.lock.lock().unwrap()).unwrap();
+            delete_denied(&home);
+            write_denied(&source);
+            let mut delete_probe = 32u32;
+            if case == 2 {
+                drop(profile._pins.remove(home_index));
+                // Positive control: the exact previously pinned directory is
+                // may be DELETE-openable. Record refusal too, without aborting
+                // the remaining rename controls; no deletion is issued here.
+                delete_probe = match OpenOptions::new()
+                    .access_mode(0x0001_0080)
+                    .share_mode(7)
+                    .custom_flags(0x0220_0000)
+                    .open(&home)
+                {
+                    Ok(control) => {
+                        assert_eq!(identity(&control).unwrap(), home_id);
+                        drop(control);
+                        0
+                    }
+                    Err(error) => error.raw_os_error().map_or(u32::MAX, |code| code as u32),
+                };
+            } else if case == 3 {
+                // Open and verify the new guard BEFORE releasing the old one.
+                // At no point can another handle acquire DELETE on this directory.
+                let replacement = OpenOptions::new()
+                    .read(true)
+                    .share_mode(3)
+                    .custom_flags(0x0220_0000)
+                    .open(&home)
+                    .unwrap();
+                verify_security(&replacement, &owner, true).unwrap();
+                assert_eq!(identity(&replacement).unwrap(), home_id);
+                drop(std::mem::replace(
+                    &mut profile._pins[home_index],
+                    replacement,
+                ));
+                delete_denied(&home);
+            }
+            let sentinel_root = parent.path().join("unrelated-owned-directory");
+            create_dir(&sentinel_root, &owner).unwrap();
+            let sentinel = sentinel_root.join("matrix-target");
+            let sentinel_bytes = b"unrelated-owned-sentinel";
+            write_new(&sentinel, &owner, sentinel_bytes).unwrap();
+            let sentinel_id = identity(&open_read(&sentinel).unwrap()).unwrap();
+            LAST_NATIVE_FAILURE.set(None);
+            let result = if case == 1 {
+                rename_relative(
+                    &staged,
+                    &profile._pins[home_index],
+                    OsStr::new("matrix-target"),
+                )
+            } else {
+                rename_metadata(&staged, &target)
+            };
+            // Capture before observer opens/cleanup can change OS last-error state.
+            let failure = LAST_NATIVE_FAILURE.get();
+            let code = match result {
+                Ok(()) => {
+                    assert!(failure.is_none());
+                    0
+                }
+                Err(Error::Io) => {
+                    let (stage, code) = failure.expect("captured native failure");
+                    assert_eq!(stage, 23);
+                    code
+                }
+                Err(_) => panic!("diagnostic input must reach native rename"),
+            };
+            let source_absent = matches!(std::fs::symlink_metadata(&source), Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound);
+            let mut final_target = observer(&target);
+            let final_target_id = identity(&final_target).unwrap();
+            let target_exact = if code == 0 {
+                final_target_id == source_id
+                    && read_bounded(&mut final_target, new.len()).unwrap() == new
+            } else {
+                final_target_id == target_id
+                    && read_bounded(&mut final_target, old.len()).unwrap() == old
+            };
+            let mut sentinel_file = observer(&sentinel);
+            let sentinel_untouched = identity(&sentinel_file).unwrap() == sentinel_id
+                && read_variable(&mut sentinel_file, sentinel_bytes.len().max(new.len())).unwrap()
+                    == sentinel_bytes;
+            let source_exact = identity(&staged).unwrap() == source_id
+                && read_bounded(&mut staged, new.len()).unwrap() == new;
+            let location_exact = if code == 0 {
+                source_absent
+            } else {
+                !source_absent && identity(&observer(&source)).unwrap() == source_id
+            };
+            let held_ids: Vec<_> = profile
+                ._pins
+                .iter()
+                .map(|pin| identity(pin).unwrap())
+                .collect();
+            assert!(other_ids.iter().all(|id| held_ids.contains(id)));
+            assert_eq!(identity(&profile.lock.lock().unwrap()).unwrap(), lease_id);
+            if case != 2 {
+                delete_denied(&home);
+            }
+            // The unchanged retained source guard must still deny writers at its
+            // actual final location. The unrelated owned sentinel stays intact.
+            let guarded = if code != 0 {
+                &source
+            } else if final_target_id == source_id {
+                &target
+            } else {
+                &sentinel
+            };
+            write_denied(guarded);
+            let integrity = target_exact && sentinel_untouched && source_exact && location_exact;
+            eprintln!("directory-pin-matrix: case={case} code={code:#010x} delete_probe={delete_probe} target={} sentinel={} source={} location={} integrity={}",
+                u8::from(target_exact),u8::from(sentinel_untouched),u8::from(source_exact),u8::from(location_exact),u8::from(integrity));
+            observations.push((case, code, integrity));
+            drop(sentinel_file);
+            drop(final_target);
+            drop(staged);
+            drop(profile);
+            parent.close().unwrap();
+        }
+        // A is already observed in the published native failure. C/D remain
+        // diagnostic outcomes, not speculative success requirements. The old
+        // nine strict production expectations still run independently afterward.
+        assert_eq!(observations[0].1, 0x8007_0020);
+        assert!(observations.iter().all(|(_, _, integrity)| *integrity));
     }
 }

@@ -45,13 +45,26 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build debug-only credential-free qualifier
         run: cargo build -p zephium-codex-broker --locked --features native-fixtures --bin codex-broker-fixture
-      - name: Exact owned profile migration and image resolution negatives
+      - name: Controlled directory-pin diagnostic (no production policy change)
         run: |
-          $profile = @(cargo test -p zephium-codex-broker --locked --features native-fixtures,trial-integration --lib profile::native::tests:: -- --ignored --test-threads=1)
+          $matrix = @(cargo test -p zephium-codex-broker --locked --features native-fixtures,trial-integration --lib profile::native::directory_pin_diagnostic::isolates_containing_directory_pin_without_changing_production_policy -- --ignored --exact --nocapture --test-threads=1 2>&1)
           $code = $LASTEXITCODE
-          $profile | Write-Output
+          $matrix | Write-Output
           if ($code -ne 0) { exit $code }
-          if (@($profile | Where-Object { $_ -cmatch '^test result: ok\. 9 passed; 0 failed; 0 ignored;' }).Count -ne 1) { throw 'Expected all nine owned profile tests, including the retained-handle differential.' }
+          if (@($matrix | Where-Object { $_ -cmatch '^test result: ok\. 1 passed; 0 failed; 0 ignored;' }).Count -ne 1) { throw 'Expected the exact directory-pin diagnostic.' }
+          foreach ($case in 0..3) {
+            $pattern = 'directory-pin-matrix: case=' + $case + ' code=0x[0-9a-f]{8} delete_probe=[^ ]+ target=1 sentinel=1 source=1 location=1 integrity=1$'
+            if (@($matrix | Where-Object { $_ -cmatch $pattern }).Count -ne 1) { throw 'Expected each finite directory-pin observation exactly once.' }
+          }
+      - name: Fresh owned profile and image-resolution prerequisites
+        run: |
+          # These unchanged six controls establish fresh ownership independently
+          # of old-policy metadata replacement. The full nine remain mandatory below.
+          $fresh = @(cargo test -p zephium-codex-broker --locked --features native-fixtures,trial-integration --lib profile::native::tests:: -- --ignored --test-threads=1 --skip managed_policy_migration_recovers_every_interrupted_boundary_without_auth_or_identity_changes --skip every_exact_old_new_metadata_pair_recovers_under_its_bound_journal --skip retained_metadata_handle_rename_preserves_identity_without_reopening_source)
+          $code = $LASTEXITCODE
+          $fresh | Write-Output
+          if ($code -ne 0) { exit $code }
+          if (@($fresh | Where-Object { $_ -cmatch '^test result: ok\. 6 passed; 0 failed; 0 ignored;' }).Count -ne 1) { throw 'Expected all six independent fresh-profile controls.' }
           $image = @(cargo test -p zephium-codex-broker --locked --features native-fixtures,trial-integration --lib image::resolution::tests:: -- --ignored --test-threads=1)
           $code = $LASTEXITCODE
           $image | Write-Output
@@ -61,3 +74,12 @@ jobs:
         run: pwsh -NoProfile -File crates/zephium-codex-broker/qualify-windows.ps1
       - name: Managed synthetic owner and original adjacent compatibility (no login or model request)
         run: pwsh -NoProfile -File crates/zephium-codex-broker/qualify-managed-windows.ps1
+      - name: Mandatory complete owned profile migration and recovery gate
+        run: |
+          # Fresh-process evidence above is not migration success. No original
+          # test/assertion is skipped here, and any failure still fails this job.
+          $profile = @(cargo test -p zephium-codex-broker --locked --features native-fixtures,trial-integration --lib profile::native::tests:: -- --ignored --test-threads=1)
+          $code = $LASTEXITCODE
+          $profile | Write-Output
+          if ($code -ne 0) { exit $code }
+          if (@($profile | Where-Object { $_ -cmatch '^test result: ok\. 9 passed; 0 failed; 0 ignored;' }).Count -ne 1) { throw 'Expected all nine owned profile tests, including the retained-handle differential.' }
