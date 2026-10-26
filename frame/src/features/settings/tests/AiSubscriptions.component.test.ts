@@ -125,7 +125,9 @@ test("gated OpenCode discovery is unknown rather than missing or connected", asy
     id: "opencode",
     cli: { id: "opencode", status: "unknown", version: null, path: null, account: null },
   });
-  await expect.element(screen.getByRole("heading", { name: "OpenCode", exact: true })).toBeVisible();
+  await expect
+    .element(screen.getByRole("heading", { name: "OpenCode", exact: true }))
+    .toBeVisible();
   await expect.element(screen.getByText("Sign-in verification unavailable")).toBeVisible();
   await expect.element(screen.getByRole("button", { name: "Install" })).not.toBeInTheDocument();
 });
