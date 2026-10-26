@@ -59,6 +59,13 @@ pub fn qualify_token_controls() -> Result<(), &'static str> {
     windows::fixtures::token_controls()
 }
 
+/// Debug-only synthetic interactive stdin/prompt lifecycle. This never invokes a
+/// vendor login, browser, credential read, grant or account status operation.
+#[cfg(all(windows, feature = "native-fixtures"))]
+pub fn qualify_synthetic_auth_inputs() -> Result<(), &'static str> {
+    windows::fixtures::auth_inputs()
+}
+
 /// Debug-only startup probe of one exact hash-pinned, Authenticode-verified vendor
 /// image. Only `--version` and restricted safe `--help`; no account operations.
 #[cfg(all(windows, feature = "native-fixtures"))]

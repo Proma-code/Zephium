@@ -11,7 +11,11 @@ use std::{
     mem::{size_of, size_of_val},
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::SyncSender,
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use windows::{
@@ -23,8 +27,8 @@ use windows::{
         },
         Security::{
             EqualSid, GetTokenInformation, TokenAppContainerSid, TokenCapabilities,
-            TokenIsAppContainer, TokenIsLessPrivilegedAppContainer, SECURITY_ATTRIBUTES,
-            SECURITY_CAPABILITIES, TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS, TOKEN_QUERY,
+            TokenIsAppContainer, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
+            TOKEN_APPCONTAINER_INFORMATION, TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_QUERY,
         },
         System::{
             JobObjects::{
@@ -149,6 +153,8 @@ pub(super) enum Command {
 #[cfg(feature = "native-fixtures")]
 #[derive(Clone, Copy)]
 pub(super) enum Fixture {
+    LoginInput,
+    LoginExit,
     TokenAppContainerControl,
     TokenLpacControl,
     VendorVersion,
@@ -175,6 +181,8 @@ impl Command {
             Self::Vendor(operation) => CommandPlan::for_operation(operation).arguments(),
             #[cfg(feature = "native-fixtures")]
             Self::Fixture(mode) => match mode {
+                Fixture::LoginInput => &["--child", "login-input"],
+                Fixture::LoginExit => &["--child", "login-exit"],
                 Fixture::TokenAppContainerControl | Fixture::TokenLpacControl => {
                     &["--child", "stall"]
                 }
@@ -256,6 +264,44 @@ pub(super) struct Output {
     pub(super) stderr: Vec<u8>,
     pub(super) stopped: Option<&'static str>,
 }
+enum Input {
+    Once(zeroize::Zeroizing<Vec<u8>>),
+    Manual(crate::auth::InputReceiver),
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LoginFixtureEvent {
+    Created,
+    CodeRequested,
+}
+pub(super) const LOGIN_FIXTURE_PROMPT: &[u8] = b"synthetic-code-request\n";
+pub(super) const LOGIN_FIXTURE_COMPLETE: &[u8] =
+    b"synthetic-code-request\nsynthetic-code-received\n";
+
+#[cfg(feature = "native-fixtures")]
+pub(super) fn run_login_fixture(
+    profile: &Profile,
+    image: &HeldImage,
+    layout: &Layout,
+    input: crate::auth::InputReceiver,
+    cancelled: &AtomicBool,
+    events: SyncSender<LoginFixtureEvent>,
+    exit_without_code: bool,
+) -> Result<Output, &'static str> {
+    let fixture = if exit_without_code {
+        Fixture::LoginExit
+    } else {
+        Fixture::LoginInput
+    };
+    run_owned(
+        profile,
+        image,
+        layout,
+        Command::Fixture(fixture),
+        Input::Manual(input),
+        cancelled,
+        Some(events),
+    )
+}
 /// Blocking owning worker. It never returns while a native process/pipe writer is
 /// live, even if its caller cancels or its deadline expires. A disconnected UI
 /// must set `cancelled`; the worker and physical custody are independent of it.
@@ -267,12 +313,57 @@ pub(super) fn run(
     input: Vec<u8>,
     cancelled: &AtomicBool,
 ) -> Result<Output, &'static str> {
-    let started = Instant::now(); // Before creation/preparation, never after spawn.
-    if input.len() > plan::MAX_STDIN_BYTES {
+    run_owned(
+        profile,
+        image,
+        layout,
+        command,
+        Input::Once(zeroize::Zeroizing::new(input)),
+        cancelled,
+        None,
+    )
+}
+fn run_owned(
+    profile: &Profile,
+    image: &HeldImage,
+    layout: &Layout,
+    command: Command,
+    input: Input,
+    cancelled: &AtomicBool,
+    fixture_events: Option<SyncSender<LoginFixtureEvent>>,
+) -> Result<Output, &'static str> {
+    // Before creation/preparation, never after spawn.
+    let started = Instant::now();
+    // Retain independently of controller and stdin-writer lifetime. This lease
+    // cannot disappear until run_owned has reaped the child and joined pipes.
+    let _admission = match &input {
+        Input::Manual(receiver) => Some(receiver.admission()),
+        Input::Once(_) => None,
+    };
+    let mut deadline = started
+        .checked_add(command.deadline())
+        .ok_or("deadline unavailable")?;
+    if let Input::Manual(receiver) = &input {
+        deadline = deadline.min(receiver.deadline());
+    }
+    if matches!(&input, Input::Once(bytes) if bytes.len() > plan::MAX_STDIN_BYTES) {
         return Err("stdin exceeds bound");
     }
+    if matches!(command, Command::Vendor(Operation::StartLogin)) {
+        return Err("original login handoff is not qualified");
+    }
+    if matches!(
+        command,
+        Command::Vendor(Operation::ReadStatus | Operation::Logout)
+    ) && !matches!(&input, Input::Once(bytes) if bytes.is_empty())
+    {
+        return Err("account inspection and logout require empty stdin");
+    }
     let mut decoder = if matches!(command, Command::Vendor(Operation::TextTurn)) {
-        let text = std::str::from_utf8(&input).map_err(|_| "invalid turn input")?;
+        let Input::Once(bytes) = &input else {
+            return Err("interactive stdin is not model input");
+        };
+        let text = std::str::from_utf8(bytes).map_err(|_| "invalid turn input")?;
         // The actual spawn boundary validates again; internal callers cannot turn
         // raw stdin into a local slash command or bypass the typed input limit.
         let _validated = plan::TurnInput::new(text).map_err(|_| "invalid turn input")?;
@@ -280,7 +371,7 @@ pub(super) fn run(
     } else {
         None
     };
-    if cancelled.load(Ordering::Acquire) {
+    if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
         return Err("cancelled before creation");
     }
     let application = wide(image.path.as_os_str())?;
@@ -393,7 +484,7 @@ pub(super) fn run(
                 )
             }
             .map_err(|_| "LPAC capabilities unavailable")?;
-            if cancelled.load(Ordering::Acquire) || started.elapsed() >= command.deadline() {
+            if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
                 return Err("cancelled before creation");
             }
             unsafe {
@@ -421,8 +512,8 @@ pub(super) fn run(
             let thread = unsafe { OwnedHandle::from_raw_handle(info.hThread.0) };
             #[cfg(feature = "native-fixtures")]
             if let Some(expect_lpac) = command.token_probe() {
-                let result = inspect_identity(handle(&process), capabilities).and_then(|_| {
-                    super::token_probe::verify(handle(&process), capabilities, expect_lpac)
+                let result = inspect_identity(handle(&process), capabilities).and_then(|token| {
+                    super::token_access::verify_control(handle(&token), capabilities, expect_lpac)
                 });
                 if let Err(error) = result {
                     terminate_and_reap(&job, &process);
@@ -458,23 +549,36 @@ pub(super) fn run(
     drop(stdin_read);
     drop(stdout_write);
     drop(stderr_write);
+    if let Some(events) = fixture_events.as_ref() {
+        if events.try_send(LoginFixtureEvent::Created).is_err() {
+            terminate_and_reap(&job, &process);
+            return Err("synthetic auth controller unavailable");
+        }
+    }
     if cancelled.load(Ordering::Acquire)
-        || started.elapsed() >= command.deadline()
+        || Instant::now() >= deadline
         || unsafe { ResumeThread(handle(&thread)) } == u32::MAX
     {
         terminate_and_reap(&job, &process);
         return Err("cancelled or resume failed");
     }
     drop(thread);
+    let writer_finished = Arc::new(AtomicBool::new(false));
+    let writer_signal = Arc::clone(&writer_finished);
     let writer = match std::thread::Builder::new()
         .name("claude-private-stdin".into())
         .spawn(move || {
             let mut file = File::from(stdin_write);
-            let mut input = input;
-            let result = file.write_all(&input);
-            input.fill(0);
+            let result = match input {
+                Input::Once(mut input) => {
+                    let result = file.write_all(&input).is_ok();
+                    input.fill(0);
+                    result
+                }
+                Input::Manual(receiver) => receiver.write_one(&mut file, &writer_signal).is_ok(),
+            };
             drop(file);
-            result.is_ok()
+            result
         }) {
         Ok(writer) => writer,
         Err(_) => {
@@ -490,10 +594,9 @@ pub(super) fn run(
     let mut err_closed = false;
     let mut exit = None;
     let mut stopped = None;
+    let mut prompt_sent = false;
     loop {
-        if stopped.is_none()
-            && (cancelled.load(Ordering::Acquire) || started.elapsed() >= command.deadline())
-        {
+        if stopped.is_none() && (cancelled.load(Ordering::Acquire) || Instant::now() >= deadline) {
             stopped = Some("cancelled or deadline exceeded");
         }
         let previous_stdout = out.len();
@@ -523,8 +626,22 @@ pub(super) fn run(
                     stopped = Some("vendor protocol mismatch");
                 }
             }
+            if let Some(events) = fixture_events.as_ref() {
+                // Only the fixed synthetic helper emits this grammar. This must
+                // never be used as an original vendor authentication parser.
+                if !LOGIN_FIXTURE_COMPLETE.starts_with(&out) {
+                    stopped = Some("synthetic auth prompt mismatch");
+                } else if !prompt_sent && out.len() >= LOGIN_FIXTURE_PROMPT.len() {
+                    if events.try_send(LoginFixtureEvent::CodeRequested).is_err() {
+                        stopped = Some("synthetic auth controller unavailable");
+                    } else {
+                        prompt_sent = true;
+                    }
+                }
+            }
         }
         if stopped.is_some() {
+            writer_finished.store(true, Ordering::Release);
             let _ = job.stop();
         }
         if exit.is_none() {
@@ -535,6 +652,7 @@ pub(super) fn run(
                         stopped.get_or_insert("exit status unavailable");
                     }
                     exit = Some(code as i32);
+                    writer_finished.store(true, Ordering::Release);
                 }
                 WAIT_TIMEOUT => {}
                 _ => {
@@ -627,7 +745,7 @@ fn read_available(
 }
 fn verify_token(process: HANDLE, capabilities: &SECURITY_CAPABILITIES) -> Result<(), &'static str> {
     let token = inspect_identity(process, capabilities)?;
-    inspect_boolean(&token, TokenIsLessPrivilegedAppContainer)
+    super::token_access::verify_lpac(handle(&token), capabilities)
 }
 fn inspect_boolean(
     token: &OwnedHandle,
@@ -662,10 +780,12 @@ fn inspect_identity(
     capabilities: &SECURITY_CAPABILITIES,
 ) -> Result<OwnedHandle, &'static str> {
     let mut raw = HANDLE::default();
-    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut raw) }.map_err(|error| {
-        super::diagnostic("open-process-token", error.code().0);
-        "token inspection failed"
-    })?;
+    unsafe { OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE, &mut raw) }.map_err(
+        |error| {
+            super::diagnostic("open-process-token", error.code().0);
+            "token inspection failed"
+        },
+    )?;
     let token = unsafe { OwnedHandle::from_raw_handle(raw.0) };
     inspect_boolean(&token, TokenIsAppContainer)?;
     let mut buffer = [0usize; 128];

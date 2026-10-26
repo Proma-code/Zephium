@@ -109,7 +109,7 @@ impl fmt::Debug for TurnInput {
 }
 impl Drop for TurnInput {
     fn drop(&mut self) {
-        self.0.fill(0);
+        zeroize::Zeroize::zeroize(&mut self.0);
     }
 }
 

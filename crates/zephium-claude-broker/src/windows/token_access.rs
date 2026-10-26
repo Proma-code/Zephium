@@ -1,4 +1,4 @@
-//! Debug-only actual-token ACL measurements, not a production IsLPAC API.
+//! Mandatory pre-resume actual-token ACL checks. Production remains gated.
 use super::wide;
 use std::{
     ffi::OsStr,
@@ -16,9 +16,8 @@ use windows::{
                 SDDL_REVISION_1,
             },
             DuplicateToken, SecurityIdentification, GENERIC_MAPPING, PRIVILEGE_SET,
-            PSECURITY_DESCRIPTOR, SECURITY_CAPABILITIES, TOKEN_DUPLICATE, TOKEN_QUERY,
+            PSECURITY_DESCRIPTOR, SECURITY_CAPABILITIES,
         },
-        System::Threading::OpenProcessToken,
     },
 };
 struct Descriptor(PSECURITY_DESCRIPTOR);
@@ -27,28 +26,27 @@ impl Drop for Descriptor {
         unsafe { LocalFree(Some(HLOCAL(self.0 .0))) };
     }
 }
-pub(super) fn verify(
-    process: HANDLE,
+pub(super) fn verify_lpac(
+    token: HANDLE,
+    capabilities: &SECURITY_CAPABILITIES,
+) -> Result<(), &'static str> {
+    verify(token, capabilities, true)
+}
+#[cfg(feature = "native-fixtures")]
+pub(super) fn verify_control(
+    token: HANDLE,
+    capabilities: &SECURITY_CAPABILITIES,
+    expect_lpac: bool,
+) -> Result<(), &'static str> {
+    verify(token, capabilities, expect_lpac)
+}
+fn verify(
+    primary: HANDLE,
     capabilities: &SECURITY_CAPABILITIES,
     expect_lpac: bool,
 ) -> Result<(), &'static str> {
     let mut raw = HANDLE::default();
-    unsafe { OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE, &mut raw) }.map_err(
-        |error| {
-            super::diagnostic("token-control-open", error.code().0);
-            "token control unavailable"
-        },
-    )?;
-    let primary = unsafe { OwnedHandle::from_raw_handle(raw.0) };
-    let mut raw = HANDLE::default();
-    unsafe {
-        DuplicateToken(
-            HANDLE(primary.as_raw_handle()),
-            SecurityIdentification,
-            &mut raw,
-        )
-    }
-    .map_err(|error| {
+    unsafe { DuplicateToken(primary, SecurityIdentification, &mut raw) }.map_err(|error| {
         super::diagnostic("token-control-duplicate", error.code().0);
         "token control duplicate unavailable"
     })?;

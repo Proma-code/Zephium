@@ -5,12 +5,13 @@ use crate::{
     plan::Operation,
 };
 use std::{
+    collections::HashMap,
     fmt,
     io::Write,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
-        Arc,
+        Arc, Mutex, OnceLock, Weak,
     },
     time::{Duration, Instant},
 };
@@ -18,6 +19,24 @@ use std::{
 const MAX_CODE_BYTES: usize = 4096;
 const MAX_HANDOFF_BYTES: usize = 8192;
 const LOGIN_DEADLINE: Duration = Duration::from_secs(300);
+
+/// Native worker lifetime, separate from any controller/view. One Claude account
+/// slot per native profile; generation changes cannot evade an older live lease.
+pub(crate) struct Admission;
+fn reserve_admission(profile: u128) -> Result<Arc<Admission>, AuthError> {
+    static REGISTRY: OnceLock<Mutex<HashMap<u128, Weak<Admission>>>> = OnceLock::new();
+    let mut slots = REGISTRY
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| AuthError::Closed)?;
+    slots.retain(|_, lease| lease.strong_count() != 0);
+    if slots.get(&profile).and_then(Weak::upgrade).is_some() {
+        return Err(AuthError::Busy);
+    }
+    let lease = Arc::new(Admission);
+    slots.insert(profile, Arc::downgrade(&lease));
+    Ok(lease)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AuthError {
@@ -29,9 +48,13 @@ pub(crate) enum AuthError {
     Closed,
     Expired,
     OpenFailed,
+    Exhausted,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Attempt(Ticket);
+pub(crate) struct Attempt {
+    ticket: Ticket,
+    controller: u64,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum State {
     Preparing,
@@ -45,7 +68,7 @@ pub(crate) enum State {
 
 /// One manual response, not a token importer or a model/tool input. No Clone,
 /// Serialize or raw Debug. Its allocation is overwritten on every owned drop.
-pub(crate) struct ManualCode(Vec<u8>);
+pub(crate) struct ManualCode(zeroize::Zeroizing<Vec<u8>>);
 impl ManualCode {
     pub(crate) fn new(value: &str) -> Result<Self, AuthError> {
         // A single opaque printable ASCII code, potentially containing '#'. Never
@@ -58,16 +81,11 @@ impl ManualCode {
         }
         let mut bytes = Vec::with_capacity(value.len() + 1);
         bytes.extend_from_slice(value.as_bytes());
-        Ok(Self(bytes))
+        Ok(Self(zeroize::Zeroizing::new(bytes)))
     }
     fn write_to(mut self, output: &mut impl Write) -> std::io::Result<()> {
         self.0.push(b'\n');
         output.write_all(&self.0)
-    }
-}
-impl Drop for ManualCode {
-    fn drop(&mut self) {
-        self.0.fill(0);
     }
 }
 impl fmt::Debug for ManualCode {
@@ -76,7 +94,7 @@ impl fmt::Debug for ManualCode {
     }
 }
 
-struct Handoff(url::Url);
+struct Handoff(zeroize::Zeroizing<String>);
 impl Handoff {
     fn candidate(value: &str) -> Result<Self, AuthError> {
         // These exact vendor origins/authorize path are a candidate allowlist,
@@ -93,7 +111,8 @@ impl Handoff {
             .strip_prefix("https://")
             .and_then(|tail| tail.split('/').next())
             .ok_or(AuthError::InvalidHandoff)?;
-        if authority.contains('%')
+        let invalid = authority.contains('%')
+            || authority.contains('@')
             || url.scheme() != "https"
             || !url.username().is_empty()
             || url.password().is_some()
@@ -110,11 +129,12 @@ impl Handoff {
                     key.as_ref(),
                     "code" | "access_token" | "refresh_token" | "id_token" | "client_secret"
                 )
-            })
-        {
+            });
+        let canonical = zeroize::Zeroizing::new(url.into());
+        if invalid {
             return Err(AuthError::InvalidHandoff);
         }
-        Ok(Self(url))
+        Ok(Self(canonical))
     }
 }
 impl fmt::Debug for Handoff {
@@ -128,8 +148,16 @@ impl fmt::Debug for Handoff {
 pub(crate) struct InputReceiver {
     receiver: Receiver<ManualCode>,
     cancelled: Arc<AtomicBool>,
+    expires: Instant,
+    admission: Arc<Admission>,
 }
 impl InputReceiver {
+    pub(crate) fn admission(&self) -> Arc<Admission> {
+        Arc::clone(&self.admission)
+    }
+    pub(crate) fn deadline(&self) -> Instant {
+        self.expires
+    }
     /// Physical child exit sets `finished`, so an idle writer cannot keep custody
     /// forever waiting for a view that has already disappeared.
     pub(crate) fn write_one(
@@ -137,12 +165,26 @@ impl InputReceiver {
         output: &mut impl Write,
         finished: &AtomicBool,
     ) -> Result<(), AuthError> {
+        self.write_one_clock(output, finished, Instant::now)
+    }
+    fn write_one_clock(
+        self,
+        output: &mut impl Write,
+        finished: &AtomicBool,
+        now: impl Fn() -> Instant,
+    ) -> Result<(), AuthError> {
         loop {
+            if now() >= self.expires {
+                return Err(AuthError::Expired);
+            }
             if self.cancelled.load(Ordering::Acquire) || finished.load(Ordering::Acquire) {
                 return Err(AuthError::Closed);
             }
             match self.receiver.recv_timeout(Duration::from_millis(20)) {
                 Ok(code) => {
+                    if now() >= self.expires {
+                        return Err(AuthError::Expired);
+                    }
                     // Cancellation can race channel delivery. Recheck before the
                     // bounded write; native job termination breaks blocked writes.
                     if self.cancelled.load(Ordering::Acquire) || finished.load(Ordering::Acquire) {
@@ -157,6 +199,7 @@ impl InputReceiver {
     }
 }
 struct Active {
+    _admission: Arc<Admission>,
     attempt: Attempt,
     owner: Owner,
     expires: Instant,
@@ -170,16 +213,24 @@ struct Active {
 /// native bridge, never from model text or an untrusted renderer-supplied owner.
 pub(crate) struct Controller {
     owner: Owner,
+    instance: u64,
     custody: Custody,
     active: Option<Active>,
 }
 impl Controller {
-    pub(crate) fn new(owner: Owner) -> Self {
-        Self {
+    pub(crate) fn new(owner: Owner) -> Result<Self, AuthError> {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let instance = NEXT
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| AuthError::Exhausted)?;
+        Ok(Self {
             owner,
+            instance,
             custody: Custody::default(),
             active: None,
-        }
+        })
     }
     pub(crate) fn reserve(
         &mut self,
@@ -190,14 +241,19 @@ impl Controller {
             return Err(AuthError::Stale);
         }
         let expires = now.checked_add(LOGIN_DEADLINE).ok_or(AuthError::Expired)?;
+        let admission = reserve_admission(owner.profile)?;
         let ticket = self
             .custody
             .reserve(owner, Operation::StartLogin)
             .map_err(|_| AuthError::Busy)?;
-        let attempt = Attempt(ticket);
+        let attempt = Attempt {
+            ticket,
+            controller: self.instance,
+        };
         let cancelled = Arc::new(AtomicBool::new(false));
         let (input, receiver) = mpsc::sync_channel(1);
         self.active = Some(Active {
+            _admission: Arc::clone(&admission),
             attempt,
             owner,
             expires,
@@ -212,6 +268,8 @@ impl Controller {
             InputReceiver {
                 receiver,
                 cancelled: Arc::clone(&cancelled),
+                expires,
+                admission,
             },
             cancelled,
         ))
@@ -253,7 +311,7 @@ impl Controller {
     pub(crate) fn spawned(&mut self, attempt: Attempt) -> Result<(), AuthError> {
         self.active(attempt)?;
         self.custody
-            .spawned(attempt.0)
+            .spawned(attempt.ticket)
             .map_err(|_| AuthError::Order)?;
         let active = self.active(attempt)?;
         if active.state == State::Preparing {
@@ -334,8 +392,9 @@ impl Controller {
         self.stop(attempt)
     }
     fn stop(&mut self, attempt: Attempt) -> Result<(), AuthError> {
+        self.active(attempt)?;
         self.custody
-            .request_stop(attempt.0)
+            .request_stop(attempt.ticket)
             .map_err(|_| AuthError::Stale)?;
         let active = self.active(attempt)?;
         active.cancelled.store(true, Ordering::Release);
@@ -354,8 +413,9 @@ impl Controller {
         Ok(())
     }
     pub(crate) fn stop_unconfirmed(&mut self, attempt: Attempt) -> Result<(), AuthError> {
+        self.active(attempt)?;
         self.custody
-            .stop_unconfirmed(attempt.0)
+            .stop_unconfirmed(attempt.ticket)
             .map_err(|_| AuthError::Order)?;
         self.active(attempt)?.state = State::StopUnconfirmed;
         Ok(())
@@ -363,33 +423,40 @@ impl Controller {
     pub(crate) fn abandon_uncreated(&mut self, attempt: Attempt) -> Result<(), AuthError> {
         self.active(attempt)?;
         self.custody
-            .abandon_before_spawn(attempt.0)
+            .abandon_before_spawn(attempt.ticket)
             .map_err(|_| AuthError::Order)?;
+        let active = self.active(attempt)?;
+        active.cancelled.store(true, Ordering::Release);
+        active.input = None;
+        active.handoff = None;
         self.active = None;
         Ok(())
     }
     pub(crate) fn observed_exit(&mut self, attempt: Attempt, code: i32) -> Result<(), AuthError> {
         self.active(attempt)?;
         self.custody
-            .observed_exit(attempt.0, code)
+            .observed_exit(attempt.ticket, code)
             .map_err(|_| AuthError::Order)?;
         let active = self.active(attempt)?;
+        active.cancelled.store(true, Ordering::Release);
         active.input = None;
         active.handoff = None;
         active.state = State::Exited;
         Ok(())
     }
     pub(crate) fn settled_pipe(&mut self, attempt: Attempt, pipe: usize) -> Result<(), AuthError> {
+        self.active(attempt)?;
         self.custody
-            .settled_pipe(attempt.0, pipe)
+            .settled_pipe(attempt.ticket, pipe)
             .map_err(|_| AuthError::Order)
     }
     /// Exit zero only permits a later separately authorized native status recheck;
     /// this result is never a Connected state or a subscription entitlement.
     pub(crate) fn release(&mut self, attempt: Attempt) -> Result<i32, AuthError> {
+        self.active(attempt)?;
         let code = self
             .custody
-            .release(attempt.0)
+            .release(attempt.ticket)
             .map_err(|_| AuthError::Order)?;
         self.active = None;
         Ok(code)
@@ -410,8 +477,14 @@ impl Drop for Controller {
 mod tests {
     use super::*;
     fn owner() -> Owner {
+        thread_local! {
+            static PROFILE: u128 = {
+                static NEXT_PROFILE: AtomicU64 = AtomicU64::new(1);
+                u128::from(NEXT_PROFILE.fetch_add(1, Ordering::Relaxed))
+            };
+        }
         Owner {
-            profile: 1,
+            profile: PROFILE.with(|profile| *profile),
             account_generation: 2,
             profile_generation: 3,
         }
@@ -453,6 +526,7 @@ mod tests {
             "https://claude.ai.evil.test/oauth/authorize?state=x",
             "https://claude.ai@evil.test/oauth/authorize?state=x",
             "https://user@claude.ai/oauth/authorize?state=x",
+            "https://@claude.ai/oauth/authorize?state=x",
             "https://claude.ai:444/oauth/authorize?state=x",
             "https://claude.ai/oauth/authorize?state=x#fragment",
             "https://%63laude.ai/oauth/authorize?state=x",
@@ -472,7 +546,7 @@ mod tests {
     #[test]
     fn prompt_is_required_one_code_only_and_no_implicit_browser_open() {
         let now = Instant::now();
-        let mut c = Controller::new(owner());
+        let mut c = Controller::new(owner()).unwrap();
         let (a, receiver, _) = c.reserve(owner(), now).unwrap();
         c.spawned(a).unwrap();
         assert_eq!(
@@ -514,7 +588,7 @@ mod tests {
     #[test]
     fn cancel_retains_custody_and_prevents_queued_code_delivery() {
         let now = Instant::now();
-        let mut c = Controller::new(owner());
+        let mut c = Controller::new(owner()).unwrap();
         let (a, receiver, cancel) = c.reserve(owner(), now).unwrap();
         c.spawned(a).unwrap();
         c.code_requested(owner(), a, now).unwrap();
@@ -537,8 +611,8 @@ mod tests {
     #[test]
     fn profile_retirement_blocks_stale_actions_but_not_native_cleanup() {
         let now = Instant::now();
-        let mut c = Controller::new(owner());
-        let (a, _receiver, cancel) = c.reserve(owner(), now).unwrap();
+        let mut c = Controller::new(owner()).unwrap();
+        let (a, receiver, cancel) = c.reserve(owner(), now).unwrap();
         c.spawned(a).unwrap();
         let next = Owner {
             profile_generation: 4,
@@ -553,6 +627,7 @@ mod tests {
         );
         assert!(matches!(c.reserve(next, now), Err(AuthError::Busy)));
         settle(&mut c, a);
+        drop(receiver);
         let (b, _, _) = c.reserve(next, now).unwrap();
         assert_ne!(a, b);
         assert_eq!(c.cancel(next, a), Err(AuthError::Stale));
@@ -561,7 +636,7 @@ mod tests {
     #[test]
     fn deadline_starts_at_reservation_and_invalidates_handoff() {
         let now = Instant::now();
-        let mut c = Controller::new(owner());
+        let mut c = Controller::new(owner()).unwrap();
         let (a, _, cancelled) = c.reserve(owner(), now).unwrap();
         c.spawned(a).unwrap();
         assert_eq!(
@@ -574,7 +649,7 @@ mod tests {
     #[test]
     fn actual_exit_settles_idle_stdin_and_all_three_ends_are_required() {
         let now = Instant::now();
-        let mut c = Controller::new(owner());
+        let mut c = Controller::new(owner()).unwrap();
         let (a, receiver, _) = c.reserve(owner(), now).unwrap();
         c.spawned(a).unwrap();
         let mut output = Vec::new();
@@ -592,7 +667,7 @@ mod tests {
     #[test]
     fn cancellation_racing_creation_cannot_abandon_child() {
         let now = Instant::now();
-        let mut c = Controller::new(owner());
+        let mut c = Controller::new(owner()).unwrap();
         let (a, _, _) = c.reserve(owner(), now).unwrap();
         c.cancel(owner(), a).unwrap();
         c.spawned(a).unwrap();
@@ -603,7 +678,7 @@ mod tests {
     #[test]
     fn dropped_view_controller_cancels_without_auth_or_token_operation() {
         let now = Instant::now();
-        let mut c = Controller::new(owner());
+        let mut c = Controller::new(owner()).unwrap();
         let (_, receiver, cancel) = c.reserve(owner(), now).unwrap();
         drop(c);
         assert!(cancel.load(Ordering::Acquire));
@@ -611,5 +686,118 @@ mod tests {
             receiver.write_one(&mut Vec::new(), &AtomicBool::new(false)),
             Err(AuthError::Closed)
         );
+    }
+    #[test]
+    fn controller_recreation_cannot_reuse_an_old_attempt() {
+        let now = Instant::now();
+        let mut first = Controller::new(owner()).unwrap();
+        let (old, _, _) = first.reserve(owner(), now).unwrap();
+        first.abandon_uncreated(old).unwrap();
+        let mut second = Controller::new(owner()).unwrap();
+        let (current, _, _) = second.reserve(owner(), now).unwrap();
+        assert_ne!(old, current);
+        assert_eq!(second.cancel(owner(), old), Err(AuthError::Stale));
+        assert_eq!(second.settled_pipe(old, 0), Err(AuthError::Stale));
+        assert_eq!(second.release(old), Err(AuthError::Stale));
+        second.abandon_uncreated(current).unwrap();
+    }
+    #[test]
+    fn idle_writer_settles_on_cancel_and_channel_eof() {
+        let now = Instant::now();
+        let mut c = Controller::new(owner()).unwrap();
+        let (a, input, cancelled) = c.reserve(owner(), now).unwrap();
+        let worker =
+            std::thread::spawn(move || input.write_one(&mut Vec::new(), &AtomicBool::new(false)));
+        cancelled.store(true, Ordering::Release);
+        assert_eq!(worker.join().unwrap(), Err(AuthError::Closed));
+        c.abandon_uncreated(a).unwrap();
+        let (_, input, _) = c.reserve(owner(), now).unwrap();
+        c.active.as_mut().unwrap().input = None;
+        let mut bytes = Vec::new();
+        assert_eq!(input.write_one(&mut bytes, &AtomicBool::new(false)), Ok(()));
+        assert!(bytes.is_empty());
+    }
+    #[test]
+    fn writer_checks_admission_deadline_without_a_ui_tick() {
+        let mut c = Controller::new(owner()).unwrap();
+        let past = Instant::now()
+            .checked_sub(LOGIN_DEADLINE + Duration::from_secs(1))
+            .unwrap();
+        let (_, input, _) = c.reserve(owner(), past).unwrap();
+        assert_eq!(
+            input.write_one(&mut Vec::new(), &AtomicBool::new(false)),
+            Err(AuthError::Expired)
+        );
+    }
+    #[test]
+    fn deadline_crossing_receive_never_writes_the_code() {
+        let now = Instant::now();
+        let mut c = Controller::new(owner()).unwrap();
+        let (a, input, _) = c.reserve(owner(), now).unwrap();
+        c.spawned(a).unwrap();
+        c.code_requested(owner(), a, now).unwrap();
+        c.submit_code(owner(), a, ManualCode::new("synthetic").unwrap(), now)
+            .unwrap();
+        let calls = std::cell::Cell::new(0);
+        let mut bytes = Vec::new();
+        assert_eq!(
+            input.write_one_clock(&mut bytes, &AtomicBool::new(false), || {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 0 {
+                    now
+                } else {
+                    now + LOGIN_DEADLINE
+                }
+            }),
+            Err(AuthError::Expired)
+        );
+        assert_eq!(calls.get(), 2);
+        assert!(bytes.is_empty());
+    }
+    #[test]
+    fn replacing_controller_cannot_release_a_native_worker_lease() {
+        let now = Instant::now();
+        let mut first = Controller::new(owner()).unwrap();
+        let (a, input, _) = first.reserve(owner(), now).unwrap();
+        first.spawned(a).unwrap();
+        let native_worker_lease = input.admission();
+        drop(first);
+        drop(input);
+        let replacement_owner = Owner {
+            account_generation: 9,
+            profile_generation: 9,
+            ..owner()
+        };
+        let mut replacement = Controller::new(replacement_owner).unwrap();
+        assert!(matches!(
+            replacement.reserve(replacement_owner, now),
+            Err(AuthError::Busy)
+        ));
+        drop(native_worker_lease); // actual native code does this only after reap/join
+        let (b, endpoint, _) = replacement.reserve(replacement_owner, now).unwrap();
+        assert_eq!(replacement.release(a), Err(AuthError::Stale));
+        replacement.abandon_uncreated(b).unwrap();
+        assert!(matches!(
+            replacement.reserve(replacement_owner, now),
+            Err(AuthError::Busy)
+        ));
+        drop(endpoint);
+        assert!(replacement.reserve(replacement_owner, now).is_ok());
+    }
+    #[test]
+    fn abandoning_uncreated_attempt_revokes_a_retained_endpoint() {
+        let now = Instant::now();
+        let mut c = Controller::new(owner()).unwrap();
+        let (attempt, input, cancelled) = c.reserve(owner(), now).unwrap();
+        c.abandon_uncreated(attempt).unwrap();
+        assert!(cancelled.load(Ordering::Acquire));
+        drop(c);
+        let mut bytes = Vec::new();
+        assert_eq!(
+            input.write_one(&mut bytes, &AtomicBool::new(false)),
+            Err(AuthError::Closed)
+        );
+        assert!(bytes.is_empty());
     }
 }

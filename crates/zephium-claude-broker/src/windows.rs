@@ -4,8 +4,7 @@ pub(super) mod fixtures;
 mod process;
 mod security;
 mod signature;
-#[cfg(feature = "native-fixtures")]
-mod token_probe;
+mod token_access;
 
 use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
 fn wide(value: &OsStr) -> Result<Vec<u16>, &'static str> {

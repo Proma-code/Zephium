@@ -259,7 +259,7 @@ pub(crate) fn qualify() -> Result<(), &'static str> {
 
 /// Actual suspended-token discrimination only. This scenario never resumes a
 /// child, reads an account, or admits a vendor image. It is separate from the
-/// strict synthetic runtime qualification, which still requires class 46.
+/// strict synthetic runtime qualification, which requires the LPAC matrix.
 pub(crate) fn token_controls() -> Result<(), &'static str> {
     let suffix = format!(
         "{}.{}",
@@ -391,4 +391,148 @@ fn receipt(stage: &'static str, output: &process::Output) {
         )
         .as_bytes(),
     );
+}
+
+/// Synthetic prompt/manual-input scenarios only, under the unchanged strict
+/// native launch checks. No real auth stdout grammar is guessed here.
+pub(crate) fn auth_inputs() -> Result<(), &'static str> {
+    use crate::{
+        auth::{Controller, ManualCode},
+        custody::Owner,
+    };
+    use std::sync::{atomic::Ordering, Arc};
+    struct StopOnDrop(Arc<AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let suffix = format!(
+        "{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "clock unavailable")?
+            .as_nanos()
+    );
+    let profile = Profile::create(&format!("Zephium.ClaudeFixture.{suffix}"))?;
+    let root = Root::create(
+        std::env::temp_dir().join(format!("Zephium.ClaudeAuthFixture.{suffix}")),
+        &profile,
+    )?;
+    let layout = Layout::create(&root.0, &profile)?;
+    let image_path = root.0.join("fixture.exe");
+    profile.copy_image(
+        &std::env::current_exe().map_err(|_| "fixture identity unavailable")?,
+        &image_path,
+    )?;
+    let hash =
+        security::hash(&mut File::open(&image_path).map_err(|_| "fixture image unavailable")?)?;
+    let image = HeldImage::open(&image_path, hash)?;
+    let owner = Owner {
+        profile: 1,
+        account_generation: 1,
+        profile_generation: 1,
+    };
+    let mut controller =
+        Controller::new(owner).map_err(|_| "synthetic controller identity exhausted")?;
+    for scenario in ["manual-code", "cancel-waiting-code", "exit-waiting-code"] {
+        let (attempt, input, cancelled) = controller
+            .reserve(owner, std::time::Instant::now())
+            .map_err(|_| "synthetic auth reservation failed")?;
+        let (sender, events) = std::sync::mpsc::sync_channel(2);
+        let output = std::thread::scope(|scope| -> Result<process::Output, &'static str> {
+            let _stop = StopOnDrop(Arc::clone(&cancelled));
+            let cancellation = &cancelled;
+            let worker = scope.spawn(|| {
+                process::run_login_fixture(
+                    &profile,
+                    &image,
+                    &layout,
+                    input,
+                    cancellation,
+                    sender,
+                    scenario == "exit-waiting-code",
+                )
+            });
+            if events
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| "synthetic creation event missing")?
+                != process::LoginFixtureEvent::Created
+            {
+                return Err("synthetic auth event order mismatch");
+            }
+            controller
+                .spawned(attempt)
+                .map_err(|_| "synthetic spawn accounting failed")?;
+            if events
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| "synthetic prompt event missing")?
+                != process::LoginFixtureEvent::CodeRequested
+            {
+                return Err("synthetic auth prompt order mismatch");
+            }
+            controller
+                .code_requested(owner, attempt, std::time::Instant::now())
+                .map_err(|_| "synthetic prompt accounting failed")?;
+            if scenario == "manual-code" {
+                controller
+                    .submit_code(
+                        owner,
+                        attempt,
+                        ManualCode::new("synthetic-native-code#synthetic-state")
+                            .map_err(|_| "synthetic code invalid")?,
+                        std::time::Instant::now(),
+                    )
+                    .map_err(|_| "synthetic code delivery failed")?;
+            } else if scenario == "cancel-waiting-code" {
+                controller
+                    .cancel(owner, attempt)
+                    .map_err(|_| "synthetic cancel failed")?;
+            }
+            worker
+                .join()
+                .map_err(|_| "synthetic auth worker panicked")?
+        })?;
+        receipt(scenario, &output);
+        match scenario {
+            "manual-code"
+                if output.code == 0
+                    && output.stopped.is_none()
+                    && output.stdout == process::LOGIN_FIXTURE_COMPLETE => {}
+            "cancel-waiting-code"
+                if output.code != 0
+                    && output.stopped == Some("cancelled or deadline exceeded")
+                    && output.stdout == process::LOGIN_FIXTURE_PROMPT => {}
+            "exit-waiting-code"
+                if output.code == 0
+                    && output.stopped == Some("stdin interrupted")
+                    && output.stdout == process::LOGIN_FIXTURE_PROMPT => {}
+            _ => return Err("synthetic auth pipe lifecycle mismatch"),
+        }
+        if !output.stderr.is_empty() {
+            return Err("synthetic auth stderr was not empty");
+        }
+        controller
+            .observed_exit(attempt, output.code)
+            .map_err(|_| "synthetic auth exit accounting failed")?;
+        for pipe in 0..3 {
+            controller
+                .settled_pipe(attempt, pipe)
+                .map_err(|_| "synthetic auth pipe accounting failed")?;
+        }
+        if controller
+            .release(attempt)
+            .map_err(|_| "synthetic auth custody not settled")?
+            != output.code
+        {
+            return Err("synthetic auth release mismatch");
+        }
+    }
+    drop(image);
+    drop(layout);
+    root.cleanup()?;
+    profile.close()?;
+    super::diagnostic("synthetic-auth-inputs-settled", 0);
+    Ok(())
 }

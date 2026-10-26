@@ -18,6 +18,8 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'Actual suspended token ACL controls failed; runtime probe not admitted' }
   cargo run -p zephium-claude-broker --locked --features native-fixtures --bin claude-broker-fixture -- qualify
   if ($LASTEXITCODE -ne 0) { throw 'Synthetic native confinement failed; vendor probe not admitted' }
+  cargo run -p zephium-claude-broker --locked --features native-fixtures --bin claude-broker-fixture -- auth-inputs
+  if ($LASTEXITCODE -ne 0) { throw 'Synthetic interactive input lifecycle failed; vendor probe not admitted' }
   $Image = Join-Path $Root 'claude.exe'
   $Handler = [System.Net.Http.HttpClientHandler]::new()
   $Handler.AllowAutoRedirect = $false

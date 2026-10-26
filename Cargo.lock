@@ -7533,6 +7533,7 @@ dependencies = [
  "tempfile",
  "url",
  "windows",
+ "zeroize",
 ]
 
 [[package]]

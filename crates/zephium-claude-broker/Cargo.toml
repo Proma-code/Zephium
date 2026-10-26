@@ -13,6 +13,7 @@ native-fixtures = []
 serde.workspace = true
 serde_json.workspace = true
 url.workspace = true
+zeroize = "=1.9.0"
 sha2 = "=0.10.9"
 
 [target.'cfg(windows)'.dependencies]

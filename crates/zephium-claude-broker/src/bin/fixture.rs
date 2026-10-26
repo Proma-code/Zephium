@@ -8,6 +8,7 @@ fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let result = match args.as_slice() {
         [mode] if mode == "token-controls" => zephium_claude_broker::qualify_token_controls(),
+        [mode] if mode == "auth-inputs" => zephium_claude_broker::qualify_synthetic_auth_inputs(),
         [mode] if mode == "qualify" => zephium_claude_broker::qualify_synthetic_fixture(),
         [flag, mode, values @ ..] if flag == "--child" && mode == "argv" => {
             if values == ["", "end\\", "a\"b"] {
@@ -40,6 +41,29 @@ fn main() {
 fn child(mode: &str) -> Result<(), &'static str> {
     use std::io::{Read, Write};
     match mode {
+        "login-input" | "login-exit" => {
+            std::io::stdout()
+                .write_all(b"synthetic-code-request\n")
+                .map_err(|_| "synthetic prompt failed")?;
+            std::io::stdout()
+                .flush()
+                .map_err(|_| "synthetic prompt flush failed")?;
+            if mode == "login-input" {
+                let mut input = Vec::new();
+                std::io::stdin()
+                    .take(4098)
+                    .read_to_end(&mut input)
+                    .map_err(|_| "synthetic code input failed")?;
+                let matched = input == b"synthetic-native-code#synthetic-state\n";
+                input.fill(0);
+                if !matched {
+                    return Err("synthetic code input mismatch");
+                }
+                std::io::stdout()
+                    .write_all(b"synthetic-code-received\n")
+                    .map_err(|_| "synthetic code receipt failed")?;
+            }
+        }
         "echo" => {
             let mut input = Vec::new();
             std::io::stdin()
