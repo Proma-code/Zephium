@@ -58,8 +58,13 @@ try {
   }
   if ((Get-Item -LiteralPath $Image).Length -ne $ExpectedSize) { throw 'Pinned vendor image size mismatch' }
   if ((Get-FileHash -LiteralPath $Image -Algorithm SHA256).Hash.ToLowerInvariant() -ne $ExpectedHash) { throw 'Pinned vendor image hash mismatch' }
-  cargo run -p zephium-claude-broker --locked --features native-fixtures --bin claude-broker-fixture -- vendor-probe $Image
-  if ($LASTEXITCODE -ne 0) { throw 'Pinned vendor startup remains unqualified' }
+  $VendorReceipt = & cargo run -p zephium-claude-broker --locked --features native-fixtures --bin claude-broker-fixture -- vendor-probe $Image
+  $VendorCode = $LASTEXITCODE
+  $VendorReceipt | Write-Output
+  if ($VendorCode -ne 0) { throw 'Pinned vendor startup or fresh durable status remains unqualified' }
+  foreach ($Marker in @('durable-status-created', 'durable-status-reopened', 'durable-status-owner-settled')) {
+    if (@($VendorReceipt | Where-Object { $_ -ceq "fixture-stage=$Marker; native-code=0" }).Count -ne 1) { throw 'A required fresh durable status scenario did not complete exactly once.' }
+  }
 } finally {
   # Only the uniquely-created CI download directory; native fixture roots are owned
   # by the helper and cannot contain any real credentials under this contract.

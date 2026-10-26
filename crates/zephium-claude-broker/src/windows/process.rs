@@ -518,12 +518,83 @@ pub(super) fn run_store_config(
         output: result.output,
     })
 }
+/// The exact retained store is returned only after physical process/pipe
+/// settlement. This is not a caller-mintable or transferable CLEAN token.
+#[cfg(feature = "native-fixtures")]
+pub(super) struct SettledStatusCall {
+    active: super::account_store::ActiveStore,
+    output: Output,
+}
+#[cfg(feature = "native-fixtures")]
+impl SettledStatusCall {
+    pub(super) fn into_parts(self) -> (super::account_store::ActiveStore, Output) {
+        (self.active, self.output)
+    }
+}
+/// Only the already-authorized signed-out fixture command is admitted here.
+/// No generic/real status selector, login, refresh, logout or inference is added.
+#[cfg(feature = "native-fixtures")]
+pub(super) fn run_store_status(
+    active: super::account_store::ActiveStore,
+    image: &super::signature::VerifiedImage,
+    expected_key: crate::registration::ProfileKey,
+    expected_owner: crate::custody::Owner,
+    control: &crate::account::Control,
+) -> Result<SettledStatusCall, &'static str> {
+    let key = active.fixture_key();
+    if control.owner() != expected_owner
+        || key.profile != expected_owner.profile
+        || key.profile.to_be_bytes() != expected_key.profile
+        || key.incarnation.to_be_bytes() != expected_key.incarnation
+    {
+        return Err("retained status owner mismatch");
+    }
+    let profile = active
+        .fixture_profile()
+        .map_err(|_| "retained status profile rejected")?;
+    // Derive every path at the owning spawn seam, not only CLAUDE_CONFIG_DIR.
+    // No detached Layout from a caller or previous incarnation is accepted.
+    let paths = active
+        .runtime_paths()
+        .map_err(|_| "retained status runtime rejected")?;
+    let layout = Layout {
+        root: paths.root,
+        work: paths.work,
+        config: paths.config,
+        home: paths.home,
+        temporary: paths.temporary,
+        appdata: paths.appdata,
+        localappdata: paths.localappdata,
+    };
+    super::diagnostic("durable-status-runtime-held", 0);
+    let mut result = run_owned(
+        &profile,
+        image.held(),
+        &layout,
+        Command::Fixture(Fixture::VendorFreshStatus),
+        Input::Once(zeroize::Zeroizing::new(Vec::new())),
+        Fence::Admitted(control),
+        FixtureHooks {
+            store: Some(active),
+            ..FixtureHooks::default()
+        },
+    )?;
+    let active = result
+        .store
+        .take()
+        .ok_or("retained status custody missing")?;
+    Ok(SettledStatusCall {
+        active,
+        output: result.output,
+    })
+}
+
 /// Exclusive native resources for a single fresh-status qualification. This is
 /// not a persistent-store constructor and cannot run any other vendor operation.
 #[cfg(feature = "native-fixtures")]
 pub(super) struct FreshSession {
     owner: crate::custody::Owner,
-    image: HeldImage,
+    image: super::signature::VerifiedImage,
     layout: Layout,
     profile: Profile,
 }
@@ -531,7 +602,7 @@ pub(super) struct FreshSession {
 impl FreshSession {
     pub(super) fn new(
         owner: crate::custody::Owner,
-        image: HeldImage,
+        image: super::signature::VerifiedImage,
         layout: Layout,
         profile: Profile,
     ) -> Self {
@@ -551,7 +622,7 @@ impl FreshSession {
         } else {
             run_owned(
                 &self.profile,
-                &self.image,
+                self.image.held(),
                 &self.layout,
                 Command::Fixture(Fixture::VendorFreshStatus),
                 Input::Once(zeroize::Zeroizing::new(Vec::new())),
@@ -822,10 +893,30 @@ fn run_owned(
     )
     .map_err(|_| "invalid fixed argv")?;
     let cwd = wide(layout.work.as_os_str())?;
+    // A durable status operation already owns the registered OS-data/Temp
+    // chain. Consume that exact validated base rather than rediscovering an OS
+    // folder and silently replacing the held registration's environment.
+    #[cfg(feature = "native-fixtures")]
+    let retained_base = if matches!(command, Command::Fixture(Fixture::VendorFreshStatus)) {
+        store
+            .as_ref()
+            .map(|active| {
+                let paths = active
+                    .runtime_paths()
+                    .map_err(|_| "retained environment proof failed")?;
+                if paths.localappdata != layout.localappdata {
+                    return Err("retained environment binding changed");
+                }
+                Ok(paths.localappdata)
+            })
+            .transpose()?
+    } else {
+        None
+    };
     // This candidate is fixed to the reviewed debug-only fixture/startup list.
     // Keep the own-SID folder/ancestor holds until physical process settlement.
     #[cfg(feature = "native-fixtures")]
-    let fixture_environment = if command.fixture_profile_environment() {
+    let fixture_environment = if retained_base.is_none() && command.fixture_profile_environment() {
         let folder = profile.fixture_folder()?;
         let base = profile.fixture_environment_base(&folder)?;
         Some((folder, base))
@@ -833,9 +924,9 @@ fn run_owned(
         None
     };
     #[cfg(feature = "native-fixtures")]
-    let initial_localappdata = fixture_environment
-        .as_ref()
-        .map(|(_, base)| base.as_path())
+    let initial_localappdata = retained_base
+        .as_deref()
+        .or_else(|| fixture_environment.as_ref().map(|(_, base)| base.as_path()))
         .unwrap_or(&layout.localappdata);
     #[cfg(not(feature = "native-fixtures"))]
     let initial_localappdata = &layout.localappdata;

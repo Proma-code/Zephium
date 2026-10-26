@@ -551,8 +551,11 @@ pub(crate) fn vendor_probe(source: &std::path::Path) -> Result<(), &'static str>
     profile.close()?;
     root.cleanup()?;
     fresh_empty_status(&original)?;
-    drop(original);
     std::io::stdout().write_all(b"pinned signed Claude 2.1.310 version/help and fresh-empty signed-out status ran under LPAC; real account login/status/logout/inference NOT qualified\n").map_err(|_| "vendor receipt failed")?;
+    // Keep the previous qualified path and its receipt independent. This next
+    // increment uses a different exclusively fresh synthetic durable identity.
+    durable_empty_status(&original)?;
+    drop(original);
     Ok(())
 }
 
@@ -583,6 +586,82 @@ fn fresh_empty_status(original: &HeldImage) -> Result<(), &'static str> {
     super::diagnostic("fresh-status-signed-out", 1);
     super::diagnostic("fresh-status-owner-settled", 1);
     Ok(())
+}
+
+/// Create, read back, drop every first store/profile/owner receipt, then reopen
+/// from the on-disk registration. Only a fresh opaque synthetic anchor survives.
+/// This does not open the native trial namespace or prove credential durability.
+fn durable_empty_status(original: &HeldImage) -> Result<(), &'static str> {
+    use super::account_store::registration::FixtureAnchor;
+    use crate::registration::PolicyVersion;
+    let anchor = FixtureAnchor::fresh().map_err(|_| "durable status anchor failed")?;
+    let profile = anchor
+        .new_profile()
+        .map_err(|_| "durable status native identity failed")?;
+    let key = {
+        let factory = anchor
+            .create_factory()
+            .map_err(|_| "durable status new factory failed")?;
+        let lease = factory
+            .create(profile, PolicyVersion::DataV1)
+            .map_err(|_| "durable status fresh registration failed")?;
+        let key = lease.profile_key();
+        let image = super::signature::VerifiedImage::open(&original.path)?;
+        let (owner, port) = super::port::RegisteredStatusPort::create(lease, image)?;
+        registered_signed_out(owner, port)?;
+        super::diagnostic("durable-status-created", 0);
+        key
+    };
+    // No retained first factory, Profile, StoreLease, Receipt, Port or AccountOwner
+    // crosses this boundary. The ProfileKey below is expected public identity,
+    // not a clean/authentication proof or authority to bypass on-disk validation.
+    {
+        let factory = anchor
+            .reopen_factory()
+            .map_err(|_| "durable status disk factory failed")?;
+        let lease = factory
+            .reopen(profile, PolicyVersion::DataV1)
+            .map_err(|_| "durable status disk registration failed")?;
+        if lease.profile_key() != key {
+            return Err("durable status incarnation changed");
+        }
+        let image = super::signature::VerifiedImage::open(&original.path)?;
+        let (owner, port) = super::port::RegisteredStatusPort::create(lease, image)?;
+        registered_signed_out(owner, port)?;
+        super::diagnostic("durable-status-reopened", 0);
+    }
+    // Fresh synthetic residue is deliberately retained, never recursively
+    // adopted/deleted. The disposable runner owns its eventual teardown.
+    super::diagnostic("durable-status-owner-settled", 0);
+    Ok(())
+}
+
+fn registered_signed_out(
+    owner: crate::account::AccountOwner,
+    mut port: super::port::RegisteredStatusPort,
+) -> Result<(), &'static str> {
+    use crate::account::{Reply, Request};
+    use crate::protocol::AuthStatus;
+    use std::time::Instant;
+    if owner.view().status.is_some() {
+        return Err("durable status projected authentication from disk");
+    }
+    let work = owner
+        .begin(
+            owner.scope().map_err(|_| "durable status scope failed")?,
+            Request::ReadStatus,
+            Instant::now(),
+        )
+        .map_err(|_| "durable status admission failed")?;
+    if work.run(&mut port, Instant::now) != Ok(Reply::Status(AuthStatus::SignedOut))
+        || !owner.drained()
+        || owner.view().status != Some(AuthStatus::SignedOut)
+    {
+        return Err("durable status owner did not settle signed out");
+    }
+    owner.close();
+    drop(owner);
+    port.close()
 }
 
 pub(super) fn receipt(stage: &'static str, output: &process::Output) {

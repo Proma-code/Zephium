@@ -1,11 +1,11 @@
-//! Debug-only synthetic store custody. No production path or native account adapter.
+//! Held account-store custody. Native trial registration remains private and unavailable
+//! through the production gate; synthetic constructors are separately feature-gated.
 //!
-//! Receipts are deliberately in-process capabilities, not restart provenance. A
+//! In-memory receipts are capabilities; durable registration is validated separately. A
 //! persistent dirty byte blocks reuse even if a crashed process loses its lock.
 //! No store destructor clears that byte or deletes a store directory. A clean
 //! last Profile Arc still runs the existing fixture Profile destructor; unresolved
 //! custody deliberately retains it. A process crash can leave fixture residue.
-#![cfg(all(debug_assertions, feature = "native-fixtures"))]
 
 use super::security::Profile;
 use std::{
@@ -19,7 +19,9 @@ use std::{
 };
 
 mod native;
+#[cfg(all(debug_assertions, feature = "native-fixtures"))]
 pub(super) mod process_fixtures;
+pub(super) mod registration;
 use native::{HeldDirectory, Identity, Policy};
 
 const LOCK: &str = "custody.lock";
@@ -79,6 +81,7 @@ struct Receipt {
     profile: Arc<Profile>,
     owner_sid: String,
     package_sid: String,
+    durable: Option<crate::registration::Record>,
 }
 
 /// Not serializable, reconstructible from a path, or transferable to another run.
@@ -100,6 +103,8 @@ struct Inner {
     config: HeldDirectory,
     lock: File,
     state: Mutex<File>,
+    registration: Option<Mutex<File>>,
+    runtime: Option<registration::HeldRuntime>,
     active: Mutex<bool>,
     quarantined: AtomicBool,
 }
@@ -120,6 +125,7 @@ fn stage<T>(name: &'static str, result: Result<T, Error>) -> Result<T, Error> {
     result
 }
 
+#[cfg(all(debug_assertions, feature = "native-fixtures"))]
 impl FixtureStoreOwner {
     /// Creates exactly one new random synthetic child of the held temp chain.
     /// No retry/adoption/fallback follows a collision or ambiguous publication.
@@ -144,7 +150,7 @@ impl FixtureStoreOwner {
         let profile = Arc::new(profile);
         let (owner_sid, package_sid) = stage(
             "store-create-principals",
-            profile.fixture_sids().map_err(|_| Error::Invalid),
+            profile.sids().map_err(|_| Error::Invalid),
         )?;
         let mut chain = stage("store-create-parent", native::pin_temp_parent(&owner_sid))?;
         // Only a fully rebound strict canonical chain reaches fresh creation.
@@ -211,6 +217,7 @@ impl FixtureStoreOwner {
             profile,
             owner_sid,
             package_sid,
+            durable: None,
         }));
         let inner = Arc::new(Inner {
             receipt: receipt.clone(),
@@ -218,6 +225,8 @@ impl FixtureStoreOwner {
             config,
             lock,
             state: Mutex::new(state),
+            registration: None,
+            runtime: None,
             active: Mutex::new(false),
             quarantined: AtomicBool::new(false),
         });
@@ -247,13 +256,10 @@ impl StoreLease {
         key: FixtureKey,
     ) -> Result<Self, Error> {
         let expected = &receipt.0;
-        if key != expected.key {
+        if expected.durable.is_some() || key != expected.key {
             return Err(Error::Invalid);
         }
-        let sids = expected
-            .profile
-            .fixture_sids()
-            .map_err(|_| Error::Invalid)?;
+        let sids = expected.profile.sids().map_err(|_| Error::Invalid)?;
         if sids != (expected.owner_sid.clone(), expected.package_sid.clone()) {
             return Err(Error::Invalid);
         }
@@ -291,6 +297,8 @@ impl StoreLease {
             config,
             lock,
             state: Mutex::new(state),
+            registration: None,
+            runtime: None,
             active: Mutex::new(false),
             quarantined: AtomicBool::new(false),
         });
@@ -300,6 +308,14 @@ impl StoreLease {
     }
     pub(super) fn verify(&self) -> Result<(), Error> {
         self.inner.verify()
+    }
+    /// The key was acquired from fresh native creation or an exact private record,
+    /// never from a renderer/path or cached authentication state.
+    pub(super) fn profile_key(&self) -> crate::registration::ProfileKey {
+        crate::registration::ProfileKey {
+            profile: self.inner.receipt.0.key.profile.to_be_bytes(),
+            incarnation: self.inner.receipt.0.key.incarnation.to_be_bytes(),
+        }
     }
 
     /// Retains lifetime custody and flushes dirty state before any future spawn.
@@ -356,6 +372,7 @@ impl ActiveStore {
     }
     /// Only the fixed native return carrying its OWN active operation can clean.
     /// Neither a caller boolean nor a separate owner/token is accepted.
+    #[cfg(all(debug_assertions, feature = "native-fixtures"))]
     pub(super) fn finish_config_fixture(
         call: super::process::SettledStoreCall,
     ) -> Result<(), &'static str> {
@@ -397,6 +414,86 @@ impl ActiveStore {
             .settle(WorkerSettled { _private: () })
             .map_err(|_| "normal config clean settlement failed")
     }
+    /// Only the fixed native signed-out return carrying this exact active store
+    /// can clean the candidate. Existing real account status is not admitted.
+    #[cfg(all(debug_assertions, feature = "native-fixtures"))]
+    pub(super) fn finish_status_fixture(
+        call: super::process::SettledStatusCall,
+    ) -> Result<crate::protocol::AuthStatus, &'static str> {
+        let (active, mut output) = call.into_parts();
+        let stdout = zeroize::Zeroizing::new(std::mem::take(&mut output.stdout));
+        let stderr = zeroize::Zeroizing::new(std::mem::take(&mut output.stderr));
+        if output.stopped.is_some() || !stderr.is_empty() {
+            return Err("signed-out store operation was not successful");
+        }
+        let config = active
+            .config_path()
+            .map_err(|_| "signed-out store proof failed")?;
+        let projects = config.join("projects");
+        crate::fresh_status::validate(
+            &stdout,
+            output.code,
+            config.to_str().ok_or("signed-out config encoding failed")?,
+            projects
+                .to_str()
+                .ok_or("signed-out projects encoding failed")?,
+        )
+        .map_err(|_| "signed-out store receipt rejected")?;
+        active
+            .settle(WorkerSettled { _private: () })
+            .map_err(|_| "signed-out store clean settlement failed")?;
+        Ok(crate::protocol::AuthStatus::SignedOut)
+    }
+    /// Fixed public executable cache, not an auth payload. Both source and final
+    /// target are pinned/signature-verified; no caller filename/hash is admitted.
+    pub(super) fn stage_verified_image(
+        &self,
+        source: &super::signature::VerifiedImage,
+    ) -> Result<super::signature::VerifiedImage, Error> {
+        use std::os::windows::fs::FileExt;
+        self.config_path()?;
+        let receipt = &self.inner.receipt.0;
+        if receipt.durable.is_none() {
+            return Err(Error::Invalid);
+        }
+        let root = &self.inner.chain.last().ok_or(Error::Invalid)?.file;
+        let policy = Policy::image_file(&receipt.owner_sid, &receipt.package_sid);
+        match native::create_file(root, "claude.exe", &policy) {
+            Ok(mut output) => {
+                let source = &source.held().file;
+                let length = source.metadata().map_err(|_| Error::Io)?.len();
+                if length == 0 || length > 512 * 1024 * 1024 {
+                    return Err(Error::Invalid);
+                }
+                let mut offset = 0;
+                let mut buffer = [0u8; 64 * 1024];
+                while offset < length {
+                    let capacity = ((length - offset) as usize).min(buffer.len());
+                    let count = source
+                        .seek_read(&mut buffer[..capacity], offset)
+                        .map_err(|_| Error::Io)?;
+                    if count == 0 {
+                        return Err(Error::Invalid);
+                    }
+                    output.write_all(&buffer[..count]).map_err(|_| Error::Io)?;
+                    offset += count as u64;
+                }
+                output.sync_all().map_err(|_| Error::Io)?;
+                native::sync_directory(root)?;
+            }
+            Err(Error::Collision) => {}
+            Err(error) => return Err(error),
+        }
+        // Keep the exact-policy read handle across final image admission. Its
+        // identity must equal the final signature/hash-pinned image handle.
+        let policy_hold = native::open_read_file(root, "claude.exe", &policy)?;
+        let expected = native::identity(&policy_hold, false)?;
+        let path = native::canonical_parent(root)?.join("claude.exe");
+        let image = super::signature::VerifiedImage::open(&path).map_err(|_| Error::Invalid)?;
+        native::verify_file(root, "claude.exe", &image.held().file, expected, &policy)?;
+        self.config_path()?;
+        Ok(image)
+    }
     /// Path observation is available only under active, independently held custody.
     pub(super) fn config_path(&self) -> Result<PathBuf, Error> {
         self.inner.verify()?;
@@ -406,6 +503,11 @@ impl ActiveStore {
         }
         let receipt = &self.inner.receipt.0;
         Ok(receipt.parent.join(&receipt.root_name).join(CONFIG))
+    }
+    /// Paths are released only while this exact operation owns DIRTY custody.
+    pub(super) fn runtime_paths(&self) -> Result<registration::RuntimePaths, Error> {
+        self.config_path()?;
+        registration::runtime_paths(&self.inner)
     }
     pub(super) fn settle(mut self, _proof: WorkerSettled) -> Result<(), Error> {
         let mut active = self.inner.active.lock().map_err(|_| Error::Quarantined)?;
@@ -458,6 +560,7 @@ impl Inner {
         if self.config.identity != receipt.config {
             return Err(Error::Invalid);
         }
+        registration::verify_durable(self)?;
         let policy = Policy::broker_file(&receipt.owner_sid);
         native::verify_file(parent, LOCK, &self.lock, receipt.lock, &policy)?;
         if self.lock.metadata().map_err(|_| Error::Io)?.len() != 0 {
@@ -520,5 +623,5 @@ fn write_file_state(mut file: &File, state: &[u8; 9]) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native-fixtures"))]
 mod tests;

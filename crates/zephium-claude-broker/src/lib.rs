@@ -24,6 +24,9 @@ mod portable_port;
 #[path = "windows/store_session.rs"]
 mod portable_store_session;
 pub mod protocol;
+#[cfg(any(test, windows))]
+#[allow(dead_code)]
+mod registration;
 mod strict_json;
 #[cfg(any(test, windows))]
 #[allow(dead_code)]

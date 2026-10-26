@@ -1,4 +1,4 @@
-//! Narrow held-native operations for synthetic account-store fixtures only.
+//! Narrow held-native operations shared by trial registration and synthetic stores.
 use super::Error;
 use std::{
     ffi::{c_void, OsStr},
@@ -74,6 +74,22 @@ pub(super) struct Identity {
     volume: u64,
     file: [u8; 16],
 }
+impl From<Identity> for crate::registration::NodeIdentity {
+    fn from(value: Identity) -> Self {
+        Self {
+            volume: value.volume,
+            file: value.file,
+        }
+    }
+}
+impl From<crate::registration::NodeIdentity> for Identity {
+    fn from(value: crate::registration::NodeIdentity) -> Self {
+        Self {
+            volume: value.volume,
+            file: value.file,
+        }
+    }
+}
 #[derive(Clone, Eq, PartialEq)]
 struct Ace {
     kind: u8,
@@ -102,6 +118,14 @@ pub(super) struct HeldDirectory {
     security: Snapshot,
 }
 impl HeldDirectory {
+    pub(super) fn try_clone(&self) -> Result<Self, Error> {
+        Ok(Self {
+            file: self.file.try_clone().map_err(|_| Error::Io)?,
+            identity: self.identity,
+            name: self.name.clone(),
+            security: self.security.clone(),
+        })
+    }
     pub(super) fn receipt(&self) -> DirectoryReceipt {
         DirectoryReceipt {
             name: self.name.clone(),
@@ -226,6 +250,16 @@ impl Policy {
         // bit used for directory traverse. The explicit replacement fixture adds
         // DELETE to OIIO payload files only, never to directories or defaults.
         Self { sddl: format!("O:{owner}D:P(A;OICI;0x{ALL:08x};;;{owner})(A;OICI;0x{ALL:08x};;;SY)(A;OICI;0x{OWNER_READ_CONTROL:08x};;;OW)(A;CI;0x{directory:08x};;;{package})(A;OIIO;0x{file:08x};;;{package})S:(ML;OICI;NW;;;LW)") }
+    }
+    pub(super) fn broker_directory(owner: &str) -> Self {
+        Self {
+            sddl: format!("O:{owner}D:P(A;OICI;0x{ALL:08x};;;{owner})(A;OICI;0x{ALL:08x};;;SY)(A;OICI;0x{OWNER_READ_CONTROL:08x};;;OW)S:(ML;OICI;NW;;;ME)"),
+        }
+    }
+    pub(super) fn image_file(owner: &str, package: &str) -> Self {
+        Self {
+            sddl: format!("O:{owner}D:P(A;;0x{ALL:08x};;;{owner})(A;;0x{ALL:08x};;;SY)(A;;0x{OWNER_READ_CONTROL:08x};;;OW)(A;;0x{READ_EXECUTE:08x};;;{package})S:(ML;;NW;;;LW)"),
+        }
     }
     pub(super) fn broker_file(owner: &str) -> Self {
         Self {
@@ -530,12 +564,15 @@ fn ntfs(file: &File) -> Result<(), Error> {
     // A local drive-root spelling is separately proved; UNC/device roots refuse.
     Ok(())
 }
-pub(super) fn fresh_name() -> Result<String, Error> {
+pub(super) fn random_id() -> Result<[u8; 16], Error> {
     let mut random = [0u8; 16];
     if unsafe { BCryptGenRandom(None, &mut random, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }.0 < 0 {
         return Err(Error::Io);
     }
-    let suffix = random
+    Ok(random)
+}
+pub(super) fn fresh_name() -> Result<String, Error> {
+    let suffix = random_id()?
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
@@ -595,7 +632,10 @@ pub(super) fn valid_temp_hint_syntax(path: &Path) -> bool {
 /// hint is never returned or used for creation, nor is it a caller-selected root.
 pub(super) fn pin_temp_parent(owner: &str) -> Result<Vec<HeldDirectory>, Error> {
     let hint = std::env::temp_dir();
-    let bootstrap = super::stage("store-temp-bootstrap", pin_parent_inner(&hint, owner, true))?;
+    let bootstrap = super::stage(
+        "store-temp-bootstrap",
+        pin_parent_inner(&hint, owner, true, None),
+    )?;
     let canonical = canonical_parent(&bootstrap.last().ok_or(Error::Invalid)?.file)?;
     // Preserve the whole bootstrap while independently re-pinning exact spelling.
     // Only the strict chain is allowed to reach any create or receipt constructor.
@@ -611,6 +651,95 @@ pub(super) fn pin_temp_parent(owner: &str) -> Result<Vec<HeldDirectory>, Error> 
             .collect::<Vec<_>>(),
     )?;
     Ok(strict)
+}
+
+/// Native KnownFolder is the only durable discovery source. The same held
+/// component rebound used by fresh temp discovery is independently replayed
+/// before any fixed namespace create/open; no caller path enters this function.
+pub(super) fn pin_local_app_data(owner: &str) -> Result<Vec<HeldDirectory>, Error> {
+    use windows::Win32::{System::Com::CoTaskMemFree, UI::Shell::FOLDERID_LocalAppData};
+    #[link(name = "shell32")]
+    extern "system" {
+        #[link_name = "SHGetKnownFolderPath"]
+        fn known_folder(
+            id: *const windows::core::GUID,
+            flags: u32,
+            token: HANDLE,
+            path: *mut PWSTR,
+        ) -> windows::core::HRESULT;
+    }
+    struct Output(PWSTR);
+    impl Drop for Output {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CoTaskMemFree(Some(self.0 .0.cast())) };
+            }
+        }
+    }
+    let mut raw = Output(PWSTR::null());
+    unsafe { known_folder(&FOLDERID_LocalAppData, 0, HANDLE::default(), &mut raw.0) }
+        .ok()
+        .map_err(|error| native_error("store-known-folder", error))?;
+    if raw.0.is_null() {
+        return Err(Error::Invalid);
+    }
+    let hint = PathBuf::from(unsafe { raw.0.to_string() }.map_err(|_| Error::Invalid)?);
+    let bootstrap = pin_parent_inner(&hint, owner, true, None)?;
+    let canonical = canonical_parent(&bootstrap.last().ok_or(Error::Invalid)?.file)?;
+    let strict = pin_parent(&canonical, owner)?;
+    compare_bootstrap_bindings(
+        &bootstrap
+            .iter()
+            .map(HeldDirectory::receipt)
+            .collect::<Vec<_>>(),
+        &strict
+            .iter()
+            .map(HeldDirectory::receipt)
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(strict)
+}
+
+/// OS-managed paths are discovered only from the retained typed profile.
+/// The own package may mutate its structurally verified package-root, AC data,
+/// and fixed Temp nodes, not any earlier ancestor.
+/// This verifies current safe ownership/ACLs, not equivalence to our custom DACL.
+pub(super) fn pin_profile_data(
+    profile: &super::Profile,
+    owner: &str,
+    package: &str,
+) -> Result<Vec<HeldDirectory>, Error> {
+    let hint = profile.owned_data_path().map_err(|_| Error::Invalid)?;
+    profile
+        .owned_environment_base(&hint)
+        .map_err(|_| Error::Invalid)?;
+    let bootstrap = pin_parent_inner(&hint, owner, true, Some((package, 2)))?;
+    let canonical = canonical_parent(&bootstrap.last().ok_or(Error::Invalid)?.file)?;
+    let mut chain = pin_parent_inner(&canonical, owner, false, Some((package, 2)))?;
+    compare_bootstrap_bindings(
+        &bootstrap
+            .iter()
+            .map(HeldDirectory::receipt)
+            .collect::<Vec<_>>(),
+        &chain.iter().map(HeldDirectory::receipt).collect::<Vec<_>>(),
+    )?;
+    let file = open(
+        &chain.last().ok_or(Error::Invalid)?.file,
+        "Temp",
+        true,
+        READ,
+        OPEN,
+        None,
+    )?;
+    exact_name(&file, "Temp")?;
+    let security = ancestor_with_package(&file, owner, Some(package))?;
+    chain.push(HeldDirectory {
+        identity: identity(&file, true)?,
+        file,
+        name: "Temp".into(),
+        security,
+    });
+    Ok(chain)
 }
 
 fn compare_bootstrap_bindings(
@@ -651,13 +780,14 @@ pub(super) fn assert_synthetic_bootstrap_binding_faults(chain: &[HeldDirectory])
 
 /// Stored receipts and explicit fixture reopens retain exact canonical spelling.
 pub(super) fn pin_parent(path: &Path, owner: &str) -> Result<Vec<HeldDirectory>, Error> {
-    pin_parent_inner(path, owner, false)
+    pin_parent_inner(path, owner, false, None)
 }
 
 fn pin_parent_inner(
     path: &Path,
     owner: &str,
     temp_bootstrap: bool,
+    final_package: Option<(&str, usize)>,
 ) -> Result<Vec<HeldDirectory>, Error> {
     if !valid_temp_hint_syntax(path) {
         return Err(invalid("store-parent-raw-syntax", 1));
@@ -704,7 +834,16 @@ fn pin_parent_inner(
             None,
         )?;
         let node_identity = identity(&file, true)?;
-        let security = super::stage("store-parent-component-security", ancestor(&file, owner))?;
+        let security = super::stage(
+            "store-parent-component-security",
+            ancestor_with_package(
+                &file,
+                owner,
+                final_package.and_then(|(sid, depth)| {
+                    (index >= names.len().saturating_sub(depth)).then_some(sid)
+                }),
+            ),
+        )?;
         let recorded_name = if temp_bootstrap {
             let canonical = normalized(&file)?
                 .rsplit('\\')
@@ -802,6 +941,12 @@ pub(super) fn create_file(parent: &File, name: &str, policy: &Policy) -> Result<
     exact_name(&file, name)?;
     policy.verify(&file)?;
     file.sync_all().map_err(|_| Error::Io)?;
+    Ok(file)
+}
+pub(super) fn open_read_file(parent: &File, name: &str, policy: &Policy) -> Result<File, Error> {
+    let file = open(parent, name, false, READ, OPEN, None)?;
+    exact_name(&file, name)?;
+    policy.verify(&file)?;
     Ok(file)
 }
 pub(super) fn open_file(parent: &File, name: &str, policy: &Policy) -> Result<File, Error> {
@@ -1036,12 +1181,86 @@ fn trusted(sid: &str, owner: &str) -> bool {
                 | "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
         )
 }
+fn profile_allow_principal(sid: &str, owner: &str, package: &str, flags: u8) -> bool {
+    trusted(sid, owner)
+        || sid == package
+        || sid == "S-1-3-4"
+        || (sid == "S-1-3-0" && flags & 8 != 0)
+}
+#[cfg(test)]
+#[test]
+fn private_profile_readers_are_closed_even_for_inherit_only_grants() {
+    let owner = "S-1-5-21-1-2-3-1000";
+    let package = "S-1-15-2-1-2-3-4-5-6-7";
+    for sid in [owner, package, "S-1-5-18", "S-1-5-32-544", "S-1-3-4"] {
+        assert!(profile_allow_principal(sid, owner, package, 0));
+    }
+    assert!(!profile_allow_principal("S-1-3-0", owner, package, 0));
+    assert!(profile_allow_principal("S-1-3-0", owner, package, 8));
+    for sid in [
+        "S-1-1-0",
+        "S-1-5-11",
+        "S-1-15-2-1",
+        "S-1-15-2-2",
+        "S-1-15-2-8-2-3-4-5-6-7",
+        "S-1-5-21-1-2-3-1001",
+    ] {
+        for flags in [0, 3, 8, 11] {
+            assert!(!profile_allow_principal(sid, owner, package, flags));
+        }
+    }
+}
+#[cfg(all(test, feature = "native-fixtures"))]
+pub(super) fn assert_native_profile_reader_policy(parent: &File, owner: &str, package: &str) {
+    // Only fresh empty synthetic nodes are changed. This proves descriptor
+    // inspection, not an LPAC read attempt or qualification of arbitrary OS ACLs.
+    let positive = create_directory(
+        parent,
+        "owned-reader-positive",
+        &Policy::directory(owner, package, true),
+    )
+    .unwrap();
+    assert!(ancestor_with_package(&positive.file, owner, Some(package)).is_ok());
+    for (name, flags, sid) in [
+        ("foreign-reader", "", "WD"),
+        ("foreign-inherit-reader", "OICIIO", "WD"),
+        ("all-packages-reader", "OICI", "S-1-15-2-1"),
+    ] {
+        let mut policy = Policy::directory(owner, package, true);
+        policy.sddl = policy
+            .sddl
+            .replace("S:(ML;", &format!("(A;{flags};FR;;;{sid})S:(ML;"));
+        let negative = create_directory(parent, name, &policy).unwrap();
+        assert!(matches!(
+            ancestor_with_package(&negative.file, owner, Some(package)),
+            Err(Error::Invalid)
+        ));
+    }
+}
+
 fn ancestor(file: &File, owner: &str) -> Result<Snapshot, Error> {
+    ancestor_with_package(file, owner, None)
+}
+fn ancestor_with_package(
+    file: &File,
+    owner: &str,
+    package: Option<&str>,
+) -> Result<Snapshot, Error> {
     let security = snapshot(file)?;
-    if !trusted(&security.owner, owner) {
+    if !trusted(&security.owner, owner) && package != Some(security.owner.as_str()) {
         return Err(invalid("store-ancestor-owner", 1));
     }
     for entry in &security.dacl {
+        // Credential-bearing OS profile nodes need confidentiality, not merely
+        // the ancestor no-foreign-mutator rule. Unknown allow principals refuse,
+        // including read-only/inherit-only grants. Creator Owner is admitted only
+        // as an inherit-only placeholder under this same private directory.
+        if let Some(package) = package {
+            if entry.kind == 0 && !profile_allow_principal(&entry.sid, owner, package, entry.flags)
+            {
+                return Err(invalid("store-profile-foreign-reader", 1));
+            }
+        }
         if !matches!(entry.kind, 0 | 1) {
             return Err(invalid("store-ancestor-ace-kind", 1));
         }
@@ -1049,7 +1268,7 @@ fn ancestor(file: &File, owner: &str) -> Result<Snapshot, Error> {
         {
             continue;
         }
-        if !trusted(&entry.sid, owner) {
+        if !trusted(&entry.sid, owner) && package != Some(entry.sid.as_str()) {
             return Err(invalid("store-ancestor-mutator", 1));
         }
     }

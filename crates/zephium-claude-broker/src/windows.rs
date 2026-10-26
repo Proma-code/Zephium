@@ -1,5 +1,4 @@
 //! Native candidate runtime. No production constructor bypasses qualification.
-#[cfg(all(debug_assertions, feature = "native-fixtures"))]
 mod account_store;
 #[cfg(feature = "native-fixtures")]
 pub(super) mod fixtures;

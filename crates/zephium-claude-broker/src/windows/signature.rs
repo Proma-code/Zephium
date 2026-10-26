@@ -20,6 +20,21 @@ pub(super) const CANDIDATE_SHA256: [u8; 32] = [
     0xf9, 0xa3, 0x92, 0x06, 0x34, 0xae, 0x3b, 0x96, 0x1e, 0xe9, 0x2c, 0x2e, 0xb5, 0x8d, 0x00, 0x51,
     0xf5, 0xf8, 0x85, 0x2b, 0x12, 0x09, 0x83, 0xd0, 0xa4, 0xf5, 0x7b, 0x6a, 0x5e, 0xfe, 0xba, 0x61,
 ];
+/// Non-Clone held vendor-image authority. The only constructor fixes both the
+/// release hash and publisher verification; callers cannot supply a trust flag,
+/// alternate hash, mutable executable path or bare executable string to a Port.
+pub(super) struct VerifiedImage(HeldImage);
+impl VerifiedImage {
+    pub(super) fn open(native_path: &std::path::Path) -> Result<Self, &'static str> {
+        let image = HeldImage::open(native_path, CANDIDATE_SHA256)?;
+        verify(&image)?;
+        Ok(Self(image))
+    }
+    pub(super) fn held(&self) -> &HeldImage {
+        &self.0
+    }
+}
+
 struct TrustState(WINTRUST_DATA);
 impl Drop for TrustState {
     fn drop(&mut self) {

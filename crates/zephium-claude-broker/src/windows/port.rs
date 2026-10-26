@@ -1,4 +1,4 @@
-//! One-shot fresh signed-out native Port qualification, not a production factory.
+//! Fresh and disk-reopened signed-out native Ports; production remains unavailable.
 use crate::{
     account::{Control, Error, Request},
     custody::Owner,
@@ -39,6 +39,39 @@ impl FreshOnly {
     }
 }
 
+/// Reopened resources start with no authentication projection. Both halves of
+/// the persisted incarnation remain bound; Owner alone is not a store identity.
+struct RetainedStatusOnly {
+    owner: Owner,
+    key: crate::registration::ProfileKey,
+}
+impl RetainedStatusOnly {
+    fn admit(
+        &self,
+        request: &Request,
+        control: &Control,
+        actual_key: crate::registration::ProfileKey,
+        now: Instant,
+    ) -> Result<(), Error> {
+        if control.owner() != self.owner
+            || actual_key != self.key
+            || self.key.profile != self.owner.profile.to_be_bytes()
+        {
+            return Err(Error::Stale);
+        }
+        if now >= control.deadline() {
+            return Err(Error::Expired);
+        }
+        if control.cancelled(now) {
+            return Err(Error::Cancelled);
+        }
+        if !matches!(request, Request::ReadStatus) {
+            return Err(Error::Process);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(all(windows, feature = "native-fixtures"))]
 mod native {
     use super::*;
@@ -53,6 +86,88 @@ mod native {
         protocol::AuthStatus,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// First bounded use of a durable factory lease. Only newly registered
+    /// synthetic profiles may exercise this adapter during qualification; no
+    /// production constructor/UI or original login operation calls it yet.
+    pub(in crate::windows) struct RegisteredStatusPort {
+        policy: RetainedStatusOnly,
+        original: signature::VerifiedImage,
+        lease: crate::windows::account_store::StoreLease,
+    }
+    impl RegisteredStatusPort {
+        pub(in crate::windows) fn create(
+            lease: crate::windows::account_store::StoreLease,
+            original: signature::VerifiedImage,
+        ) -> Result<(AccountOwner, Self), &'static str> {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT_LIFETIME: AtomicU64 = AtomicU64::new(1);
+            lease
+                .verify()
+                .map_err(|_| "registered status lease rejected")?;
+            let key = lease.profile_key();
+            let generation = NEXT_LIFETIME
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    value.checked_add(1)
+                })
+                .map_err(|_| "registered status lifetime exhausted")?;
+            let identity = Owner {
+                profile: u128::from_be_bytes(key.profile),
+                account_generation: 1,
+                profile_generation: generation,
+            };
+            let owner =
+                AccountOwner::new(identity).map_err(|_| "registered status owner unavailable")?;
+            Ok((
+                owner,
+                Self {
+                    policy: RetainedStatusOnly {
+                        owner: identity,
+                        key,
+                    },
+                    original,
+                    lease,
+                },
+            ))
+        }
+        pub(in crate::windows) fn close(self) -> Result<(), &'static str> {
+            self.lease
+                .verify()
+                .map_err(|_| "registered status close unconfirmed")?;
+            // No persistent directory, OS profile or cached image is deleted.
+            // A failed ActiveStore independently retains DIRTY/quarantined custody.
+            drop(self);
+            Ok(())
+        }
+    }
+    impl Port for RegisteredStatusPort {
+        fn run(&mut self, request: Request, control: &Control) -> Result<Reply, Error> {
+            use crate::windows::{account_store::ActiveStore, process};
+            self.policy
+                .admit(&request, control, self.lease.profile_key(), Instant::now())?;
+            let active = self.lease.begin_operation().map_err(|_| Error::Process)?;
+            crate::windows::diagnostic("durable-status-dirty-admitted", 0);
+            // Image preparation and the actual spawn both retain this same
+            // operation. The process seam derives all paths from ActiveStore.
+            let image = active
+                .stage_verified_image(&self.original)
+                .map_err(|_| Error::Process)?;
+            crate::windows::diagnostic("durable-status-image-held", 0);
+            let call = process::run_store_status(
+                active,
+                &image,
+                self.policy.key,
+                self.policy.owner,
+                control,
+            )
+            .map_err(|_| Error::Process)?;
+            crate::windows::diagnostic("durable-status-native-returned", 0);
+            let status = ActiveStore::finish_status_fixture(call).map_err(|_| Error::Protocol)?;
+            // CLEAN concerns native operation settlement only. Status comes only
+            // from the bounded original-client readback, not the registration.
+            Ok(Reply::Status(status))
+        }
+    }
 
     pub(in crate::windows) struct FreshStatusPort {
         policy: FreshOnly,
@@ -100,8 +215,7 @@ mod native {
             }
             let target = root.0.join("claude.exe");
             profile.copy_image(&original.path, &target)?;
-            let image = HeldImage::open(&target, signature::CANDIDATE_SHA256)?;
-            signature::verify(&image)?;
+            let image = signature::VerifiedImage::open(&target)?;
             let owner =
                 AccountOwner::new(identity).map_err(|_| "fresh status owner unavailable")?;
             Ok((
@@ -167,7 +281,7 @@ mod native {
     }
 }
 #[cfg(all(windows, feature = "native-fixtures"))]
-pub(super) use native::FreshStatusPort;
+pub(super) use native::{FreshStatusPort, RegisteredStatusPort};
 
 #[cfg(test)]
 mod tests {
@@ -309,5 +423,72 @@ mod tests {
             ),
             Err(Error::Closed)
         );
+    }
+    #[test]
+    fn retained_status_binds_full_key_and_allows_fresh_readback_only() {
+        let native = identity();
+        let key = crate::registration::ProfileKey {
+            profile: native.profile.to_be_bytes(),
+            incarnation: [7; 16],
+        };
+        let policy = RetainedStatusOnly { owner: native, key };
+        let owner = AccountOwner::new(native).unwrap();
+        assert_eq!(owner.view().status, None);
+        for _ in 0..2 {
+            let now = Instant::now();
+            let work = owner
+                .begin(owner.scope().unwrap(), Request::ReadStatus, now)
+                .unwrap();
+            let result = work.run(
+                &mut |request: Request, control: &Control| {
+                    assert_eq!(policy.admit(&request, control, key, now), Ok(()));
+                    let wrong_owner = RetainedStatusOnly {
+                        owner: Owner {
+                            profile_generation: native.profile_generation + 1,
+                            ..native
+                        },
+                        key,
+                    };
+                    assert_eq!(
+                        wrong_owner.admit(&request, control, key, now),
+                        Err(Error::Stale)
+                    );
+                    for byte in [0, 15] {
+                        let mut wrong = key;
+                        wrong.incarnation[byte] ^= 1;
+                        assert_eq!(
+                            policy.admit(&request, control, wrong, now),
+                            Err(Error::Stale)
+                        );
+                    }
+                    let mut wrong = key;
+                    wrong.profile[0] ^= 1;
+                    assert_eq!(
+                        policy.admit(&request, control, wrong, now),
+                        Err(Error::Stale)
+                    );
+                    for denied in [
+                        Request::Login,
+                        Request::Logout,
+                        Request::Turn {
+                            input: TurnInput::new("synthetic").unwrap(),
+                            selected: AuthStatus::ClaudeAccount,
+                        },
+                    ] {
+                        assert_eq!(
+                            policy.admit(&denied, control, key, now),
+                            Err(Error::Process)
+                        );
+                    }
+                    assert_eq!(
+                        policy.admit(&request, control, key, control.deadline()),
+                        Err(Error::Expired)
+                    );
+                    Ok(Reply::Status(AuthStatus::SignedOut))
+                },
+                || now,
+            );
+            assert_eq!(result, Ok(Reply::Status(AuthStatus::SignedOut)));
+        }
     }
 }

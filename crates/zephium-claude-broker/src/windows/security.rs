@@ -50,7 +50,7 @@ fn sid_string(sid: PSID) -> Result<String, &'static str> {
     unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
     result
 }
-fn owner_sid() -> Result<String, &'static str> {
+pub(super) fn owner_sid() -> Result<String, &'static str> {
     let mut raw = HANDLE::default();
     // SAFETY: token output is local and becomes uniquely owned immediately.
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) }
@@ -139,6 +139,9 @@ impl Profile {
     /// account discovery, token content or existing profile adoption.
     #[cfg(feature = "native-fixtures")]
     pub(super) fn fixture_sids(&self) -> Result<(String, String), &'static str> {
+        self.sids()
+    }
+    pub(super) fn sids(&self) -> Result<(String, String), &'static str> {
         Ok((
             owner_sid()?,
             sid_string(PSID(self.sid.as_ptr().cast_mut().cast()))?,
@@ -148,25 +151,7 @@ impl Profile {
     /// Never adopts another application's package/profile or normalizes a caller path.
     #[cfg(feature = "native-fixtures")]
     pub(super) fn fixture_folder(&self) -> Result<HeldProfileFolder, &'static str> {
-        use windows::Win32::{
-            Security::Isolation::GetAppContainerFolderPath, System::Com::CoTaskMemFree,
-        };
-        let sid = wide(OsStr::new(&sid_string(PSID(
-            self.sid.as_ptr().cast_mut().cast(),
-        ))?))?;
-        let raw = unsafe { GetAppContainerFolderPath(PCWSTR(sid.as_ptr())) }
-            .map_err(|_| "fresh profile data folder unavailable")?;
-        if raw.is_null() {
-            return Err("fresh profile data folder missing");
-        }
-        let text = unsafe { raw.to_string() };
-        unsafe { CoTaskMemFree(Some(raw.0.cast())) };
-        let path = std::path::PathBuf::from(
-            text.map_err(|_| "fresh profile data folder encoding failed")?,
-        );
-        if !plain_local_path(&path) || path.components().count() < 5 {
-            return Err("fresh profile data folder path rejected");
-        }
+        let path = self.owned_data_path()?;
         let mut holds = Vec::new();
         let mut paths: Vec<_> = path.ancestors().collect();
         paths.reverse();
@@ -189,6 +174,39 @@ impl Profile {
             path,
             _holds: holds,
         })
+    }
+    /// OS path for exactly this retained principal; the durable factory must
+    /// still pin/rebind and verify it before use. No caller path is accepted.
+    pub(super) fn owned_data_path(&self) -> Result<std::path::PathBuf, &'static str> {
+        use windows::Win32::{
+            Security::Isolation::GetAppContainerFolderPath, System::Com::CoTaskMemFree,
+        };
+        let sid = wide(OsStr::new(&sid_string(PSID(
+            self.sid.as_ptr().cast_mut().cast(),
+        ))?))?;
+        let raw = unsafe { GetAppContainerFolderPath(PCWSTR(sid.as_ptr())) }
+            .map_err(|_| "fresh profile data folder unavailable")?;
+        if raw.is_null() {
+            return Err("fresh profile data folder missing");
+        }
+        let text = unsafe { raw.to_string() };
+        unsafe { CoTaskMemFree(Some(raw.0.cast())) };
+        let path = std::path::PathBuf::from(
+            text.map_err(|_| "fresh profile data folder encoding failed")?,
+        );
+        if !plain_local_path(&path) || path.components().count() < 5 {
+            return Err("fresh profile data folder path rejected");
+        }
+        Ok(path)
+    }
+    pub(super) fn owned_environment_base(
+        &self,
+        path: &Path,
+    ) -> Result<std::path::PathBuf, &'static str> {
+        let name = String::from_utf16(&self.name[..self.name.len() - 1])
+            .map_err(|_| "profile name encoding failed")?;
+        let sid = sid_string(PSID(self.sid.as_ptr().cast_mut().cast()))?;
+        fixture_profile_base(path, &name, &sid)
     }
     /// Windows derives its AppContainer LOCALAPPDATA from the input base. Use
     /// only the held own-SID API path's exact documented ancestor; no ambient
@@ -215,6 +233,25 @@ impl Profile {
             "default-owner-equals-token-user",
             i32::from(default_owner_matches_user()?),
         );
+        Self::create_named(name, true)
+    }
+    /// Native ProfileKey only. Persistent identities are nondeleting from the
+    /// first successful OS creation, including later constructor failure.
+    pub(super) fn create_trial(key: crate::registration::ProfileKey) -> Result<Self, &'static str> {
+        Self::create_named(crate::registration::principal_name(key).as_str(), false)
+    }
+    /// Reopen derives the exact stable SID; it NEVER falls back to Create.
+    /// The durable factory separately requires the recorded OS folders to exist.
+    pub(super) fn reopen_trial(key: crate::registration::ProfileKey) -> Result<Self, &'static str> {
+        use windows::Win32::Security::Isolation::DeriveAppContainerSidFromAppContainerName;
+        let name = wide(OsStr::new(
+            crate::registration::principal_name(key).as_str(),
+        ))?;
+        let sid = unsafe { DeriveAppContainerSidFromAppContainerName(PCWSTR(name.as_ptr())) }
+            .map_err(|_| "persistent identity derivation failed")?;
+        Self::from_sid(name, sid, false)
+    }
+    fn create_named(name: &str, delete_on_drop: bool) -> Result<Self, &'static str> {
         let name = wide(OsStr::new(name))?;
         // SAFETY: all UTF-16 strings are live, NUL-terminated; no capabilities yet.
         let sid = unsafe {
@@ -229,11 +266,22 @@ impl Profile {
             super::diagnostic("create-private-identity", error.code().0);
             "private identity unavailable"
         })?;
-        let length = unsafe { GetLengthSid(sid) } as usize;
+        Self::from_sid(name, sid, delete_on_drop)
+    }
+    fn from_sid(name: Vec<u16>, sid: PSID, delete_on_drop: bool) -> Result<Self, &'static str> {
+        let valid =
+            !sid.0.is_null() && unsafe { windows::Win32::Security::IsValidSid(sid) }.as_bool();
+        let length = if valid {
+            (unsafe { GetLengthSid(sid) }) as usize
+        } else {
+            0
+        };
         if !(8..=128).contains(&length) {
             unsafe {
                 FreeSid(sid);
-                let _ = DeleteAppContainerProfile(PCWSTR(name.as_ptr()));
+                if delete_on_drop {
+                    let _ = DeleteAppContainerProfile(PCWSTR(name.as_ptr()));
+                }
             }
             return Err("invalid private SID");
         }
@@ -244,12 +292,14 @@ impl Profile {
         }
         if copied.is_err() {
             unsafe {
-                let _ = DeleteAppContainerProfile(PCWSTR(name.as_ptr()));
+                if delete_on_drop {
+                    let _ = DeleteAppContainerProfile(PCWSTR(name.as_ptr()));
+                }
             }
             return Err("private SID copy failed");
         }
         let mut result = Self {
-            delete_on_drop: true,
+            delete_on_drop,
             name,
             sid: storage,
             internet: vec![0usize; 16],
@@ -267,6 +317,9 @@ impl Profile {
         Ok(result)
     }
     pub(super) fn close(mut self) -> Result<(), &'static str> {
+        if !self.delete_on_drop {
+            return Err("persistent identity requires explicit qualified retirement");
+        }
         unsafe { DeleteAppContainerProfile(PCWSTR(self.name.as_ptr())) }
             .map_err(|_| "private identity cleanup failed")?;
         self.delete_on_drop = false;
@@ -530,7 +583,6 @@ fn plain_local_path(path: &Path) -> bool {
         _ => false,
     })
 }
-#[cfg(feature = "native-fixtures")]
 fn fixture_profile_base(
     path: &Path,
     name: &str,
