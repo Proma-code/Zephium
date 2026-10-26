@@ -233,75 +233,49 @@ mod tests {
 }
 
 // Fixed synthetic handle-probe receipts only, never provider-output recognition.
-// A crash without the positive control and exact pre-call policy marker is not
-// evidence of denial. `Some(true)` identifies the strict exception form.
+// The native parent already requires suspended object-identity proof. The child
+// must then settle with known stdout and strict policy; no crash is success.
 #[cfg(any(test, all(windows, feature = "native-fixtures")))]
-pub(crate) fn fixture_handle_denial(
+pub(crate) fn fixture_handle_control(
     code: i32,
     stopped: bool,
     stdout: &[u8],
     stderr: &[u8],
-) -> Option<bool> {
-    if stopped || !stderr.is_empty() {
-        return None;
-    }
-    if code == 0
-        && matches!(
-            stdout,
-            b"known-handle-ok\nstrict-handles=0\nprobe-ready\nnot-inherited\n"
-                | b"known-handle-ok\nstrict-handles=1\nprobe-ready\nnot-inherited\n"
-        )
-    {
-        Some(false)
-    } else if code as u32 == 0xc000_0008
-        && stdout == b"known-handle-ok\nstrict-handles=1\nprobe-ready\n"
-    {
-        Some(true)
-    } else {
-        None
-    }
+) -> bool {
+    !stopped
+        && code == 0
+        && stderr.is_empty()
+        && stdout == b"known-handle-ok\nstrict-handles=1\nhandle-check-ok\n"
 }
 #[cfg(test)]
 mod handle_fixture_tests {
-    use super::fixture_handle_denial as denied;
+    use super::fixture_handle_control as settled;
     #[test]
-    fn only_exact_proven_negative_handle_receipts_are_accepted() {
-        let ready = b"known-handle-ok\nstrict-handles=1\nprobe-ready\n";
-        let invalid = 0xc000_0008u32 as i32;
-        assert_eq!(denied(invalid, false, ready, b""), Some(true));
-        assert_eq!(
-            denied(
-                0,
-                false,
-                b"known-handle-ok\nstrict-handles=0\nprobe-ready\nnot-inherited\n",
-                b""
-            ),
-            Some(false)
-        );
-        assert_eq!(
-            denied(
-                0,
-                false,
-                b"known-handle-ok\nstrict-handles=1\nprobe-ready\nnot-inherited\n",
-                b""
-            ),
-            Some(false)
-        );
-        for code in [0, 1, 101, 0xc000_0005u32 as i32, 0xc000_0409u32 as i32] {
-            assert_eq!(denied(code, false, ready, b""), None);
+    fn only_exact_known_pipe_and_strict_policy_receipt_settles() {
+        let ready = b"known-handle-ok\nstrict-handles=1\nhandle-check-ok\n";
+        assert!(settled(0, false, ready, b""));
+        for code in [
+            1,
+            101,
+            0xc000_0008u32 as i32,
+            0xc000_0005u32 as i32,
+            0xc000_0409u32 as i32,
+        ] {
+            assert!(!settled(code, false, ready, b""));
         }
-        assert_eq!(denied(invalid, true, ready, b""), None);
-        assert_eq!(denied(invalid, false, ready, b"unexpected"), None);
+        assert!(!settled(0, true, ready, b""));
+        assert!(!settled(0, false, ready, b"unexpected"));
         for incomplete in [
             b"".as_slice(),
-            b"probe-ready\n",
-            b"strict-handles=1\nprobe-ready\n",
-            b"known-handle-ok\nstrict-handles=0\nprobe-ready\n",
+            b"known-handle-ok\nstrict-handles=0\nhandle-check-ok\n",
+            b"strict-handles=1\nhandle-check-ok\n",
+            b"known-handle-ok\nstrict-handles=1\nprobe-ready\n",
+            b"known-handle-ok\nstrict-handles=1\nprobe-ready\nnot-inherited\n",
         ] {
-            assert_eq!(denied(invalid, false, incomplete, b""), None);
+            assert!(!settled(0, false, incomplete, b""));
         }
         let mut extra = ready.to_vec();
         extra.extend_from_slice(b"other-operation\n");
-        assert_eq!(denied(invalid, false, &extra, b""), None);
+        assert!(!settled(0, false, &extra, b""));
     }
 }

@@ -205,16 +205,11 @@ fn child(mode: &str) -> Result<(), &'static str> {
             };
             let mut bytes = Vec::new();
             std::io::stdin()
-                .take(9)
+                .take(1)
                 .read_to_end(&mut bytes)
                 .map_err(|_| "handle fixture input failed")?;
-            let bytes: [u8; 8] = bytes
-                .try_into()
-                .map_err(|_| "handle fixture input invalid")?;
-            let inherited = usize::try_from(u64::from_le_bytes(bytes))
-                .map_err(|_| "handle fixture value invalid")?;
-            if inherited == 0 || inherited == usize::MAX {
-                return Err("handle fixture value invalid");
+            if !bytes.is_empty() {
+                return Err("handle fixture input invalid");
             }
             let mut flags = 0u32;
             unsafe { GetHandleInformation(HANDLE(std::io::stdout().as_raw_handle()), &mut flags) }
@@ -233,27 +228,14 @@ fn child(mode: &str) -> Result<(), &'static str> {
             if policy & !3 != 0 {
                 return Err("handle mitigation flags unknown");
             }
-            let marker: &[u8] = if policy & 1 != 0 {
-                b"known-handle-ok\nstrict-handles=1\nprobe-ready\n"
-            } else {
-                b"known-handle-ok\nstrict-handles=0\nprobe-ready\n"
-            };
-            std::io::stdout()
-                .write_all(marker)
-                .map_err(|_| "handle probe marker failed")?;
-            std::io::stdout()
-                .flush()
-                .map_err(|_| "handle probe marker flush failed")?;
-            // This exact negative query is intentionally the only operation after
-            // the marker. Strict-handle policy may raise STATUS_INVALID_HANDLE;
-            // it is not disabled and no generic child crash is accepted.
-            match unsafe { GetHandleInformation(HANDLE(inherited as *mut _), &mut flags) } {
-                Ok(()) => return Err("unlisted inheritable handle was present"),
-                Err(error) if error.code().0 as u32 == 0x8007_0006 => {}
-                Err(_) => return Err("handle probe returned unexpected error"),
+            if policy & 1 == 0 {
+                return Err("strict handle checking unavailable");
             }
+            // The actual unlisted object was compared by the parent before
+            // ResumeThread. Do not query an old numeric slot after runtime init:
+            // this process may legitimately allocate a different object there.
             std::io::stdout()
-                .write_all(b"not-inherited\n")
+                .write_all(b"known-handle-ok\nstrict-handles=1\nhandle-check-ok\n")
                 .map_err(|_| "handle probe receipt failed")?;
         }
         "isolation" => {

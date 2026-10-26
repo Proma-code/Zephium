@@ -140,55 +140,26 @@ pub(crate) fn qualify() -> Result<(), &'static str> {
         .map_err(|_| "loopback address unavailable")?;
     let _baseline = TcpStream::connect_timeout(&address, Duration::from_secs(1))
         .map_err(|_| "loopback baseline unavailable")?;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    let attributes = windows::Win32::Security::SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<windows::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
-        bInheritHandle: true.into(),
-        ..Default::default()
-    };
-    let event = unsafe {
-        windows::Win32::System::Threading::CreateEventW(
-            Some(&attributes),
-            true,
-            false,
-            windows::core::PCWSTR::null(),
-        )
-    }
-    .map_err(|_| "inherited-handle fixture unavailable")?;
-    let event = unsafe { OwnedHandle::from_raw_handle(event.0) };
-    let mut flags = 0u32;
-    unsafe {
-        windows::Win32::Foundation::GetHandleInformation(
-            windows::Win32::Foundation::HANDLE(event.as_raw_handle()),
-            &mut flags,
-        )
-    }
-    .map_err(|_| "parent event handle control failed")?;
-    if flags & windows::Win32::Foundation::HANDLE_FLAG_INHERIT.0 == 0 {
-        return Err("parent event was not inheritable");
-    }
+    // Object identity is checked in process::run while this actual child is
+    // suspended; child-side numeric validity cannot establish inheritance.
     let handle_probe = process::run(
         &profile,
         &image,
         &layout,
         Command::Fixture(Fixture::HandleProbe),
-        (event.as_raw_handle() as usize as u64)
-            .to_le_bytes()
-            .to_vec(),
+        Vec::new(),
         &cancelled,
     )?;
     receipt("handle-probe", &handle_probe);
-    let strict_denial = crate::plan::fixture_handle_denial(
+    if !crate::plan::fixture_handle_control(
         handle_probe.code,
         handle_probe.stopped.is_some(),
         &handle_probe.stdout,
         &handle_probe.stderr,
-    )
-    .ok_or("unlisted handle denial was not established")?;
-    super::diagnostic(
-        "unlisted-handle-denial-established",
-        i32::from(strict_denial),
-    );
+    ) {
+        return Err("suspended handle identity control did not settle");
+    }
+    super::diagnostic("unlisted-handle-denial-established", 0);
     // Windows reroutes LOCALAPPDATA/TMP/TEMP to the fresh AppContainer profile.
     // Bind expected values to the documented API for our exact fresh SID, not a
     // host environment value, guessed prefix, or arbitrary normalized path.

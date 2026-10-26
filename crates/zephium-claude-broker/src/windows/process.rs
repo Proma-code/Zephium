@@ -47,6 +47,10 @@ use windows::{
     },
 };
 
+#[cfg(feature = "native-fixtures")]
+#[path = "handle_probe.rs"]
+mod handle_probe;
+
 fn handle(value: &impl AsRawHandle) -> HANDLE {
     HANDLE(value.as_raw_handle())
 }
@@ -861,6 +865,12 @@ fn run_owned(
     for parent in [&stdout_read, &stderr_read, &stdin_write] {
         no_inherit(parent)?;
     }
+    #[cfg(feature = "native-fixtures")]
+    let unlisted_probe = if matches!(command, Command::Fixture(Fixture::HandleProbe)) {
+        Some(handle_probe::Probe::new()?)
+    } else {
+        None
+    };
     let attributes = Attributes::new()?;
     let inherited = [
         handle(&stdin_read),
@@ -1024,6 +1034,12 @@ fn run_owned(
             },
             store: None,
         });
+    }
+    #[cfg(feature = "native-fixtures")]
+    if let Some(probe) = &unlisted_probe {
+        // Actual suspended process and exact stdout listed at creation. Any
+        // error drops the physical guard; no child instruction has run yet.
+        probe.verify(handle(&process), handle(&stdout_write))?;
     }
     // Parent must close every child-side pipe before any join or EOF observation.
     drop(stdin_read);
