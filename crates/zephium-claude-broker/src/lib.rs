@@ -7,6 +7,8 @@
 #![deny(clippy::dbg_macro, clippy::print_stderr, clippy::print_stdout)]
 
 #[allow(dead_code)]
+mod account;
+#[allow(dead_code)]
 mod auth;
 pub mod custody;
 pub mod plan;

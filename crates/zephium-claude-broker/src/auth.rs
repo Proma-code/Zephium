@@ -19,23 +19,78 @@ use std::{
 const MAX_CODE_BYTES: usize = 4096;
 const MAX_HANDOFF_BYTES: usize = 8192;
 const LOGIN_DEADLINE: Duration = Duration::from_secs(300);
+// Native profiles only; bound retained revision tombstones across repeated
+// profile creation/deletion in one application process.
+const MAX_ADMISSION_PROFILES: usize = 4096;
 
 /// Native worker lifetime, separate from any controller/view. One Claude account
 /// slot per native profile; generation changes cannot evade an older live lease.
-pub(crate) struct Admission;
-fn reserve_admission(profile: u128) -> Result<Arc<Admission>, AuthError> {
-    static REGISTRY: OnceLock<Mutex<HashMap<u128, Weak<Admission>>>> = OnceLock::new();
-    let mut slots = REGISTRY
-        .get_or_init(Default::default)
-        .lock()
-        .map_err(|_| AuthError::Closed)?;
-    slots.retain(|_, lease| lease.strong_count() != 0);
-    if slots.get(&profile).and_then(Weak::upgrade).is_some() {
+pub(crate) struct Admission {
+    profile: u128,
+    revision: u64,
+}
+struct AdmissionSlot {
+    revision: u64,
+    lease: Weak<Admission>,
+}
+fn admissions() -> &'static Mutex<HashMap<u128, AdmissionSlot>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<u128, AdmissionSlot>>> = OnceLock::new();
+    REGISTRY.get_or_init(Default::default)
+}
+impl Admission {
+    pub(super) fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+pub(super) fn reserve_admission(profile: u128) -> Result<Arc<Admission>, AuthError> {
+    reserve_admission_for(profile, None)
+}
+pub(super) fn reserve_admission_for(
+    profile: u128,
+    expected_revision: Option<u64>,
+) -> Result<Arc<Admission>, AuthError> {
+    let mut slots = admissions().lock().map_err(|_| AuthError::Closed)?;
+    if !slots.contains_key(&profile) && slots.len() >= MAX_ADMISSION_PROFILES {
+        return Err(AuthError::Exhausted);
+    }
+    let slot = slots.entry(profile).or_insert(AdmissionSlot {
+        revision: 0,
+        lease: Weak::new(),
+    });
+    if slot.lease.upgrade().is_some() {
         return Err(AuthError::Busy);
     }
-    let lease = Arc::new(Admission);
-    slots.insert(profile, Arc::downgrade(&lease));
+    if expected_revision.is_some_and(|revision| revision != slot.revision) {
+        return Err(AuthError::Stale);
+    }
+    // Keep the monotonic revision even while idle. Removing idle slots would
+    // allow an old status selection to match a newly created login owner.
+    slot.revision = slot.revision.checked_add(1).ok_or(AuthError::Exhausted)?;
+    let lease = Arc::new(Admission {
+        profile,
+        revision: slot.revision,
+    });
+    slot.lease = Arc::downgrade(&lease);
     Ok(lease)
+}
+pub(super) fn revision_is_current(profile: u128, revision: u64) -> bool {
+    admissions().lock().is_ok_and(|slots| {
+        slots
+            .get(&profile)
+            .is_some_and(|slot| slot.revision == revision)
+    })
+}
+
+/// An owning worker panicked without proving settlement. Keep its native profile
+/// admission occupied for the process lifetime; a dropped view cannot clear it.
+/// This is not evidence that native child/pipe teardown succeeded.
+pub(super) fn retain_uncertain(admission: Arc<Admission>) {
+    static HELD: OnceLock<Mutex<HashMap<u128, Arc<Admission>>>> = OnceLock::new();
+    let mut held = HELD
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    held.entry(admission.profile).or_insert(admission);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

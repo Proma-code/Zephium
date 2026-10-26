@@ -235,7 +235,7 @@ mod tests {
 // Fixed synthetic handle-probe receipts only, never provider-output recognition.
 // A crash without the positive control and exact pre-call policy marker is not
 // evidence of denial. `Some(true)` identifies the strict exception form.
-#[cfg(any(test, feature = "native-fixtures"))]
+#[cfg(any(test, all(windows, feature = "native-fixtures")))]
 pub(crate) fn fixture_handle_denial(
     code: i32,
     stopped: bool,

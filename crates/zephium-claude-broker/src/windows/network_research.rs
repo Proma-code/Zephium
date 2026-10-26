@@ -8,18 +8,25 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
     io::{Read, Write},
-    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::PathBuf,
     sync::atomic::AtomicBool,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use windows::{
     core::w,
     Win32::{
         Foundation::ERROR_SUCCESS,
         Networking::WinSock::{WSACleanup, WSAStartup, WSADATA},
-        System::Registry::{
-            RegCloseKey, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE,
+        System::{
+            JobObjects::{
+                JobObjectExtendedLimitInformation, QueryInformationJobObject,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+            },
+            Registry::{
+                RegCloseKey, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE,
+            },
         },
     },
 };
@@ -32,6 +39,7 @@ struct Request {
     image: PathBuf,
     config: PathBuf,
     loopback: SocketAddr,
+    public: SocketAddr,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +50,10 @@ struct Observation {
     loopback_error: Option<i32>,
     loopback_timeout: bool,
     child_error: i32,
+    job_query: i32,
+    job_limit: u32,
+    job_flags: u32,
+    public_connected: bool,
 }
 
 impl Observation {
@@ -51,16 +63,83 @@ impl Observation {
             && self.winsock_startup == 10107
             && self.loopback_error.is_none()
             && !self.loopback_timeout
-            && self.child_error == 5
+            && !self.public_connected
+            && self.child_quota_denied()
     }
     fn candidate_matches(&self) -> bool {
         self.catalog_read == 0
             && self.catalog_write_open == 5
             && self.winsock_startup == 0
-            && self.loopback_error == Some(10013)
-            && !self.loopback_timeout
-            && self.child_error == 5
+            && self.public_connected
+            && ((self.loopback_error == Some(10013) && !self.loopback_timeout)
+                || (matches!(self.loopback_error, None | Some(10060)) && self.loopback_timeout))
+            && self.child_quota_denied()
     }
+    fn child_quota_denied(&self) -> bool {
+        self.child_error == 1816
+            && self.job_query == 0
+            && self.job_limit == 1
+            && self.job_flags
+                == (JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+                    | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                    | JOB_OBJECT_LIMIT_PROCESS_MEMORY)
+                    .0
+    }
+}
+
+// Conservative public-v4 filter for the one fixed DNS name. Never probe a
+// returned loopback/LAN/link-local/shared/special-use address or another port.
+fn public_address_allowed(address: SocketAddr) -> bool {
+    let IpAddr::V4(ip) = address.ip() else {
+        return false;
+    };
+    let [a, b, c, _] = ip.octets();
+    address.port() == 443
+        && !(a == 0
+            || a == 10
+            || a == 127
+            || a >= 224
+            || (a == 100 && (64..=127).contains(&b))
+            || (a == 169 && b == 254)
+            || (a == 172 && (16..=31).contains(&b))
+            || (a == 192 && (b == 168 || (b == 0 && c <= 2) || (b == 88 && c == 99)))
+            || (a == 198 && (b == 18 || b == 19 || (b == 51 && c == 100)))
+            || (a == 203 && b == 0 && c == 113))
+}
+
+fn public_positive_control() -> Result<SocketAddr, &'static str> {
+    // Resolution happens only in this credential-free parent, against the
+    // original image's fixed official download host. No URI/host comes from UI.
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = ("downloads.claude.ai", 443)
+            .to_socket_addrs()
+            .map(|addresses| {
+                addresses
+                    .take(16)
+                    .filter(|address| public_address_allowed(*address))
+                    .take(4)
+                    .collect::<Vec<_>>()
+            });
+        let _ = sender.send(result);
+    });
+    let addresses = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "research public DNS deadline exceeded")?
+        .map_err(|_| "research public DNS unavailable")?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for address in addresses {
+        let budget = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_secs(2));
+        if budget.is_zero() {
+            break;
+        }
+        if TcpStream::connect_timeout(&address, budget).is_ok() {
+            return Ok(address);
+        }
+    }
+    Err("research public parent TCP control unavailable")
 }
 
 /// This opens one fixed OS catalog key; no values, enumeration, ACL changes or
@@ -99,6 +178,7 @@ pub(crate) fn controls() -> Result<(), &'static str> {
     if catalog_open(false)? != 0 {
         return Err("research parent catalog positive control failed");
     }
+    let public = public_positive_control()?;
     let suffix = format!(
         "{}.{}",
         std::process::id(),
@@ -155,6 +235,7 @@ pub(crate) fn controls() -> Result<(), &'static str> {
         image: image_path,
         config: layout.config.clone(),
         loopback: address,
+        public,
     })
     .map_err(|_| "research request encoding failed")?;
     if request.len() > 8192 {
@@ -200,6 +281,13 @@ pub(crate) fn controls() -> Result<(), &'static str> {
             i32::from(result.loopback_timeout),
         );
         super::diagnostic("network-research-child-error", result.child_error);
+        super::diagnostic("network-research-job-query", result.job_query);
+        super::diagnostic("network-research-job-limit", result.job_limit as i32);
+        super::diagnostic("network-research-job-flags", result.job_flags as i32);
+        super::diagnostic(
+            "network-research-public-tcp",
+            i32::from(result.public_connected),
+        );
         for path in [&foreign_path, &outside_path] {
             if std::fs::read(path).map_err(|_| "research sentinel disappeared")? != SENTINEL {
                 return Err("research sentinel changed");
@@ -213,7 +301,9 @@ pub(crate) fn controls() -> Result<(), &'static str> {
     }
     let baseline = &observations[0];
     let candidate = &observations[1];
-    // Timeout/refused/provider errors do not establish policy denial.
+    // A timeout is only observed loopback unreachability, correlated with the
+    // live parent listener and this child's public TCP positive control. It is
+    // not called an explicit access-denied result or proof of WFP attribution.
     let matched = baseline.baseline_matches() && candidate.candidate_matches();
     drop(image);
     profile.close()?;
@@ -225,6 +315,7 @@ pub(crate) fn controls() -> Result<(), &'static str> {
         return Err("research network differential remains unqualified");
     }
     super::diagnostic("network-research-differential-settled", 0);
+    super::diagnostic("network-research-loopback-observed-unreachable", 0);
     Ok(())
 }
 
@@ -241,6 +332,9 @@ pub(crate) fn child() -> Result<(), &'static str> {
         serde_json::from_slice(&bytes).map_err(|_| "research request invalid")?;
     if !request.loopback.ip().is_loopback() || request.loopback.port() == 0 {
         return Err("research address not loopback");
+    }
+    if !public_address_allowed(request.public) {
+        return Err("research public endpoint invalid");
     }
     for path in [&request.outside, &request.foreign] {
         for result in [
@@ -278,6 +372,18 @@ pub(crate) fn child() -> Result<(), &'static str> {
             return Err("research ambient environment inherited");
         }
     }
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    let job_query = unsafe {
+        QueryInformationJobObject(
+            None,
+            JobObjectExtendedLimitInformation,
+            (&raw mut limits).cast(),
+            std::mem::size_of_val(&limits) as u32,
+            None,
+        )
+    }
+    .err()
+    .map_or(0, |error| error.code().0);
     let child_error = match std::process::Command::new(&request.image)
         .args(["--child", "echo"])
         .spawn()
@@ -298,6 +404,10 @@ pub(crate) fn child() -> Result<(), &'static str> {
         loopback_error: None,
         loopback_timeout: false,
         child_error,
+        job_query,
+        job_limit: limits.BasicLimitInformation.ActiveProcessLimit,
+        job_flags: limits.BasicLimitInformation.LimitFlags.0,
+        public_connected: false,
     };
     struct Winsock;
     impl Drop for Winsock {
@@ -314,6 +424,8 @@ pub(crate) fn child() -> Result<(), &'static str> {
         if data.wVersion != 0x0202 {
             return Err("research Winsock version mismatch");
         }
+        result.public_connected =
+            TcpStream::connect_timeout(&request.public, Duration::from_secs(3)).is_ok();
         match TcpStream::connect_timeout(&request.loopback, Duration::from_millis(750)) {
             Ok(_) => result.loopback_error = Some(0),
             Err(error) => {
@@ -343,7 +455,11 @@ mod tests {
             winsock_startup: 0,
             loopback_error: Some(10013),
             loopback_timeout: false,
-            child_error: 5,
+            child_error: 1816,
+            job_query: 0,
+            job_limit: 1,
+            job_flags: 0x2108,
+            public_connected: true,
         }
     }
     #[test]
@@ -354,14 +470,18 @@ mod tests {
             winsock_startup: 10107,
             loopback_error: None,
             loopback_timeout: false,
-            child_error: 5,
+            child_error: 1816,
+            job_query: 0,
+            job_limit: 1,
+            job_flags: 0x2108,
+            public_connected: false,
         };
         assert!(baseline.baseline_matches());
         assert!(!baseline.candidate_matches());
         assert!(!candidate().baseline_matches());
     }
     #[test]
-    fn candidate_requires_precise_denial_not_timeout_or_refusal() {
+    fn candidate_distinguishes_measured_timeout_from_denial_and_refusal() {
         assert!(candidate().candidate_matches());
         for code in [None, Some(0), Some(10060), Some(10061), Some(10107)] {
             let mut value = candidate();
@@ -372,6 +492,16 @@ mod tests {
         value.loopback_timeout = true;
         assert!(!value.candidate_matches());
         let mut value = candidate();
+        value.loopback_error = None;
+        value.loopback_timeout = true;
+        assert!(value.candidate_matches());
+        value.public_connected = false;
+        assert!(!value.candidate_matches());
+        let mut value = candidate();
+        value.loopback_error = Some(10060);
+        value.loopback_timeout = true;
+        assert!(value.candidate_matches());
+        let mut value = candidate();
         value.winsock_startup = 10107;
         assert!(!value.candidate_matches());
         let mut value = candidate();
@@ -380,6 +510,52 @@ mod tests {
         let mut value = candidate();
         value.child_error = 0;
         assert!(!value.candidate_matches());
+    }
+    #[test]
+    fn quota_error_requires_the_actual_nonbreakaway_one_child_job() {
+        for error in [0, 5, 8, 87] {
+            let mut value = candidate();
+            value.child_error = error;
+            assert!(!value.candidate_matches());
+        }
+        let mut value = candidate();
+        value.job_query = -1;
+        assert!(!value.candidate_matches());
+        let mut value = candidate();
+        value.job_limit = 2;
+        assert!(!value.candidate_matches());
+        for flags in [0, 0x2100, 0x2908, 0x3108] {
+            let mut value = candidate();
+            value.job_flags = flags;
+            assert!(!value.candidate_matches());
+        }
+    }
+    #[test]
+    fn public_tcp_destination_rejects_nonpublic_and_non443_addresses() {
+        for address in [
+            "0.0.0.0:443",
+            "10.1.2.3:443",
+            "127.0.0.1:443",
+            "100.64.0.1:443",
+            "169.254.1.1:443",
+            "172.16.0.1:443",
+            "192.168.1.1:443",
+            "192.0.2.1:443",
+            "198.18.1.1:443",
+            "198.51.100.1:443",
+            "203.0.113.1:443",
+            "224.0.0.1:443",
+            "255.255.255.255:443",
+            "[::1]:443",
+            "[2606:4700:4700::1111]:443",
+            "1.1.1.1:80",
+        ] {
+            assert!(
+                !public_address_allowed(address.parse().unwrap()),
+                "{address}"
+            );
+        }
+        assert!(public_address_allowed("1.1.1.1:443".parse().unwrap()));
     }
     #[test]
     fn observation_rejects_unknown_and_duplicate_fields() {
