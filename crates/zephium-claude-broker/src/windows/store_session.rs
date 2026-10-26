@@ -293,12 +293,8 @@ impl ForeignSentinel {
     const CONTENT: &'static [u8] = b"synthetic foreign profile data";
     fn create(suffix: &str) -> Result<Self, &'static str> {
         use std::{io::Write, os::windows::fs::OpenOptionsExt};
-        let profile =
-            super::security::Profile::create(&format!("Zephium.ClaudeFixture.{suffix}.Foreign"))?;
-        let root = super::fixtures::Root::create(
-            std::env::temp_dir().join(format!("Zephium.ClaudeFixture.{suffix}.Foreign")),
-            &profile,
-        )?;
+        let profile = super::security::Profile::create(suffix)?;
+        let root = super::fixtures::Root::create(std::env::temp_dir().join(suffix), &profile)?;
         // Inherits only this fresh foreign Profile's private root descriptor.
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -364,6 +360,17 @@ enum Comparison {
     Baseline,
     FileDelete,
 }
+// CreateAppContainerProfile limits names to 64 characters. Hex preserves the
+// complete native PID/nanosecond tuple. One finite tag encodes mode and role.
+fn fixture_name(pid: u32, stamp: u128, mode: Comparison, foreign: bool) -> String {
+    let tag = match (mode, foreign) {
+        (Comparison::Baseline, false) => "B",
+        (Comparison::FileDelete, false) => "D",
+        (Comparison::Baseline, true) => "F",
+        (Comparison::FileDelete, true) => "G",
+    };
+    format!("Zephium.ClaudeFixture.{tag}{pid:x}.{stamp:x}")
+}
 fn expected_baseline_failure(
     mode: Comparison,
     operation: Operation,
@@ -396,8 +403,8 @@ fn comparison(mode: Comparison) -> Result<(), &'static str> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| "clock unavailable")?
         .as_nanos();
-    let suffix = format!("{}.{}.StoreConfig.{mode:?}", std::process::id(), stamp);
-    let profile = Profile::create(&format!("Zephium.ClaudeFixture.{suffix}"))?;
+    let suffix = fixture_name(std::process::id(), stamp, mode, false);
+    let profile = Profile::create(&suffix)?;
     let key = FixtureKey {
         domain: FixtureDomain::TrialModel,
         profile: stamp,
@@ -418,10 +425,7 @@ fn comparison(mode: Comparison) -> Result<(), &'static str> {
     let profile = active
         .fixture_profile()
         .map_err(|_| "fresh config profile unavailable")?;
-    let root = Root::create(
-        std::env::temp_dir().join(format!("Zephium.ClaudeFixture.{suffix}")),
-        &profile,
-    )?;
+    let root = Root::create(std::env::temp_dir().join(&suffix), &profile)?;
     let layout = Layout::create(&root.0, &profile)?;
     let config = active
         .config_path()
@@ -436,7 +440,7 @@ fn comparison(mode: Comparison) -> Result<(), &'static str> {
     std::fs::create_dir(config.join(CONTROL_DIRECTORY))
         .map_err(|_| "fresh control directory failed")?;
     parent_config_rights(&config, false)?;
-    let foreign = ForeignSentinel::create(&suffix)?;
+    let foreign = ForeignSentinel::create(&fixture_name(std::process::id(), stamp, mode, true))?;
     let source_path = std::env::current_exe().map_err(|_| "synthetic image unavailable")?;
     let mut source = OpenOptions::new()
         .read(true)
@@ -598,5 +602,21 @@ mod tests {
                 result
             ));
         }
+    }
+    #[test]
+    fn native_monikers_fit_full_width_inputs_and_keep_scopes_distinct() {
+        let mut names = std::collections::BTreeSet::new();
+        for (pid, stamp) in [(0, 0), (u32::MAX, u128::MAX), (1, 12), (11, 2)] {
+            for mode in [Comparison::Baseline, Comparison::FileDelete] {
+                for foreign in [false, true] {
+                    let name = fixture_name(pid, stamp, mode, foreign);
+                    assert!(name.starts_with("Zephium.ClaudeFixture."));
+                    assert!(name.len() <= 64);
+                    assert!(name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'.'));
+                    assert!(names.insert(name.to_ascii_lowercase()));
+                }
+            }
+        }
+        assert_eq!(names.len(), 16);
     }
 }
