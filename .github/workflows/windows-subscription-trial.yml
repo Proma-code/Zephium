@@ -47,6 +47,7 @@ jobs:
           ./scripts/test-windows-trial-binary-identity.ps1
           ./scripts/test-windows-trial-staging.ps1
           ./scripts/test-windows-trial-install-checks.ps1
+          ./scripts/test-windows-trial-runtime.ps1
           rustc --edition 2021 --test desktop/src/subscription_registry.rs -o "$env:RUNNER_TEMP/subscription-registry-tests.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & "$env:RUNNER_TEMP/subscription-registry-tests.exe"
@@ -136,6 +137,20 @@ jobs:
         run: |
           $installer = Join-Path $PWD 'target/windows-subscription-trial-artifact/Zephium-Subscription-Trial-Windows-x64-setup.exe'
           ./scripts/windows-trial-install-smoke.ps1 -ExpectedSourceRevision $env:GITHUB_SHA -ExpectedInstallerSha256 ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant())
+      - name: Fresh raw trial initialization, owned window and orderly close
+        id: runtime_smoke
+        run: |
+          $installer = Join-Path $PWD 'target/windows-subscription-trial-artifact/Zephium-Subscription-Trial-Windows-x64-setup.exe'
+          $executable = Join-Path $PWD 'target/release/zephium-subscription-trial.exe'
+          ./scripts/windows-trial-runtime-smoke.ps1 -ExpectedSourceRevision $env:GITHUB_SHA -ExpectedInstallerSha256 ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()) -ExpectedExecutableSha256 ((Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant())
+      - name: Retain bounded runtime observation (no raw log)
+        if: ${{ !cancelled() && (steps.runtime_smoke.outcome == 'success' || steps.runtime_smoke.outcome == 'failure') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Windows-Trial-Startup-Observation-${{ github.sha }}
+          path: target/windows-trial-runtime-smoke/summary.json
+          if-no-files-found: warn
+          retention-days: 14
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: Zephium-Subscription-Trial-Windows-x64-${{ github.sha }}

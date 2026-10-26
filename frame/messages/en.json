@@ -3294,6 +3294,7 @@
   "model_vision": "Sees images",
   "model_web": "Searches the web",
   "model_context": "{size} context",
+  "model_context_budget": "{size} context budget",
   "model_recommended": "Recommended",
   "model_price": "{input} in · {output} out per million tokens",
   "model_price_short": "{input} in · {output} out",

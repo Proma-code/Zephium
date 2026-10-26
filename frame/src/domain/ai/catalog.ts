@@ -71,6 +71,15 @@ export function connectionName(source: NonNullable<ReturnType<typeof modelConnec
   }[source]();
 }
 
+/** Protected adapters report local planning budgets, not verified provider capacity. */
+export function modelContext(entry: WorkModelEntry): string {
+  const source = modelConnection(entry);
+  const size = contextSize(entry.context_window);
+  return source === "chatgpt" || source === "gateway" || source === "go"
+    ? m.model_context_budget({ size })
+    : m.model_context({ size });
+}
+
 function gatewayEntry(entry: WorkModelEntry): boolean {
   return entry.model.provider === "compatible" && /^gateway\/[0-9a-f]{32}\/.+$/u.test(entry.id);
 }

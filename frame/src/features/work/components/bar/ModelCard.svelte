@@ -12,7 +12,7 @@
 
 <script lang="ts">
   import {
-    contextSize,
+    modelContext,
     dollars,
     effortName,
     modelName,
@@ -71,8 +71,7 @@
     if (entry.model.provider === "open_code_go") words.push(m.go_coding_only());
     if (tier) words.push(CHARACTERS[tier]());
     else if (entry.model.provider === "compatible") words.push(m.model_character_own());
-    if (entry.context_window < 500_000)
-      words.push(m.model_context({ size: contextSize(entry.context_window) }));
+    if (entry.context_window < 500_000) words.push(modelContext(entry));
     if (!entry.supports.vision) words.push(m.model_no_images());
     return words.join(" · ");
   });

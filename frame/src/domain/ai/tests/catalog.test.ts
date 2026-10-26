@@ -12,6 +12,7 @@ import {
   locked,
   modelName,
   modelConnection,
+  modelContext,
   pickerGroups,
   priceTier,
   searchEntries,
@@ -299,5 +300,28 @@ describe("OpenCode Go is its own native-managed provider", () => {
         (group) => group.provider === "open_code_go",
       ),
     ).toBe(false);
+  });
+});
+
+describe("model context provenance", () => {
+  test.each([
+    ["open_ai", "chatgpt/example", "32K context budget"],
+    ["compatible", `gateway/${"a".repeat(32)}/example`, "32K context budget"],
+    ["open_code_go", `opencode-go/${"a".repeat(32)}/example`, "32K context budget"],
+    ["open_ai", "openai/example", "32K context"],
+    ["compatible", "compatible/example", "32K context"],
+    ["anthropic", "anthropic/example", "32K context"],
+    ["cloud", "zephium/example", "32K context"],
+    ["google", "chatgpt/example", "32K context"],
+  ] as const)("%s %s has source-appropriate capacity wording", (provider, id, expected) => {
+    const model = entry(provider, "example", "Example", false, ["lead"], {
+      id,
+      context_window: 32768,
+      max_output: 8192,
+    });
+    expect(modelContext(model)).toBe(expected);
+    expect(modelName(model)).toBe("Example");
+    expect(model.context_window).toBe(32768);
+    expect(model.max_output).toBe(8192);
   });
 });

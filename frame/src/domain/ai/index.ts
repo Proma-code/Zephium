@@ -2,7 +2,6 @@ export { ModelsSession } from "./models.svelte";
 export { effortName } from "./effort";
 export { favourites, toggleFavourite } from "./favourites.svelte";
 export {
-  contextSize,
   dollars,
   effortLevels,
   entryOf,
@@ -16,6 +15,7 @@ export {
   locked,
   modelName,
   modelConnection,
+  modelContext,
   pickerGroups,
   providerName,
   requiredPlan,

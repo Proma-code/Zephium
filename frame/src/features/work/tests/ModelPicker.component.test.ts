@@ -5,6 +5,7 @@ import { page, userEvent } from "vitest/browser";
 import type { WorkModelReasoning, WorkModelsReadyV1 } from "$shared/ipc/bindings";
 import { preferences } from "$domain/preferences";
 import ModelPicker from "../components/bar/ModelPicker.svelte";
+import ModelCard from "../components/bar/ModelCard.svelte";
 import ModelBarStage from "./ModelBarStage.svelte";
 import { PROFILE, entry, models } from "$shared/testing/work-models";
 import { goView, goQuotaReading } from "$shared/testing/opencode-go";
@@ -1116,3 +1117,39 @@ test("Go quota refresh leaves model choice untouched and stale quota remains dis
   await expect.element(screen.getByText("80% remaining", { exact: false })).not.toBeInTheDocument();
   expect(native.choose).toHaveBeenCalledTimes(choices);
 });
+
+test.each([
+  ["open_ai", "chatgpt/example", "ChatGPT", "32K context budget"],
+  ["open_code_go", `opencode-go/${"a".repeat(32)}/example`, "OpenCode Go", "32K context budget"],
+  ["compatible", `gateway/${"a".repeat(32)}/example`, "Local gateway", "32K context budget"],
+  ["open_ai", "openai/example", "API key", "32K context"],
+  ["compatible", "compatible/example", "Custom endpoint", "32K context"],
+] as const)(
+  "the %s model card describes %s without mistaking an adapter budget for vendor capacity",
+  async (provider, id, connection, context) => {
+    const screen = await render(ModelCard, {
+      subject: {
+        entry: entry(provider, "example", "Example", false, ["lead"], {
+          id,
+          context_window: 32768,
+          max_output: 8192,
+        }),
+        tier: null,
+        levels: [],
+        effort: null,
+      },
+      expanded: false,
+      region: "model-context-fixture",
+      ontoggle: vi.fn(),
+      onEffort: vi.fn(),
+    });
+    const card = screen.getByRole("region", { name: "Example", exact: true });
+    await expect
+      .element(card)
+      .toHaveAccessibleDescription(new RegExp(`Connection: ${connection}`, "u"));
+    await expect.element(card).toHaveAccessibleDescription(new RegExp(`${context}(?: ·|$)`, "u"));
+    if (context === "32K context")
+      await expect.element(card).not.toHaveAccessibleDescription(/context budget/u);
+    await expect.element(card).toHaveAccessibleName("Example");
+  },
+);

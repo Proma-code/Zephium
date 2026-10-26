@@ -1,59 +1,59 @@
 # Windows subscription trial — test status
 
-This is an experimental checkpoint, not full acceptance of all requested providers.
-Detailed internal review and verification records are kept separately.
+This remains an experimental personal fork, not full acceptance of every
+requested provider. No real account grant or paid inference was used in these
+tests. Detailed internal reviews are kept separately.
 
-## Portable checks completed on 2026-10-26
+## Checks completed on 2026-10-26
 
-- ChatGPT: 70 tests; local gateway: 22; OpenCode Go account ownership and quota lifecycle: 37 passed.
-- Account/gateway/Go IPC: 23 passed; four explicit generation commands are
-  normally ignored. Generated binding checks passed.
-- Local gateway transport: 13 fixtures; OpenCode Go transport: 37 passed,
-  including 18 explicit quota-read fixtures.
-- Quota projection: 22 fixtures and 16 existing account tests passed. These do
-  not establish live quota retrieval.
-- Focused model routing: six; shared run-source tests: 13; call/accounting: seven;
-  profile-deletion selector: 20 passed.
-- An expanded app subset passed 951 tests with 11 ignored. Ten unchanged fixtures
-  requiring a different Unix temporary-directory layout were excluded on the
-  Linux cloud host. The unfiltered run failed those fixtures and two consequent
-  shared-lock checks; both shared-lock checks passed when rerun separately.
-  This is not an unfiltered full-suite pass.
-- Strict Clippy passed for the account and transport crates. App Clippy completed
-  with existing unrelated warnings, so it is not a warning-free app check.
-- Final renderer: 1,087 tests in 174 files, typecheck, lint, formatting and unused-code
-  checks passed. Production build and all 143 emitted style files passed. Five
-  additional quota browser cases are included for the next Windows Chromium run.
-- Trial packaging helpers: seven Node tests, six Rust configuration tests and
-  synthetic PowerShell staging/installer guard tests passed. Two shared account
-  registry concurrency fixtures also passed. Guard/parser checks
-  do not install or uninstall an application.
-- Project skill inventory validation passed for nine skills from four sources.
+- Portable account, transport, quota, routing and profile-removal regressions
+  passed. The latest renderer checks passed **1,104 unit tests in 175 files**,
+  typechecking, lint, formatting and unused-code checks. Both frame builds and
+  all 143 emitted style files passed.
+- On Windows, the account/picker Chromium component tests, native account and
+  focused routing tests, trial configuration checks, strict desktop Clippy and
+  complete generated IPC binding checks passed at source
+  `9b21629b96c7c6385ba2257a7426cb9be5797c84`.
+- The Windows native vault fixture passed using fresh synthetic trial profiles.
+  It exercised credential roundtrip, replacement, profile separation and cleanup,
+  not a real provider account.
+- The original pinned Claude client passed credential-free version/help startup
+  checks. This does not enable Claude account linking or establish login and
+  conversation behavior.
+- Packaging identity/guard checks and the nine-skill inventory validation passed.
+  Pure guard tests alone do not prove Windows installation or application startup.
 
-Tests used synthetic data, not real provider accounts or paid inference.
-Browser observations using mocked native responses are separate from Windows
-application testing and do not prove a real account connection.
+[Windows run for that source](https://github.com/Proma-code/Zephium/actions/runs/40279899377).
 
-## Windows status
+## Installer and application status
 
-Earlier runs exposed a timing-sensitive frontend test, build/check ordering,
-component-test selectors and a platform-dependent fixture socket mode. Repairs
-were tested and published without weakening the behavior assertions.
+The Windows installer job for the source above completed successfully on
+2026-10-26. It built and staged the unsigned installer, checked its exact bundled
+payload identity, and passed disposable install, same-artifact reinstall and
+uninstall checks with synthetic preservation fixtures. The workflow uploaded a
+temporary installer artifact. No application was launched by that smoke test.
 
-Subsequent Windows runs passed actual Chromium component tests, frame build,
-native account tests and focused app/IPC regressions. Separate fixture, lint and
-new-component selector failures were corrected and published. The current Go
-and quota increment still requires its own completed Windows run. Skipped steps
-are not counted as passes.
+The next raw-executable runtime check is still pending. It is limited to fresh
+first-run initialization, an observed responsive application window and orderly
+close. It is not complete UI testing or proof of installed-resource behavior.
+Five additional context-budget component cases also await their exact Windows run.
 
-Windows desktop compilation, installer execution, side-by-side operation and
-native account behavior are not yet fully verified. No installer is represented
-as ready here. A disposable-runner install/reinstall/uninstall smoke is planned
-with synthetic preservation fixtures; it is not real installed-app coexistence.
-Claude account linking remains open. Go now has manual quota retrieval code,
-but live account data and its Windows behavior remain unverified.
+Real side-by-side operation with an existing Zephium installation, live provider
+sign-in, model requests and account quota responses still need explicit user
+validation. Synthetic preservation fixtures are not an existing installation.
+Do not disable Windows protection to run an unsigned experimental installer.
 
-The current [user guide](../docs/subscription-accounts.md) describes available
-routes; the [Windows trial guide](../docs/windows-subscription-trial.md) describes
-how to recognize the separate experimental package. No pull request, merge or
-release is part of this work.
+## Remaining test limits
+
+- The full Windows Work suites are separate from focused regressions and remain
+  pending until their workflow completes. Skipped steps are not passes.
+- An expanded Linux app subset passed 951 tests with 11 ignored. The unfiltered
+  run failed ten unchanged temporary-directory-layout fixtures and two consequent
+  shared-lock checks. This is not an unfiltered full-suite pass.
+- Claude account linking remains in development. OpenCode Go has manual quota
+  retrieval code, but these tests used synthetic responses. Numeric direct
+  ChatGPT and generic local-gateway quota remain unavailable.
+
+See the [connection guide](../docs/subscription-accounts.md) and
+[Windows trial guide](../docs/windows-subscription-trial.md). There is no pull
+request, merge or public release in this work.
