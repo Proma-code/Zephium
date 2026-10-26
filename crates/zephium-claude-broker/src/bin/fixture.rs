@@ -3,6 +3,11 @@
 #[cfg(not(debug_assertions))]
 compile_error!("Synthetic Claude broker helper is debug-only");
 
+#[cfg(any(windows, test))]
+fn exact_path(value: &std::ffi::OsStr, expected: &str) -> bool {
+    value == std::ffi::OsStr::new(expected)
+}
+
 #[cfg(windows)]
 fn main() {
     // Synthetic helper diagnostics only. Never copy panic payloads, paths, user
@@ -319,7 +324,7 @@ fn child(mode: &str) -> Result<(), &'static str> {
                 .write_all(b"isolation-config\n")
                 .map_err(|_| "isolation marker failed")?;
             let config = std::env::var_os("CLAUDE_CONFIG_DIR").ok_or("private config missing")?;
-            if std::path::Path::new(&config) != std::path::Path::new(path("config")?) {
+            if !exact_path(&config, path("config")?) {
                 return Err("config isolation path mismatch");
             }
             for (variable, field) in [
@@ -329,7 +334,7 @@ fn child(mode: &str) -> Result<(), &'static str> {
                 ("LOCALAPPDATA", "localappdata"),
             ] {
                 let value = std::env::var_os(variable).ok_or("private environment path missing")?;
-                if std::path::Path::new(&value) != std::path::Path::new(path(field)?) {
+                if !exact_path(&value, path(field)?) {
                     return Err(match variable {
                         "HOME" => "private HOME path mismatch",
                         "USERPROFILE" => "private USERPROFILE path mismatch",
@@ -339,9 +344,40 @@ fn child(mode: &str) -> Result<(), &'static str> {
                     });
                 }
             }
-            if std::env::current_dir().map_err(|_| "private work directory unavailable")?
-                != std::path::Path::new(path("work")?)
-            {
+            for variable in ["TMP", "TEMP"] {
+                let value = std::env::var_os(variable).ok_or("private temporary path missing")?;
+                if !exact_path(&value, path("temporary")?) {
+                    return Err("private temporary path mismatch");
+                }
+            }
+            for (field, leaf) in [
+                ("localappdata", "synthetic-localappdata-write"),
+                ("temporary", "synthetic-temp-write"),
+            ] {
+                let target = std::path::Path::new(path(field)?).join(leaf);
+                std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(target)
+                    .and_then(|mut file| file.write_all(b"fixture only"))
+                    .map_err(|_| "fresh profile data write failed")?;
+            }
+            for write in [false, true] {
+                let result = std::fs::OpenOptions::new()
+                    .read(!write)
+                    .write(write)
+                    .open(path("foreign_data")?);
+                match result {
+                    Err(error) if error.raw_os_error() == Some(5) => {}
+                    _ => return Err("foreign profile data denial not established"),
+                }
+            }
+            if !exact_path(
+                std::env::current_dir()
+                    .map_err(|_| "private work directory unavailable")?
+                    .as_os_str(),
+                path("work")?,
+            ) {
                 return Err("private work directory mismatch");
             }
             std::fs::write(
@@ -363,4 +399,24 @@ fn child(mode: &str) -> Result<(), &'static str> {
         _ => return Err("unknown child fixture"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod path_tests {
+    #[test]
+    fn exact_expected_path_never_accepts_lexical_aliases() {
+        use std::ffi::OsStr;
+        let expected = r"C:\synthetic\profile\AC";
+        assert!(super::exact_path(OsStr::new(expected), expected));
+        for alias in [
+            r"C:\synthetic\profile\.\AC",
+            r"C:\synthetic\profile\\AC",
+            r"c:\synthetic\profile\AC",
+            r"C:\synthetic\profile\AC\",
+            r"C:/synthetic/profile/AC",
+            r"C:\synthetic\other\AC",
+        ] {
+            assert!(!super::exact_path(OsStr::new(alias), expected));
+        }
+    }
 }

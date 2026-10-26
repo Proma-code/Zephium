@@ -38,6 +38,9 @@ jobs:
         with:
           shared-key: windows-claude-broker-qualification
           cache-on-failure: true
+      - name: Build native fixture harness (no account)
+        id: fixture_build
+        run: cargo build -p zephium-claude-broker --locked --features native-fixtures --bin claude-broker-fixture
       - name: Fresh synthetic account-store fixtures (no account)
         run: |
           $listed = & cargo test -p zephium-claude-broker --locked --features native-fixtures --lib windows::account_store::tests -- --ignored --list
@@ -48,4 +51,5 @@ jobs:
           cargo test -p zephium-claude-broker --locked --features native-fixtures --lib windows::account_store::tests -- --ignored --test-threads=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Synthetic fixtures then exact original client startup (no login or inference)
+        if: ${{ !cancelled() && steps.fixture_build.outcome == 'success' }}
         run: pwsh -NoProfile -File crates/zephium-claude-broker/qualify-windows.ps1

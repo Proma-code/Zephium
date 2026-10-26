@@ -88,6 +88,22 @@ struct Inner {
     quarantined: AtomicBool,
 }
 
+// Fixed stage names and closed numeric categories only. This never reports a
+// path, SID, descriptor, account value or native caller-provided text.
+fn stage<T>(name: &'static str, result: Result<T, Error>) -> Result<T, Error> {
+    let code = match &result {
+        Ok(_) => 0,
+        Err(Error::Busy) => 1,
+        Err(Error::Collision) => 2,
+        Err(Error::Dirty) => 3,
+        Err(Error::Invalid) => 4,
+        Err(Error::Io) => 5,
+        Err(Error::Quarantined) => 6,
+    };
+    super::diagnostic(name, code);
+    result
+}
+
 impl FixtureStoreOwner {
     /// Creates exactly one new random synthetic child of the held temp chain.
     /// No retry/adoption/fallback follows a collision or ambiguous publication.
@@ -95,35 +111,71 @@ impl FixtureStoreOwner {
         // Consume the non-Clone fresh Profile. Two fixture keys cannot share a
         // package principal by passing the same Arc into separate store roots.
         let profile = Arc::new(profile);
-        let (owner_sid, package_sid) = profile.fixture_sids().map_err(|_| Error::Invalid)?;
-        let ambient_parent = std::env::temp_dir();
-        let mut chain = native::pin_parent(&ambient_parent, &owner_sid)?;
-        // Store only the held canonical spelling, after exact raw input proof.
-        let parent = native::canonical_parent(&chain.last().ok_or(Error::Invalid)?.file)?;
-        let root_name = native::fresh_name()?;
-        let root_policy = Policy::directory(&owner_sid, &package_sid, false);
-        let root = native::create_directory(
-            &chain.last().ok_or(Error::Invalid)?.file,
-            &root_name,
-            &root_policy,
+        let (owner_sid, package_sid) = stage(
+            "store-create-principals",
+            profile.fixture_sids().map_err(|_| Error::Invalid),
         )?;
-        native::sync_directory(&chain.last().ok_or(Error::Invalid)?.file)?;
+        let ambient_parent = std::env::temp_dir();
+        let mut chain = stage(
+            "store-create-parent",
+            native::pin_parent(&ambient_parent, &owner_sid),
+        )?;
+        // Store only the held canonical spelling, after exact raw input proof.
+        let parent = stage(
+            "store-create-canonical-parent",
+            native::canonical_parent(&chain.last().ok_or(Error::Invalid)?.file),
+        )?;
+        let root_name = stage("store-create-random-name", native::fresh_name())?;
+        let root_policy = Policy::directory(&owner_sid, &package_sid, false);
+        let root = stage(
+            "store-create-root",
+            native::create_directory(
+                &chain.last().ok_or(Error::Invalid)?.file,
+                &root_name,
+                &root_policy,
+            ),
+        )?;
+        stage(
+            "store-create-parent-sync",
+            native::sync_directory(&chain.last().ok_or(Error::Invalid)?.file),
+        )?;
         chain.push(root);
         let root = &chain.last().ok_or(Error::Invalid)?.file;
         let broker_policy = Policy::broker_file(&owner_sid);
-        let lock = native::create_file(root, LOCK, &broker_policy)?;
-        native::lock_exclusive(&lock)?;
-        let mut state = native::create_file(root, STATE, &broker_policy)?;
-        // Partial fresh creation is never represented as a clean reusable store.
-        state.write_all(DIRTY).map_err(|_| Error::Io)?;
-        state.sync_all().map_err(|_| Error::Io)?;
-        native::sync_directory(root)?;
-        let config = native::create_directory(
-            root,
-            CONFIG,
-            &Policy::directory(&owner_sid, &package_sid, true),
+        let lock = stage(
+            "store-create-lock",
+            native::create_file(root, LOCK, &broker_policy),
         )?;
-        native::sync_directory(root)?;
+        stage("store-create-lease", native::lock_exclusive(&lock))?;
+        let mut state = stage(
+            "store-create-state",
+            native::create_file(root, STATE, &broker_policy),
+        )?;
+        // Partial fresh creation is never represented as a clean reusable store.
+        stage(
+            "store-create-dirty-write",
+            state.write_all(DIRTY).map_err(|_| Error::Io),
+        )?;
+        stage(
+            "store-create-dirty-sync",
+            state.sync_all().map_err(|_| Error::Io),
+        )?;
+        stage(
+            "store-create-state-parent-sync",
+            native::sync_directory(root),
+        )?;
+        let config = stage(
+            "store-create-config",
+            native::create_directory(
+                root,
+                CONFIG,
+                &Policy::directory(&owner_sid, &package_sid, true),
+            ),
+        )?;
+        stage(
+            "store-create-config-parent-sync",
+            native::sync_directory(root),
+        )?;
         let receipt = InProcessFixtureReceipt(Arc::new(Receipt {
             parent,
             root_name,
@@ -145,9 +197,9 @@ impl FixtureStoreOwner {
             active: Mutex::new(false),
             quarantined: AtomicBool::new(false),
         });
-        inner.verify()?;
+        stage("store-create-final-proof", inner.verify())?;
         // No process has been admitted by this fresh-only constructor.
-        inner.write_state(CLEAN)?;
+        stage("store-create-clean-sync", inner.write_state(CLEAN))?;
         Ok((Self { receipt }, StoreLease { inner }))
     }
     pub(super) fn receipt(&self) -> InProcessFixtureReceipt {

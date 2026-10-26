@@ -186,7 +186,24 @@ pub(crate) fn qualify() -> Result<(), &'static str> {
         "unlisted-handle-denial-established",
         i32::from(strict_denial),
     );
-    let request = serde_json::json!({"sentinel":sentinel_file,"outside":sentinel.0,"loopback":address.to_string(),"image":image_path,"config":layout.config,"home":layout.home,"work":layout.work,"appdata":layout.appdata,"localappdata":layout.localappdata});
+    // Windows reroutes LOCALAPPDATA/TMP/TEMP to the fresh AppContainer profile.
+    // Bind expected values to the documented API for our exact fresh SID, not a
+    // host environment value, guessed prefix, or arbitrary normalized path.
+    let mut own_folder = profile.fixture_folder()?;
+    let own_temporary = own_folder.temporary()?;
+    let foreign_profile = Profile::create(&format!("Zephium.ClaudeFixture.ForeignData.{suffix}"))?;
+    let foreign_folder = foreign_profile.fixture_folder()?;
+    if own_folder.path == foreign_folder.path {
+        return Err("fresh profile data identities collided");
+    }
+    let foreign_file = foreign_folder.path.join("synthetic-foreign-data");
+    File::options()
+        .create_new(true)
+        .write(true)
+        .open(&foreign_file)
+        .and_then(|mut file| file.write_all(b"synthetic foreign profile data"))
+        .map_err(|_| "fresh foreign profile sentinel creation failed")?;
+    let request = serde_json::json!({"sentinel":sentinel_file,"outside":sentinel.0,"loopback":address.to_string(),"image":image_path,"config":layout.config,"home":layout.home,"work":layout.work,"appdata":layout.appdata,"localappdata":own_folder.path,"temporary":own_temporary,"foreign_data":foreign_file});
     let output = process::run(
         &profile,
         &image,
@@ -253,6 +270,15 @@ pub(crate) fn qualify() -> Result<(), &'static str> {
         b"claude-broker-fixture: empty work directory was writable\n" => {
             super::diagnostic("synthetic-work-write-succeeded", 1)
         }
+        b"claude-broker-fixture: private temporary path mismatch\n" => {
+            super::diagnostic("synthetic-temporary-path-mismatch", 1)
+        }
+        b"claude-broker-fixture: fresh profile data write failed\n" => {
+            super::diagnostic("synthetic-profile-data-write-failed", 1)
+        }
+        b"claude-broker-fixture: foreign profile data denial not established\n" => {
+            super::diagnostic("synthetic-foreign-profile-data-denial-failed", 1)
+        }
         _ => {}
     }
     if output.code != 0
@@ -262,6 +288,18 @@ pub(crate) fn qualify() -> Result<(), &'static str> {
     {
         return Err("ACL, child or loopback denial fixture failed");
     }
+    if std::fs::read(own_folder.path.join("synthetic-localappdata-write"))
+        .map_err(|_| "own profile local data readback failed")?
+        != b"fixture only"
+        || std::fs::read(own_folder.path.join("Temp").join("synthetic-temp-write"))
+            .map_err(|_| "own profile temporary readback failed")?
+            != b"fixture only"
+        || std::fs::read(&foreign_file).map_err(|_| "foreign profile data readback failed")?
+            != b"synthetic foreign profile data"
+    {
+        return Err("profile data write or foreign sentinel changed");
+    }
+    super::diagnostic("sid-bound-profile-data-controls-passed", 0);
     let flood = process::run(
         &profile,
         &image,
@@ -344,6 +382,9 @@ pub(crate) fn qualify() -> Result<(), &'static str> {
     if HeldImage::open(&alias, hash).is_ok() {
         return Err("hard-linked executable admitted");
     }
+    drop(foreign_folder);
+    drop(own_folder);
+    foreign_profile.close()?;
     profile.close()?;
     sentinel.cleanup()?;
     root.cleanup()?;

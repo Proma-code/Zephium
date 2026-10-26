@@ -14,7 +14,7 @@ use std::{
 use windows::{
     core::{BOOL, PCWSTR, PWSTR},
     Win32::{
-        Foundation::{LocalFree, HANDLE, HLOCAL, UNICODE_STRING},
+        Foundation::{GetLastError, LocalFree, HANDLE, HLOCAL, UNICODE_STRING},
         Security::{
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -35,6 +35,15 @@ use windows::{
         System::IO::{IO_STATUS_BLOCK, OVERLAPPED},
     },
 };
+
+fn invalid(stage: &'static str, category: i32) -> Error {
+    super::super::diagnostic(stage, category);
+    Error::Invalid
+}
+fn native_error(stage: &'static str, error: windows::core::Error) -> Error {
+    super::super::diagnostic(stage, error.code().0);
+    Error::Invalid
+}
 
 const READ: u32 = 0x0012_0089;
 const WRITE: u32 = 0x0012_0116;
@@ -129,7 +138,7 @@ impl Policy {
                 None,
             )
         }
-        .map_err(|_| Error::Invalid)?;
+        .map_err(|error| native_error("store-descriptor-build", error))?;
         if raw.0.is_null() {
             return Err(Error::Invalid);
         }
@@ -138,15 +147,48 @@ impl Policy {
     fn verify(&self, file: &File) -> Result<Snapshot, Error> {
         let expected = snapshot_descriptor(self.descriptor()?.0)?;
         let actual = snapshot(file)?;
-        if actual.owner != expected.owner
-            || actual.dacl != expected.dacl
-            || actual.labels != expected.labels
-            || actual.control & 0x1000 == 0
-        {
-            return Err(Error::Invalid);
+        if actual.owner != expected.owner {
+            return Err(invalid("store-policy-owner", 1));
+        }
+        if actual.dacl != expected.dacl {
+            return Err(invalid(
+                "store-policy-dacl",
+                acl_difference(&actual.dacl, &expected.dacl),
+            ));
+        }
+        if actual.labels != expected.labels {
+            return Err(invalid(
+                "store-policy-label",
+                acl_difference(&actual.labels, &expected.labels),
+            ));
+        }
+        if actual.control & 0x1000 == 0 {
+            return Err(invalid("store-policy-protected", 1));
         }
         Ok(actual)
     }
+}
+// Closed mismatch categories: count, ACE kind, flags, mask, or SID. Never
+// serialize either descriptor or its identities into qualification diagnostics.
+fn acl_difference(actual: &[Ace], expected: &[Ace]) -> i32 {
+    if actual.len() != expected.len() {
+        return 1;
+    }
+    for (actual, expected) in actual.iter().zip(expected) {
+        if actual.kind != expected.kind {
+            return 2;
+        }
+        if actual.flags != expected.flags {
+            return 3;
+        }
+        if actual.mask != expected.mask {
+            return 4;
+        }
+        if actual.sid != expected.sid {
+            return 5;
+        }
+    }
+    0
 }
 struct Descriptor(PSECURITY_DESCRIPTOR);
 impl Drop for Descriptor {
@@ -241,6 +283,7 @@ fn open(
         )
     };
     if result < 0 {
+        super::super::diagnostic("store-nt-open", result);
         return Err(match unsafe { RtlNtStatusToDosError(result) } {
             80 | 183 => Error::Collision,
             32 | 33 => Error::Busy,
@@ -248,11 +291,11 @@ fn open(
         });
     }
     if raw.is_invalid() {
-        return Err(Error::Invalid);
+        return Err(invalid("store-nt-open-handle", 1));
     }
     let file = unsafe { File::from_raw_handle(raw.0) };
     if result != 0 {
-        return Err(Error::Invalid);
+        return Err(invalid("store-nt-open-status", result));
     }
     identity(&file, directory)?;
     Ok(file)
@@ -260,11 +303,14 @@ fn open(
 pub(super) fn identity(file: &File, directory: bool) -> Result<Identity, Error> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     unsafe { GetFileInformationByHandle(handle(file), &mut info) }.map_err(|_| Error::Invalid)?;
-    if info.dwFileAttributes & 0x400 != 0
-        || (info.dwFileAttributes & 0x10 != 0) != directory
-        || (!directory && info.nNumberOfLinks != 1)
-    {
-        return Err(Error::Invalid);
+    if info.dwFileAttributes & 0x400 != 0 {
+        return Err(invalid("store-node-reparse", 1));
+    }
+    if (info.dwFileAttributes & 0x10 != 0) != directory {
+        return Err(invalid("store-node-kind", 1));
+    }
+    if !directory && info.nNumberOfLinks != 1 {
+        return Err(invalid("store-node-link-count", 1));
     }
     let mut id = FILE_ID_INFO::default();
     unsafe {
@@ -275,7 +321,7 @@ pub(super) fn identity(file: &File, directory: bool) -> Result<Identity, Error> 
             size_of::<FILE_ID_INFO>() as u32,
         )
     }
-    .map_err(|_| Error::Invalid)?;
+    .map_err(|error| native_error("store-file-identity", error))?;
     Ok(Identity {
         volume: id.VolumeSerialNumber,
         file: id.FileId.Identifier,
@@ -286,14 +332,22 @@ fn normalized(file: &File) -> Result<String, Error> {
     let length = unsafe {
         GetFinalPathNameByHandleW(handle(file), &mut buffer, GETFINALPATHNAMEBYHANDLE_FLAGS(0))
     } as usize;
-    if length == 0 || length >= buffer.len() {
-        return Err(Error::Invalid);
+    if length == 0 {
+        return Err(invalid(
+            "store-path-query",
+            unsafe { GetLastError() }.0 as i32,
+        ));
     }
-    String::from_utf16(&buffer[..length]).map_err(|_| Error::Invalid)
+    if length >= buffer.len() {
+        return Err(invalid("store-path-bound", 1));
+    }
+    String::from_utf16(&buffer[..length]).map_err(|_| invalid("store-path-utf16", 1))
 }
 pub(super) fn canonical_parent(file: &File) -> Result<PathBuf, Error> {
     let normalized = normalized(file)?;
-    let plain = normalized.strip_prefix("\\\\?\\").ok_or(Error::Invalid)?;
+    let plain = normalized
+        .strip_prefix("\\\\?\\")
+        .ok_or_else(|| invalid("store-path-prefix", 1))?;
     Ok(PathBuf::from(plain))
 }
 
@@ -310,16 +364,16 @@ pub(super) fn exact_parent_spelling(path: &Path, canonical: &Path) -> bool {
 
 fn exact_name(file: &File, name: &str) -> Result<(), Error> {
     if normalized(file)?.rsplit('\\').next() != Some(name) {
-        return Err(Error::Invalid);
+        return Err(invalid("store-component-spelling", 1));
     }
     Ok(())
 }
 fn ntfs(file: &File) -> Result<(), Error> {
     let mut fs = [0u16; 32];
     unsafe { GetVolumeInformationByHandleW(handle(file), None, None, None, None, Some(&mut fs)) }
-        .map_err(|_| Error::Invalid)?;
+        .map_err(|error| native_error("store-volume-query", error))?;
     if fs[..5] != [b'N' as u16, b'T' as u16, b'F' as u16, b'S' as u16, 0] {
-        return Err(Error::Invalid);
+        return Err(invalid("store-volume-kind", 1));
     }
     // A local drive-root spelling is separately proved; UNC/device roots refuse.
     Ok(())
@@ -342,13 +396,13 @@ fn open_drive(drive: u8, owner: &str) -> Result<HeldDirectory, Error> {
         .share_mode(3)
         .custom_flags(0x0220_0000)
         .open(&name)
-        .map_err(|_| Error::Invalid)?;
+        .map_err(|error| invalid("store-drive-open", error.raw_os_error().unwrap_or(-1)))?;
     let identity = identity(&file, true)?;
     if !normalized(&file)?.eq_ignore_ascii_case(&format!("\\\\?\\{name}")) {
-        return Err(Error::Invalid);
+        return Err(invalid("store-drive-spelling", 1));
     }
-    ntfs(&file)?;
-    let security = ancestor(&file, owner)?;
+    super::stage("store-drive-volume", ntfs(&file))?;
+    let security = super::stage("store-drive-security", ancestor(&file, owner))?;
     Ok(HeldDirectory {
         file,
         identity,
@@ -361,23 +415,28 @@ pub(super) fn pin_parent(path: &Path, owner: &str) -> Result<Vec<HeldDirectory>,
     let drive = match components.next() {
         Some(Component::Prefix(prefix)) => match prefix.kind() {
             Prefix::Disk(drive) => drive,
-            _ => return Err(Error::Invalid),
+            _ => return Err(invalid("store-parent-prefix", 1)),
         },
-        _ => return Err(Error::Invalid),
+        _ => return Err(invalid("store-parent-prefix", 1)),
     };
     if components.next() != Some(Component::RootDir) {
-        return Err(Error::Invalid);
+        return Err(invalid("store-parent-root", 1));
     }
     let names = components
         .map(|p| match p {
-            Component::Normal(name) => name.to_str().ok_or(Error::Invalid),
-            _ => Err(Error::Invalid),
+            Component::Normal(name) => name
+                .to_str()
+                .ok_or_else(|| invalid("store-parent-component-utf16", 1)),
+            _ => Err(invalid("store-parent-component-kind", 1)),
         })
         .collect::<Result<Vec<_>, _>>()?;
     if names.is_empty() {
-        return Err(Error::Invalid);
+        return Err(invalid("store-parent-empty", 1));
     }
-    let mut chain = vec![open_drive(drive, owner)?];
+    let mut chain = vec![super::stage(
+        "store-parent-drive",
+        open_drive(drive, owner),
+    )?];
     for (index, name) in names.iter().enumerate() {
         let file = open(
             &chain.last().ok_or(Error::Invalid)?.file,
@@ -387,8 +446,8 @@ pub(super) fn pin_parent(path: &Path, owner: &str) -> Result<Vec<HeldDirectory>,
             OPEN,
             None,
         )?;
-        exact_name(&file, name)?;
-        let security = ancestor(&file, owner)?;
+        super::stage("store-parent-component-spelling", exact_name(&file, name))?;
+        let security = super::stage("store-parent-component-security", ancestor(&file, owner))?;
         chain.push(HeldDirectory {
             identity: identity(&file, true)?,
             file,
@@ -398,7 +457,7 @@ pub(super) fn pin_parent(path: &Path, owner: &str) -> Result<Vec<HeldDirectory>,
     }
     let canonical = canonical_parent(&chain.last().ok_or(Error::Invalid)?.file)?;
     if !exact_parent_spelling(path, &canonical) {
-        return Err(Error::Invalid);
+        return Err(invalid("store-parent-raw-spelling", 1));
     }
     Ok(chain)
 }
@@ -562,7 +621,9 @@ pub(super) fn lock_exclusive(file: &File) -> Result<(), Error> {
 }
 pub(super) fn sync_directory(file: &File) -> Result<(), Error> {
     let mut status = IO_STATUS_BLOCK::default();
-    if unsafe { NtFlushBuffersFile(handle(file), &mut status) } != 0 {
+    let result = unsafe { NtFlushBuffersFile(handle(file), &mut status) };
+    if result != 0 {
+        super::super::diagnostic("store-directory-sync", result);
         return Err(Error::Io);
     }
     Ok(())
@@ -585,13 +646,14 @@ fn acl_entries(acl: *mut ACL) -> Result<Vec<Ace>, Error> {
     let size = usize::from(unsafe { (*acl).AclSize });
     let count = u32::from(unsafe { (*acl).AceCount });
     if size < size_of::<ACL>() || count > 256 {
-        return Err(Error::Invalid);
+        return Err(invalid("store-acl-shape", 1));
     }
     let end = base.checked_add(size).ok_or(Error::Invalid)?;
     let mut entries = Vec::with_capacity(count as usize);
     for index in 0..count {
         let mut raw: *mut c_void = std::ptr::null_mut();
-        unsafe { GetAce(acl, index, &mut raw) }.map_err(|_| Error::Invalid)?;
+        unsafe { GetAce(acl, index, &mut raw) }
+            .map_err(|error| native_error("store-ace-query", error))?;
         let address = raw as usize;
         if address < base + size_of::<ACL>()
             || address
@@ -599,7 +661,7 @@ fn acl_entries(acl: *mut ACL) -> Result<Vec<Ace>, Error> {
                 .is_none_or(|v| v > end)
             || !address.is_multiple_of(std::mem::align_of::<ACCESS_ALLOWED_ACE>())
         {
-            return Err(Error::Invalid);
+            return Err(invalid("store-acl-shape", 1));
         }
         let header = unsafe { &*raw.cast::<ACE_HEADER>() };
         let length = usize::from(header.AceSize);
@@ -608,12 +670,12 @@ fn acl_entries(acl: *mut ACL) -> Result<Vec<Ace>, Error> {
             || length < offset + 8
             || address.checked_add(length).is_none_or(|v| v > end)
         {
-            return Err(Error::Invalid);
+            return Err(invalid("store-acl-shape", 1));
         }
         let sid = unsafe { raw.cast::<u8>().add(offset) };
         let subauthorities = unsafe { *sid.add(1) } as usize;
         if subauthorities > 15 || offset + 8 + 4 * subauthorities > length {
-            return Err(Error::Invalid);
+            return Err(invalid("store-acl-shape", 1));
         }
         entries.push(Ace {
             kind: header.AceType,
@@ -639,7 +701,7 @@ fn snapshot(file: &File) -> Result<Snapshot, Error> {
         )
     }
     .ok()
-    .map_err(|_| Error::Invalid)?;
+    .map_err(|error| native_error("store-security-query", error))?;
     if raw.0.is_null() {
         return Err(Error::Invalid);
     }
@@ -650,22 +712,22 @@ fn snapshot_descriptor(sd: PSECURITY_DESCRIPTOR) -> Result<Snapshot, Error> {
     let mut owner = PSID::default();
     let mut defaulted = BOOL::default();
     unsafe { GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted) }
-        .map_err(|_| Error::Invalid)?;
+        .map_err(|error| native_error("store-descriptor-owner", error))?;
     let mut control = 0;
     let mut revision = 0;
     unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) }
-        .map_err(|_| Error::Invalid)?;
+        .map_err(|error| native_error("store-descriptor-control", error))?;
     let mut present = BOOL::default();
     let mut dacl = std::ptr::null_mut();
     unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) }
-        .map_err(|_| Error::Invalid)?;
+        .map_err(|error| native_error("store-descriptor-dacl", error))?;
     if !present.as_bool() || dacl.is_null() {
-        return Err(Error::Invalid);
+        return Err(invalid("store-descriptor-dacl-present", 1));
     }
     let dacl = acl_entries(dacl)?;
     let mut labels = std::ptr::null_mut();
     unsafe { GetSecurityDescriptorSacl(sd, &mut present, &mut labels, &mut defaulted) }
-        .map_err(|_| Error::Invalid)?;
+        .map_err(|error| native_error("store-descriptor-label", error))?;
     let labels = if present.as_bool() {
         acl_entries(labels)?
     } else {
@@ -690,18 +752,18 @@ fn trusted(sid: &str, owner: &str) -> bool {
 fn ancestor(file: &File, owner: &str) -> Result<Snapshot, Error> {
     let security = snapshot(file)?;
     if !trusted(&security.owner, owner) {
-        return Err(Error::Invalid);
+        return Err(invalid("store-ancestor-owner", 1));
     }
     for entry in &security.dacl {
         if !matches!(entry.kind, 0 | 1) {
-            return Err(Error::Invalid);
+            return Err(invalid("store-ancestor-ace-kind", 1));
         }
         if entry.kind == 1 || entry.flags & 8 != 0 || entry.mask & (0x000d_0150 | 0x5000_0000) == 0
         {
             continue;
         }
         if !trusted(&entry.sid, owner) {
-            return Err(Error::Invalid);
+            return Err(invalid("store-ancestor-mutator", 1));
         }
     }
     Ok(security)

@@ -103,6 +103,31 @@ fn default_owner_matches_user() -> Result<bool, &'static str> {
     let owner = sid_string(unsafe { (*buffer.as_ptr().cast::<TOKEN_OWNER>()).Owner })?;
     Ok(owner == owner_sid()?)
 }
+#[cfg(feature = "native-fixtures")]
+pub(super) struct HeldProfileFolder {
+    pub(super) path: std::path::PathBuf,
+    _holds: Vec<File>,
+}
+#[cfg(feature = "native-fixtures")]
+impl HeldProfileFolder {
+    pub(super) fn temporary(&mut self) -> Result<std::path::PathBuf, &'static str> {
+        let path = self.path.join("Temp");
+        let held = OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES.0)
+            .share_mode(3)
+            .custom_flags(OPEN_NOFOLLOW_DIRECTORY)
+            .open(&path)
+            .map_err(|_| "fresh profile temporary folder cannot be held")?;
+        let metadata = held
+            .metadata()
+            .map_err(|_| "fresh profile temporary metadata unavailable")?;
+        if !metadata.is_dir() || metadata.file_attributes() & 0x400 != 0 {
+            return Err("fresh profile temporary folder is aliased");
+        }
+        self._holds.push(held);
+        Ok(path)
+    }
+}
 pub(super) struct Profile {
     delete_on_drop: bool,
     name: Vec<u16>,
@@ -118,6 +143,52 @@ impl Profile {
             owner_sid()?,
             sid_string(PSID(self.sid.as_ptr().cast_mut().cast()))?,
         ))
+    }
+    /// Documented OS-managed data folder for this freshly created identity only.
+    /// Never adopts another application's package/profile or normalizes a caller path.
+    #[cfg(feature = "native-fixtures")]
+    pub(super) fn fixture_folder(&self) -> Result<HeldProfileFolder, &'static str> {
+        use windows::Win32::{
+            Security::Isolation::GetAppContainerFolderPath, System::Com::CoTaskMemFree,
+        };
+        let sid = wide(OsStr::new(&sid_string(PSID(
+            self.sid.as_ptr().cast_mut().cast(),
+        ))?))?;
+        let raw = unsafe { GetAppContainerFolderPath(PCWSTR(sid.as_ptr())) }
+            .map_err(|_| "fresh profile data folder unavailable")?;
+        if raw.is_null() {
+            return Err("fresh profile data folder missing");
+        }
+        let text = unsafe { raw.to_string() };
+        unsafe { CoTaskMemFree(Some(raw.0.cast())) };
+        let path = std::path::PathBuf::from(
+            text.map_err(|_| "fresh profile data folder encoding failed")?,
+        );
+        if !plain_local_path(&path) || path.components().count() < 5 {
+            return Err("fresh profile data folder path rejected");
+        }
+        let mut holds = Vec::new();
+        let mut paths: Vec<_> = path.ancestors().collect();
+        paths.reverse();
+        for directory in paths {
+            let held = OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES.0)
+                .share_mode(3)
+                .custom_flags(OPEN_NOFOLLOW_DIRECTORY)
+                .open(directory)
+                .map_err(|_| "fresh profile folder ancestor cannot be held")?;
+            let metadata = held
+                .metadata()
+                .map_err(|_| "fresh profile folder metadata unavailable")?;
+            if !metadata.is_dir() || metadata.file_attributes() & 0x400 != 0 {
+                return Err("fresh profile folder is aliased");
+            }
+            holds.push(held);
+        }
+        Ok(HeldProfileFolder {
+            path,
+            _holds: holds,
+        })
     }
     /// Only freshly generated identities are admitted by this candidate. Persistent
     /// vendor identity/retirement remains part of the production qualification.
