@@ -193,9 +193,27 @@ pub(crate) fn qualify() -> Result<(), &'static str> {
         &cancelled,
     )?;
     receipt("output", &output);
+    // Recognize only this fixed helper grammar; never forward raw child output.
+    for (stage, prefix) in [
+        ("isolation-reached-files", b"isolation-files\n".as_slice()),
+        ("isolation-reached-network", b"isolation-files\nisolation-network\n".as_slice()),
+        ("isolation-reached-child", b"isolation-files\nisolation-network\nisolation-child\n".as_slice()),
+        ("isolation-reached-environment", b"isolation-files\nisolation-network\nisolation-child\nisolation-environment\n".as_slice()),
+        ("isolation-reached-config", b"isolation-files\nisolation-network\nisolation-child\nisolation-environment\nisolation-config\n".as_slice()),
+    ] { if output.stdout.starts_with(prefix) { super::diagnostic(stage, 0); } }
+    match output.stderr.as_slice() {
+        b"fixture-panic=network-runtime\n" => {
+            super::diagnostic("synthetic-panic-network-runtime", 101)
+        }
+        b"fixture-panic=process-runtime\n" => {
+            super::diagnostic("synthetic-panic-process-runtime", 101)
+        }
+        b"fixture-panic=unclassified\n" => super::diagnostic("synthetic-panic-unclassified", 101),
+        _ => {}
+    }
     if output.code != 0
         || output.stopped.is_some()
-        || output.stdout != b"isolation-ok"
+        || output.stdout != b"isolation-files\nisolation-network\nisolation-child\nisolation-environment\nisolation-config\nisolation-ok"
         || !output.stderr.is_empty()
     {
         return Err("ACL, child or loopback denial fixture failed");

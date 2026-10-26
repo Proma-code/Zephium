@@ -5,6 +5,34 @@ compile_error!("Synthetic Claude broker helper is debug-only");
 
 #[cfg(windows)]
 fn main() {
+    // Synthetic helper diagnostics only. Never copy panic payloads, paths, user
+    // input or account-bearing text into public Actions logs.
+    std::panic::set_hook(Box::new(|info| {
+        use std::io::Write;
+        let text = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("");
+        let file = info
+            .location()
+            .map(|location| location.file())
+            .unwrap_or("");
+        let marker: &[u8] = if text.contains("WSAStartup")
+            || text.contains("WinSock")
+            || text.contains("Winsock")
+            || file.contains("/sys/net/")
+            || file.contains("\\sys\\net\\")
+        {
+            b"fixture-panic=network-runtime\n"
+        } else if file.contains("/sys/pal/windows/process") || file.contains("/sys/process/") {
+            b"fixture-panic=process-runtime\n"
+        } else {
+            b"fixture-panic=unclassified\n"
+        };
+        let _ = std::io::stderr().write_all(marker);
+    }));
     let args: Vec<_> = std::env::args().skip(1).collect();
     let result = match args.as_slice() {
         [mode] if mode == "token-controls" => zephium_claude_broker::qualify_token_controls(),
@@ -187,12 +215,18 @@ fn child(mode: &str) -> Result<(), &'static str> {
                     .and_then(serde_json::Value::as_str)
                     .ok_or("fixture field missing")
             };
+            std::io::stdout()
+                .write_all(b"isolation-files\n")
+                .map_err(|_| "isolation marker failed")?;
             if std::fs::read(path("sentinel")?).is_ok()
                 || std::fs::write(path("sentinel")?, b"modified").is_ok()
                 || std::fs::read_dir(path("outside")?).is_ok()
             {
                 return Err("outside sentinel access succeeded");
             }
+            std::io::stdout()
+                .write_all(b"isolation-network\n")
+                .map_err(|_| "isolation marker failed")?;
             let address = path("loopback")?
                 .parse()
                 .map_err(|_| "fixture address invalid")?;
@@ -201,6 +235,9 @@ fn child(mode: &str) -> Result<(), &'static str> {
             {
                 return Err("loopback access succeeded");
             }
+            std::io::stdout()
+                .write_all(b"isolation-child\n")
+                .map_err(|_| "isolation marker failed")?;
             if let Ok(mut child) = std::process::Command::new(path("image")?)
                 .args(["--child", "echo"])
                 .spawn()
@@ -209,6 +246,9 @@ fn child(mode: &str) -> Result<(), &'static str> {
                 let _ = child.wait();
                 return Err("second child was admitted");
             }
+            std::io::stdout()
+                .write_all(b"isolation-environment\n")
+                .map_err(|_| "isolation marker failed")?;
             for key in [
                 "ANTHROPIC_API_KEY",
                 "CLAUDE_CODE_OAUTH_TOKEN",
@@ -222,6 +262,9 @@ fn child(mode: &str) -> Result<(), &'static str> {
                     return Err("ambient sensitive variable inherited");
                 }
             }
+            std::io::stdout()
+                .write_all(b"isolation-config\n")
+                .map_err(|_| "isolation marker failed")?;
             let config = std::env::var_os("CLAUDE_CONFIG_DIR").ok_or("private config missing")?;
             if std::path::Path::new(&config) != std::path::Path::new(path("config")?) {
                 return Err("config isolation path mismatch");
