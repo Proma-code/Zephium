@@ -507,3 +507,48 @@ fn preparation_unwind_retains_global_admission_not_only_registry_state() {
         Err(account::Error::Busy)
     ));
 }
+
+#[test]
+fn returned_wrapper_does_not_retain_custody_of_a_newer_operation() {
+    let (accounts, scope) = selected();
+    let weak = Arc::downgrade(&accounts.inner);
+    let drops = Arc::new(AtomicUsize::new(0));
+    install(&accounts, scope, Arc::clone(&drops));
+    let mut older = accounts
+        .begin(scope, Request::ReadStatus, Instant::now())
+        .unwrap();
+    // Execute the same actual AccountOwner/Port path, keeping only this outer
+    // wrapper alive so the newer admission deterministically precedes its Drop.
+    assert_eq!(older.run_inner(), Ok(Reply::Status(AuthStatus::SignedOut)));
+    let newer = accounts
+        .begin(scope, Request::ReadStatus, Instant::now())
+        .unwrap();
+    drop(older);
+    accounts.close();
+    drop(accounts);
+    assert!(weak.upgrade().is_some()); // The newer queued Work still owns it.
+    drop(newer); // Never entered; it has no native settlement obligation.
+    assert!(weak.upgrade().is_none());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+#[test]
+fn never_entered_wrapper_does_not_retain_custody_of_a_newer_operation() {
+    let (accounts, scope) = selected();
+    let weak = Arc::downgrade(&accounts.inner);
+    let drops = Arc::new(AtomicUsize::new(0));
+    install(&accounts, scope, Arc::clone(&drops));
+    let mut older = accounts
+        .begin(scope, Request::ReadStatus, Instant::now())
+        .unwrap();
+    // Interpose at exactly Drop's existing never-entered account::Work release.
+    drop(older.work.take());
+    let newer = accounts
+        .begin(scope, Request::ReadStatus, Instant::now())
+        .unwrap();
+    drop(older);
+    accounts.close();
+    drop(accounts);
+    drop(newer);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}

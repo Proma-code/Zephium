@@ -295,6 +295,8 @@ impl TrialAccounts {
             inner: Arc::clone(&self.inner),
             resource: Arc::clone(resource),
             work: Some(work),
+            port_entered: false,
+            call_returned: false,
         })
     }
 }
@@ -461,40 +463,56 @@ impl Drop for Preparation {
         }
     }
 }
-struct BorrowedPort<'a>(&'a mut dyn Port);
+struct BorrowedPort<'a> {
+    port: &'a mut dyn Port,
+    entered: &'a mut bool,
+}
 impl Port for BorrowedPort<'_> {
     fn run(
         &mut self,
         request: Request,
         control: &account::Control,
     ) -> Result<Reply, account::Error> {
-        self.0.run(request, control)
+        *self.entered = true;
+        self.port.run(request, control)
     }
 }
 pub(crate) struct OperationWork {
     inner: Arc<Inner>,
     resource: Arc<Resource>,
     work: Option<account::Work>,
+    port_entered: bool,
+    call_returned: bool,
 }
 impl OperationWork {
     pub(crate) fn run(mut self) -> Result<Reply, account::Error> {
+        self.run_inner()
+    }
+    fn run_inner(&mut self) -> Result<Reply, account::Error> {
         let mut port = self
             .resource
             .port
             .lock()
             .map_err(|_| account::Error::Closed)?;
-        self.work
-            .take()
-            .ok_or(account::Error::Protocol)?
-            .run(&mut BorrowedPort(port.as_mut()), Instant::now)
+        let result = self.work.take().ok_or(account::Error::Protocol)?.run(
+            &mut BorrowedPort {
+                port: port.as_mut(),
+                entered: &mut self.port_entered,
+            },
+            Instant::now,
+        );
+        self.call_returned = true;
+        result
     }
 }
 impl Drop for OperationWork {
     fn drop(&mut self) {
         drop(self.work.take());
-        if !self.resource.owner.drained() {
-            // AccountOwner's Work already marks started unwinding uncertain.
-            // Keep the same Port and registry, not only a presentation flag.
+        if self.port_entered && !self.call_returned {
+            // Retain only THIS call's entered-but-unreturned obligation. A newer
+            // admission can already occupy the AccountOwner after our return or
+            // never-entered Work release; its state is not our settlement proof.
+            // AccountOwner's Work independently marks started unwind uncertain.
             std::mem::forget(Arc::clone(&self.inner));
         }
     }
