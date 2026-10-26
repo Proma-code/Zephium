@@ -720,12 +720,11 @@ mod tests {
     #[test]
     fn writer_checks_admission_deadline_without_a_ui_tick() {
         let mut c = Controller::new(owner()).unwrap();
-        let past = Instant::now()
-            .checked_sub(LOGIN_DEADLINE + Duration::from_secs(1))
-            .unwrap();
-        let (_, input, _) = c.reserve(owner(), past).unwrap();
+        let now = Instant::now();
+        let (_, input, _) = c.reserve(owner(), now).unwrap();
+        let deadline = input.deadline();
         assert_eq!(
-            input.write_one(&mut Vec::new(), &AtomicBool::new(false)),
+            input.write_one_clock(&mut Vec::new(), &AtomicBool::new(false), || deadline),
             Err(AuthError::Expired)
         );
     }
