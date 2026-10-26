@@ -118,7 +118,7 @@ pub enum ConfigReadbackError {
     ImportedResources,
     /// The disposable fixture did not report only its exact owned user layer.
     Layers,
-    /// Managed requirements are present or their absence was not explicit.
+    /// Effective requirements differ from the pinned owned-login-only projection.
     Requirements,
 }
 
@@ -328,21 +328,70 @@ pub fn validate_fixture_layers(
     Ok(())
 }
 
-/// Require explicit absence of managed requirements on disposable CI only.
-/// Never override or suppress a policy to make this check succeed.
+// Pinned protocol/v2/config.rs:413–459. These are explicit nulls in the
+// effective owned-login-only projection, not omitted fields or defaults.
+const OWNED_LOGIN_NULL_REQUIREMENTS: &[&str] = &[
+    "modelProvider",
+    "modelProviders",
+    "cliAuthCredentialsStore",
+    "chatgptBaseUrl",
+    "additionalDeveloperInstructions",
+    "allowedApprovalPolicies",
+    "allowedApprovalsReviewers",
+    "allowedSandboxModes",
+    "allowedWindowsSandboxImplementations",
+    "allowedPermissionProfiles",
+    "defaultPermissions",
+    "allowedWebSearchModes",
+    "allowManagedHooksOnly",
+    "allowBrowserAndComputerUse",
+    "allowAppshots",
+    "allowRemoteControl",
+    "computerUse",
+    "browserUse",
+    "inAppBrowser",
+    "featureRequirements",
+    "hooks",
+    "enforceResidency",
+    "network",
+    "application",
+    "autoReview",
+    "models",
+    "sqliteHome",
+    "logDir",
+    "modelCatalogJson",
+    "checkForUpdateOnStartup",
+    "allowLoginShell",
+    "feedback",
+];
+
+/// Validate the pinned effective requirements for this disposable fixture.
+/// config_processor.rs:443–463 emits a non-null object even without managed
+/// requirements when the owned forced-login setting restricts methods to ChatGPT.
+/// Call only alongside the owned config/layer checks. This response has no
+/// origins and is not independent proof of every restriction's provenance.
 pub fn validate_fixture_requirements(result: &Value) -> Result<(), ConfigReadbackError> {
-    let object = result
-        .as_object()
-        .ok_or(ConfigReadbackError::Requirements)?;
-    if object.get("requirements") != Some(&Value::Null)
-        || object
-            .keys()
-            .any(|key| key != "requirements" && key != "supportsIndependentSpeedModes")
+    let fail = ConfigReadbackError::Requirements;
+    let object = result.as_object().ok_or(fail)?;
+    if object.len() != 2
         || object
             .get("supportsIndependentSpeedModes")
-            .is_some_and(|value| !value.is_null() && !value.is_boolean())
+            .and_then(Value::as_bool)
+            != Some(true)
     {
-        return Err(ConfigReadbackError::Requirements);
+        return Err(fail);
+    }
+    let requirements = object
+        .get("requirements")
+        .and_then(Value::as_object)
+        .ok_or(fail)?;
+    if requirements.len() != 33
+        || requirements.get("allowedLoginMethods") != Some(&serde_json::json!(["chatgpt"]))
+        || OWNED_LOGIN_NULL_REQUIREMENTS
+            .iter()
+            .any(|key| requirements.get(*key) != Some(&Value::Null))
+    {
+        return Err(fail);
     }
     Ok(())
 }
@@ -602,25 +651,133 @@ mod tests {
         }
     }
 
+    // Independently enumerated from pinned protocol/v2/config.rs:413–459 and
+    // config_processor.rs:443–601. Do not derive this fixture from the validator.
+    fn owned_login_requirements() -> Value {
+        json!({"supportsIndependentSpeedModes":true,"requirements":{
+            "modelProvider":null,"modelProviders":null,"allowedLoginMethods":["chatgpt"],
+            "cliAuthCredentialsStore":null,"chatgptBaseUrl":null,
+            "additionalDeveloperInstructions":null,"allowedApprovalPolicies":null,
+            "allowedApprovalsReviewers":null,"allowedSandboxModes":null,
+            "allowedWindowsSandboxImplementations":null,"allowedPermissionProfiles":null,
+            "defaultPermissions":null,"allowedWebSearchModes":null,"allowManagedHooksOnly":null,
+            "allowBrowserAndComputerUse":null,"allowAppshots":null,"allowRemoteControl":null,
+            "computerUse":null,"browserUse":null,"inAppBrowser":null,"featureRequirements":null,
+            "hooks":null,"enforceResidency":null,"network":null,"application":null,
+            "autoReview":null,"models":null,"sqliteHome":null,"logDir":null,
+            "modelCatalogJson":null,"checkForUpdateOnStartup":null,"allowLoginShell":null,"feedback":null
+        }})
+    }
+
     #[test]
-    fn managed_requirements_must_be_explicitly_absent() {
-        for value in [
-            json!({"requirements":null}),
-            json!({"requirements":null,"supportsIndependentSpeedModes":true}),
-        ] {
-            assert_eq!(validate_fixture_requirements(&value), Ok(()));
+    fn effective_requirements_match_owned_chatgpt_policy() {
+        let value = owned_login_requirements();
+        assert_eq!(value["requirements"].as_object().unwrap().len(), 33);
+        assert_eq!(validate_fixture_requirements(&value), Ok(()));
+    }
+
+    #[test]
+    fn effective_requirements_reject_every_changed_or_missing_field() {
+        let original = owned_login_requirements();
+        for key in original["requirements"].as_object().unwrap().keys() {
+            let mut value = original.clone();
+            value["requirements"].as_object_mut().unwrap().remove(key);
+            assert_eq!(
+                validate_fixture_requirements(&value),
+                Err(ConfigReadbackError::Requirements)
+            );
+            for replacement in [
+                json!(true),
+                json!(false),
+                json!(0),
+                json!(""),
+                json!({}),
+                json!([]),
+            ] {
+                let mut value = original.clone();
+                value["requirements"][key] = replacement;
+                assert_eq!(
+                    validate_fixture_requirements(&value),
+                    Err(ConfigReadbackError::Requirements)
+                );
+            }
         }
-        for value in [
-            json!({}),
-            json!({"requirements":{}}),
-            json!({"requirements":{"allowedLoginMethods":["chatgpt"]}}),
-            json!({"requirements":null,"supportsIndependentSpeedModes":"true"}),
-            json!({"requirements":null,"unknown":null}),
+        for methods in [
+            Value::Null,
+            json!(["api"]),
+            json!(["api", "chatgpt"]),
+            json!(["chatgpt", "chatgpt"]),
+            json!(["Chatgpt"]),
         ] {
+            let mut value = original.clone();
+            value["requirements"]["allowedLoginMethods"] = methods;
             assert_eq!(
                 validate_fixture_requirements(&value),
                 Err(ConfigReadbackError::Requirements)
             );
         }
+    }
+
+    #[test]
+    fn effective_requirements_reject_wrong_metadata_shape_and_unknown_fields() {
+        for replacement in [
+            Value::Null,
+            json!(false),
+            json!(1),
+            json!("true"),
+            json!([]),
+            json!({}),
+        ] {
+            let mut value = owned_login_requirements();
+            value["supportsIndependentSpeedModes"] = replacement;
+            assert_eq!(
+                validate_fixture_requirements(&value),
+                Err(ConfigReadbackError::Requirements)
+            );
+        }
+        for replacement in [
+            Value::Null,
+            json!({}),
+            json!([]),
+            json!(false),
+            json!("null"),
+        ] {
+            let mut value = owned_login_requirements();
+            value["requirements"] = replacement;
+            assert_eq!(
+                validate_fixture_requirements(&value),
+                Err(ConfigReadbackError::Requirements)
+            );
+        }
+        for key in ["requirements", "supportsIndependentSpeedModes"] {
+            let mut value = owned_login_requirements();
+            value.as_object_mut().unwrap().remove(key);
+            assert_eq!(
+                validate_fixture_requirements(&value),
+                Err(ConfigReadbackError::Requirements)
+            );
+        }
+        let mut value = owned_login_requirements();
+        value["unexpected"] = Value::Null;
+        assert_eq!(
+            validate_fixture_requirements(&value),
+            Err(ConfigReadbackError::Requirements)
+        );
+        let mut value = owned_login_requirements();
+        value["requirements"]["unexpected"] = Value::Null;
+        assert_eq!(
+            validate_fixture_requirements(&value),
+            Err(ConfigReadbackError::Requirements)
+        );
+        let mut value = owned_login_requirements();
+        value["requirements"]
+            .as_object_mut()
+            .unwrap()
+            .remove("modelProvider");
+        value["requirements"]["model_provider"] = Value::Null;
+        assert_eq!(
+            validate_fixture_requirements(&value),
+            Err(ConfigReadbackError::Requirements)
+        );
     }
 }

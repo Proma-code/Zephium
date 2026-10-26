@@ -15,7 +15,7 @@ The debug-only native qualification uses a fresh disposable home and only:
 
 - initializes private stdio;
 - checks signed-out account state without requesting refresh;
-- checks the owned configuration and absence of managed requirements;
+- checks the owned configuration and exact effective ChatGPT-only login restriction;
 - closes stdin and requires process exit zero and an empty owned job;
 - checks cancellation and four fixed synthetic transport failure cases.
 

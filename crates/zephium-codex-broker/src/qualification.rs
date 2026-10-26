@@ -67,7 +67,7 @@ fn run(image: Arc<PinnedImage>, runtime: Arc<RuntimePaths>) -> Result<(), &'stat
     let requirements = exchange(&mut session, protocol::requirements(), 4, deadline, &cancel)?;
     crate::config::validate_fixture_requirements(&requirements)
         .map_err(|_| "managed-requirements")?;
-    println!("codex-stage=requirements-empty; code=0");
+    println!("codex-stage=requirements-owned-login-only; code=0");
     let exit = session
         .finish(Instant::now() + Duration::from_secs(30))
         .map_err(|_| "close")?;
