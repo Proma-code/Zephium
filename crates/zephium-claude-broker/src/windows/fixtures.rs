@@ -462,7 +462,7 @@ pub(crate) fn token_controls() -> Result<(), &'static str> {
 }
 
 /// Read-only local startup of the exact signed vendor image, without an install,
-/// account status/login or inference. Fixed argv; fresh empty private directories.
+/// actual account status/login or inference. Fixed metadata argv and fresh directories.
 pub(crate) fn vendor_probe(source: &std::path::Path) -> Result<(), &'static str> {
     use super::signature;
     let original = HeldImage::open(source, signature::CANDIDATE_SHA256)?;
@@ -512,15 +512,71 @@ pub(crate) fn vendor_probe(source: &std::path::Path) -> Result<(), &'static str>
         &cancelled,
     )?;
     receipt("help", &help);
-    if help.code != 0 || help.stopped.is_some() || help.stdout.is_empty() || !help.stderr.is_empty()
+    if help.code != 0
+        || help.stopped.is_some()
+        || !crate::help_metadata::valid(crate::help_metadata::Topic::General, &help.stdout)
+        || !help.stderr.is_empty()
     {
         return Err("pinned vendor help did not run under LPAC");
+    }
+    for (mode, topic, stage) in [
+        (
+            Fixture::VendorLoginHelp,
+            crate::help_metadata::Topic::Login,
+            "auth-login-help",
+        ),
+        (
+            Fixture::VendorStatusHelp,
+            crate::help_metadata::Topic::Status,
+            "auth-status-help",
+        ),
+        (
+            Fixture::VendorLogoutHelp,
+            crate::help_metadata::Topic::Logout,
+            "auth-logout-help",
+        ),
+    ] {
+        let output = process::run(
+            &profile,
+            &image,
+            &layout,
+            Command::Fixture(mode),
+            Vec::new(),
+            &cancelled,
+        )?;
+        receipt(stage, &output);
+        if output.code != 0
+            || output.stopped.is_some()
+            || !output.stderr.is_empty()
+            || !crate::help_metadata::valid(topic, &output.stdout)
+        {
+            return Err("pinned vendor auth help shape rejected; no account operation admitted");
+        }
+        for (flag, marker) in [
+            ("--console", "help-option-console"),
+            ("--claudeai", "help-option-claudeai"),
+            ("--email", "help-option-email"),
+            ("--sso", "help-option-sso"),
+            ("--no-browser", "help-option-no-browser"),
+            ("--no-open-browser", "help-option-no-open-browser"),
+            ("--browser", "help-option-browser"),
+            ("--code", "help-option-code"),
+            ("--callback-port", "help-option-callback-port"),
+            ("--port", "help-option-port"),
+            ("--text", "help-option-text"),
+            ("--json", "help-option-json"),
+        ] {
+            super::diagnostic(
+                marker,
+                i32::from(crate::help_metadata::has_option(&output.stdout, flag)),
+            );
+        }
     }
     drop(image);
     profile.close()?;
     root.cleanup()?;
     drop(original);
-    std::io::stdout().write_all(b"pinned signed Claude 2.1.310 version/help ran under LPAC; login, account status and inference NOT qualified\n").map_err(|_| "vendor receipt failed")?;
+    std::io::stdout().write_all(b"pinned signed Claude 2.1.310 version and global/auth help metadata ran under LPAC; actual login/status/logout/inference NOT qualified\n").map_err(|_| "vendor receipt failed")?;
     Ok(())
 }
 

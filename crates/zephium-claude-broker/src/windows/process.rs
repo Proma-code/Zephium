@@ -162,6 +162,9 @@ pub(super) enum Fixture {
     TokenLpacControl,
     VendorVersion,
     VendorHelp,
+    VendorLoginHelp,
+    VendorStatusHelp,
+    VendorLogoutHelp,
     Echo,
     Argv,
     Isolation,
@@ -189,6 +192,9 @@ impl Command {
                 | Fixture::LoginExit
                 | Fixture::VendorVersion
                 | Fixture::VendorHelp
+                | Fixture::VendorLoginHelp
+                | Fixture::VendorStatusHelp
+                | Fixture::VendorLogoutHelp
                 | Fixture::Echo
                 | Fixture::Argv
                 | Fixture::Isolation
@@ -217,6 +223,9 @@ impl Command {
                 | Fixture::LoginExit
                 | Fixture::VendorVersion
                 | Fixture::VendorHelp
+                | Fixture::VendorLoginHelp
+                | Fixture::VendorStatusHelp
+                | Fixture::VendorLogoutHelp
                 | Fixture::Echo
                 | Fixture::Argv
                 | Fixture::Isolation
@@ -251,6 +260,9 @@ impl Command {
                 }
                 Fixture::VendorVersion => &["--version"],
                 Fixture::VendorHelp => &["--restricted", "--safe-mode", "--help"],
+                Fixture::VendorLoginHelp => &["auth", "login", "--help"],
+                Fixture::VendorStatusHelp => &["auth", "status", "--help"],
+                Fixture::VendorLogoutHelp => &["auth", "logout", "--help"],
                 Fixture::Echo => &["--child", "echo"],
                 Fixture::Argv => &["--child", "argv", "", "end\\", "a\"b"],
                 Fixture::Isolation => &["--child", "isolation"],
@@ -959,6 +971,19 @@ fn inspect_identity(
 mod research_admission_tests {
     use super::*;
     #[test]
+    fn auth_metadata_has_no_variant_without_help() {
+        for (mode, command) in [
+            (Fixture::VendorLoginHelp, "login"),
+            (Fixture::VendorStatusHelp, "status"),
+            (Fixture::VendorLogoutHelp, "logout"),
+        ] {
+            assert_eq!(
+                Command::Fixture(mode).arguments(),
+                ["auth", command, "--help"]
+            );
+        }
+    }
+    #[test]
     fn environment_repair_preserves_both_sides_of_capability_differential() {
         for operation in [
             Operation::ReadStatus,
@@ -979,6 +1004,9 @@ mod research_admission_tests {
         for fixture in [
             Fixture::VendorVersion,
             Fixture::VendorHelp,
+            Fixture::VendorLoginHelp,
+            Fixture::VendorStatusHelp,
+            Fixture::VendorLogoutHelp,
             Fixture::HandleProbe,
             Fixture::LoginInput,
             Fixture::LoginExit,
@@ -1014,6 +1042,9 @@ mod research_admission_tests {
             Fixture::NetworkRegistryRead,
             Fixture::VendorVersion,
             Fixture::VendorHelp,
+            Fixture::VendorLoginHelp,
+            Fixture::VendorStatusHelp,
+            Fixture::VendorLogoutHelp,
             Fixture::Isolation,
             Fixture::LoginInput,
             Fixture::LoginExit,

@@ -21,7 +21,10 @@ Portable checks are not Windows runtime evidence. The debug-only Windows
 `qualify-windows.ps1` script first runs credential-free synthetic fixtures. Only
 if those pass does it download—not install—the exact original Claude 2.1.310
 Windows x64 image, verify its pinned bytes and signature, and run `--version`
-and restricted safe `--help`. It never runs login, status/logout or inference.
+and restricted safe `--help`, then fixed `auth login/status/logout --help` metadata.
+It never performs login, status/logout or inference. Credential-free pinned
+version/global-help startup has passed the disposable Windows fixture; account
+behavior is still unqualified.
 No vendor binary is checked in; this is not an updater or production approval.
 The debug runtime also evaluates `registryRead`, which is broader than a single
 registry catalog. Passing fixtures does not establish safety for every registry

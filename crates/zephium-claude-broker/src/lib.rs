@@ -11,6 +11,8 @@ mod account;
 #[allow(dead_code)]
 mod auth;
 pub mod custody;
+#[cfg(any(test, all(windows, feature = "native-fixtures")))]
+mod help_metadata;
 pub mod plan;
 pub mod protocol;
 mod strict_json;
@@ -25,7 +27,7 @@ compile_error!("Claude broker synthetic fixtures are forbidden in optimized buil
 /// A closed reason why the original vendor client cannot yet run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Unavailable {
-    /// The original, unmodified native image/runtime has no reviewed pinned identity.
+    /// Credential-free pinned-image startup does not qualify the account runtime.
     VendorImageNotQualified,
     /// Production hosting is limited to the reviewed Windows implementation.
     WindowsRequired,
@@ -83,7 +85,7 @@ pub fn research_network_child() -> Result<(), &'static str> {
 }
 
 /// Debug-only startup probe of one exact hash-pinned, Authenticode-verified vendor
-/// image. Only `--version` and restricted safe `--help`; no account operations.
+/// image. Version/global/auth-command `--help` metadata only; no account operations.
 #[cfg(all(windows, feature = "native-fixtures"))]
 pub fn qualify_vendor_startup(image: &std::path::Path) -> Result<(), &'static str> {
     windows::fixtures::vendor_probe(image)
