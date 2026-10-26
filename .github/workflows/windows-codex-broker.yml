@@ -51,7 +51,7 @@ jobs:
           $code = $LASTEXITCODE
           $profile | Write-Output
           if ($code -ne 0) { exit $code }
-          if (@($profile | Where-Object { $_ -cmatch '^test result: ok\. 8 passed; 0 failed; 0 ignored;' }).Count -ne 1) { throw 'Expected all eight owned profile tests.' }
+          if (@($profile | Where-Object { $_ -cmatch '^test result: ok\. 9 passed; 0 failed; 0 ignored;' }).Count -ne 1) { throw 'Expected all nine owned profile tests, including the retained-handle differential.' }
           $image = @(cargo test -p zephium-codex-broker --locked --features native-fixtures,trial-integration --lib image::resolution::tests:: -- --ignored --test-threads=1)
           $code = $LASTEXITCODE
           $image | Write-Output

@@ -458,7 +458,9 @@ fn replace_metadata(
     drop(staged);
     phase(4); // Reopen and verify the staged object before rename.
     let staged = OpenOptions::new()
-        .access_mode(0x8001_0000)
+        // This guard verifies identity/content only. DELETE is used by the
+        // pathname rename, not by this retained read handle.
+        .access_mode(0x8000_0000)
         .share_mode(5)
         .custom_flags(0x0020_0000)
         .open(stage)
@@ -978,5 +980,93 @@ mod tests {
                 parent.close().unwrap();
             }
         }
+    }
+    #[test]
+    #[ignore = "owned Windows retained-handle rights differential; no account/provider calls"]
+    fn retained_metadata_read_guard_allows_replace_without_delete_access() {
+        let parent = tempfile::tempdir().unwrap();
+        let profile = ProfileLease::fixture(parent.path(), id()).unwrap();
+        let owner = owner_sid().unwrap();
+        let home = profile.root.join("codex-home");
+        let source = home.join("guard-source");
+        let target = home.join("guard-target");
+        let old = b"owned-old-metadata";
+        let new = b"owned-new-metadata";
+        write_new(&source, &owner, new).unwrap();
+        write_new(&target, &owner, old).unwrap();
+        let target_before = open_read(&target).unwrap();
+        let old_target_id = identity(&target_before).unwrap();
+        drop(target_before);
+        let mut baseline = OpenOptions::new()
+            .access_mode(0x8001_0000)
+            .share_mode(5)
+            .custom_flags(0x0020_0000)
+            .open(&source)
+            .unwrap();
+        verify_file(&baseline, &owner).unwrap();
+        let expected = identity(&baseline).unwrap();
+        assert_eq!(read_bounded(&mut baseline, new.len()).unwrap(), new);
+        let source_wide = wide(source.as_os_str()).unwrap();
+        let target_wide = wide(target.as_os_str()).unwrap();
+        let move_exact = || unsafe {
+            MoveFileExW(
+                PCWSTR(source_wide.as_ptr()),
+                PCWSTR(target_wide.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        let error = move_exact().expect_err("baseline DELETE guard must reproduce sharing refusal");
+        assert_eq!(error.code().0 as u32, 0x8007_0020);
+        assert_eq!(identity(&baseline).unwrap(), expected);
+        assert_eq!(read_bounded(&mut baseline, new.len()).unwrap(), new);
+        let mut unchanged_target = open_read(&target).unwrap();
+        assert_eq!(identity(&unchanged_target).unwrap(), old_target_id);
+        assert_eq!(read_bounded(&mut unchanged_target, old.len()).unwrap(), old);
+        drop(unchanged_target);
+        drop(baseline);
+
+        // The only variable is the unnecessary DELETE bit. The same source,
+        // target, directory/lease pins, share flags and MoveFileEx flags remain.
+        let mut candidate = OpenOptions::new()
+            .access_mode(0x8000_0000)
+            .share_mode(5)
+            .custom_flags(0x0020_0000)
+            .open(&source)
+            .unwrap();
+        verify_file(&candidate, &owner).unwrap();
+        assert_eq!(identity(&candidate).unwrap(), expected);
+        assert_eq!(read_bounded(&mut candidate, new.len()).unwrap(), new);
+        assert_eq!(
+            OpenOptions::new()
+                .write(true)
+                .share_mode(7)
+                .open(&source)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(32)
+        );
+        move_exact().expect("READ-only retained guard must allow exact replacement");
+        assert!(matches!(std::fs::symlink_metadata(&source), Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound));
+        assert_eq!(identity(&candidate).unwrap(), expected);
+        assert_eq!(read_bounded(&mut candidate, new.len()).unwrap(), new);
+        let mut final_target = open_read(&target).unwrap();
+        verify_file(&final_target, &owner).unwrap();
+        assert_eq!(identity(&final_target).unwrap(), expected);
+        assert_ne!(identity(&final_target).unwrap(), old_target_id);
+        assert_eq!(read_bounded(&mut final_target, new.len()).unwrap(), new);
+        assert_eq!(
+            OpenOptions::new()
+                .write(true)
+                .share_mode(7)
+                .open(&target)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(32)
+        );
+        drop(final_target);
+        drop(candidate);
+        drop(profile);
+        parent.close().unwrap();
     }
 }
