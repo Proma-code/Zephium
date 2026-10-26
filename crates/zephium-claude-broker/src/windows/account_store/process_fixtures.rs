@@ -554,6 +554,41 @@ impl Drop for Running {
     }
 }
 
+// Failure-only classification of this fixed synthetic helper's closed errors.
+// Unknown output is never displayed; classification does not admit a receipt.
+fn child_error_category(bytes: &[u8]) -> i32 {
+    let Some(error) = bytes
+        .strip_prefix(b"claude-broker-fixture: ")
+        .and_then(|value| value.strip_suffix(b"\n"))
+    else {
+        return 0;
+    };
+    match error {
+        b"store child invocation invalid" => 1,
+        b"store child binding invalid" => 2,
+        b"store child capability unavailable" => 3,
+        b"store child root proof failed" => 4,
+        b"store child root binding mismatch" => 5,
+        b"store child lock proof failed" => 6,
+        b"store child lock binding failed" => 7,
+        b"store child lock binding mismatch" => 8,
+        b"store child parent lease was not exclusive" => 9,
+        b"store child state proof failed" => 10,
+        b"store child state binding failed" => 11,
+        b"store child state binding mismatch" => 12,
+        b"store child clean marker refused" => 13,
+        b"store child dirty persistence failed" => 14,
+        b"store child dirty proof failed" => 15,
+        b"store child released lease unavailable" => 16,
+        b"store child readiness receipt failed" => 17,
+        b"store child readiness flush failed" => 18,
+        b"store child overflow receipt failed" => 19,
+        b"store child receipt failed" => 20,
+        b"only fixed fixture modes are accepted" => 21,
+        _ => 0,
+    }
+}
+
 fn run_child(
     mode: Mode,
     context: Arc<Context>,
@@ -751,6 +786,23 @@ fn run_child(
                 || handles.stdout.bytes != mode.output()
                 || !handles.stderr.bytes.is_empty()
             {
+                super::super::diagnostic("store-child-exit-code", code as i32);
+                super::super::diagnostic(
+                    "store-child-stdout-length",
+                    handles.stdout.bytes.len() as i32,
+                );
+                super::super::diagnostic(
+                    "store-child-stderr-length",
+                    handles.stderr.bytes.len() as i32,
+                );
+                super::super::diagnostic(
+                    "store-child-receipt-equal",
+                    i32::from(handles.stdout.bytes == mode.output()),
+                );
+                super::super::diagnostic(
+                    "store-child-error-category",
+                    child_error_category(&handles.stderr.bytes),
+                );
                 return Err("store child fixed receipt mismatch");
             }
             if let Some(error) =
@@ -776,6 +828,23 @@ fn run_child(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn child_error_diagnostics_are_closed_and_do_not_change_receipt_acceptance() {
+        assert_eq!(
+            child_error_category(b"claude-broker-fixture: store child root proof failed\n"),
+            4
+        );
+        for bytes in [
+            b"claude-broker-fixture: private text\n".as_slice(),
+            b"claude-broker-fixture: store child root proof failed\nextra",
+            b"store child root proof failed\n",
+            b"claude-broker-fixture: store child root proof failed\r\n",
+            b"store-child-busy\n",
+        ] {
+            assert_eq!(child_error_category(bytes), 0);
+        }
+        assert_ne!(Mode::Busy.output(), b"store-child-busy\r\n");
+    }
     #[test]
     fn only_fixed_source_copy_can_have_cargo_aliases() {
         assert!(copy_source_shape(true, 0x20, 1024, 1));
