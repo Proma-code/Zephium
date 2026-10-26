@@ -630,6 +630,42 @@ mod tests {
         )
         .await
         .unwrap();
+        if result.evidence.exit != Some(7)
+            || !result.evidence.text.contains("hello żółć")
+            || !result.evidence.text.contains("error")
+        {
+            // Fixture-only finite diagnostics: never print the environment,
+            // paths, arbitrary command output, or another test's payload.
+            let termination = match result.note.as_str() {
+                "Stopped after 10 s" => 1,
+                "Stopped" => 2,
+                "Stopped when the app quit" => 3,
+                "The output could not be read" => 4,
+                "The command failed" => 5,
+                "Completed" => 6,
+                _ => 0,
+            };
+            let categories = [
+                "#< CLIXML",
+                "ParserError",
+                "CommandNotFoundException",
+                "FileNotFoundException",
+                "UnauthorizedAccessException",
+                "PSSecurityException",
+                "OutOfMemoryException",
+                "is not recognized",
+            ]
+            .iter()
+            .enumerate()
+            .fold(0u16, |bits, (index, marker)| {
+                bits | (u16::from(result.evidence.text.contains(marker)) << index)
+            });
+            eprintln!("unicode-fixture: exit={:?} termination={} elapsed_ms={} bytes={} truncated={} hello={} stderr_marker={} category_bits={:#06x}",
+                result.evidence.exit, termination, result.evidence.elapsed_ms,
+                result.evidence.bytes, result.evidence.truncated,
+                result.evidence.text.contains("hello żółć"),
+                result.evidence.text.contains("error"), categories);
+        }
         assert!(!result.succeeded);
         assert_eq!(result.evidence.exit, Some(7));
         assert!(result.evidence.text.contains("hello żółć"));
