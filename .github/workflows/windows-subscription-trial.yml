@@ -44,6 +44,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Isolation contract and build guard tests
         run: |
+          ./scripts/test-windows-trial-binary-identity.ps1
           ./scripts/test-windows-trial-staging.ps1
           ./scripts/test-windows-trial-install-checks.ps1
           rustc --edition 2021 --test desktop/src/subscription_registry.rs -o "$env:RUNNER_TEMP/subscription-registry-tests.exe"
@@ -74,7 +75,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm --dir frame run check:styles
       - name: Native account protocol and trial Credential Manager tests
-        run: cargo test -p zephium-chatgpt -p zephium-gateway -p zephium-opencode-go -p zephium-provider-accounts -p zephium-credentials --locked --features zephium-credentials/windows-subscription-trial
+        run: cargo test -p zephium-chatgpt -p zephium-gateway -p zephium-opencode-go -p zephium-provider-accounts -p zephium-credentials --locked --features zephium-credentials/windows-subscription-trial,zephium-chatgpt/windows-subscription-trial
+      - name: Synthetic native trial vault roundtrip (no account)
+        run: |
+          $filter = 'vault::native_tests::windows::native_trial_vault_roundtrip_preserves_other_fresh_profile_and_cleans_up'
+          $listed = & cargo test -p zephium-chatgpt --locked --features windows-subscription-trial,zephium-credentials/windows-subscription-trial --lib $filter -- --ignored --exact --list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $listed | Write-Output
+          $fixtures = @($listed | Where-Object { $_ -ceq "${filter}: test" })
+          if ($fixtures.Count -ne 1) { throw 'Expected exactly one reviewed synthetic native vault fixture.' }
+          cargo test -p zephium-chatgpt --locked --features windows-subscription-trial,zephium-credentials/windows-subscription-trial --lib $filter -- --ignored --exact
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Subscription routing, accounting and profile-erasure journal regressions
         run: |
           cargo test -p zephium-app --features work-runtime,work-execution --locked work_models::tests

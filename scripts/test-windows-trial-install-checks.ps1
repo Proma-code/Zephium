@@ -32,6 +32,19 @@ foreach ($key in $info.Keys) {
   Assert-Rejected { Assert-TrialSmokeBuildInfo $bad $context }
 }
 
+$binaryHash = 'a' * 64
+Assert-TrialInstalledBinary $binaryHash $binaryHash 'Zephium Subscription Trial'
+Assert-Rejected { Assert-TrialInstalledBinary ('b' * 64) $binaryHash 'Zephium Subscription Trial' }
+Assert-Rejected { Assert-TrialInstalledBinary $binaryHash $binaryHash 'Zephium' }
+Assert-Rejected { Assert-TrialInstalledBinary $binaryHash $binaryHash $null }
+Assert-Rejected { Assert-TrialInstalledBinary 'not-a-hash' $binaryHash 'Zephium Subscription Trial' }
+$binaryPath = 'D:\a\Zephium\Zephium\target\release\zephium-subscription-trial.exe'
+$definition = '!define MAINBINARYSRCPATH "' + $binaryPath + '"'
+Assert-TrialInstallerBinarySource $definition $binaryPath
+Assert-Rejected { Assert-TrialInstallerBinarySource $definition ($binaryPath + '.other') }
+Assert-Rejected { Assert-TrialInstallerBinarySource ($definition + "`n" + $definition) $binaryPath }
+Assert-Rejected { Assert-TrialInstallerBinarySource '' $binaryPath }
+
 $script = Get-Content "$PSScriptRoot/windows-trial-install-smoke.ps1" -Raw
 foreach ($required in @(
   'Assert-TrialSmokeEnvironment $context', 'Assert-TrialSmokeBuildInfo $info $context',

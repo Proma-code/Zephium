@@ -7,6 +7,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . "$PSScriptRoot/windows-trial-install-checks.ps1"
 . "$PSScriptRoot/windows-trial-staging-checks.ps1"
+. "$PSScriptRoot/windows-trial-binary-identity.ps1"
 $context = @{
   actions = "$env:GITHUB_ACTIONS"; repository = "$env:GITHUB_REPOSITORY"; event = "$env:GITHUB_EVENT_NAME"
   ref = "$env:GITHUB_REF"; runner = "$env:RUNNER_ENVIRONMENT"; os = "$env:RUNNER_OS"
@@ -177,7 +178,12 @@ try {
   if ($signature -cne $info.authenticodeStatus -or $signature -cnotin @('NotSigned', 'Valid')) { throw 'Installer signature status changed or requires security review.' }
   Assert-TrialInstallerIdentity -Script (Get-Content (Join-Path $artifact 'installer.nsi.txt') -Raw)
   if ((Get-Hash (Join-Path $artifact 'installer-hooks.nsh.txt')) -cne (Get-Hash 'desktop/windows/subscription-trial-hooks.nsh')) { throw 'Staged hooks differ from the reviewed source.' }
-  $binaryHash = Get-Hash (Join-Path $root 'target/release/zephium-subscription-trial.exe')
+  $builtBinary = Join-Path $root 'target/release/zephium-subscription-trial.exe'
+  Assert-TrialInstallerBinarySource -Script (Get-Content (Join-Path $artifact 'installer.nsi.txt') -Raw) -ExpectedPath $builtBinary
+  $binaryIdentity = Get-TrialBinaryIdentity -Path $builtBinary
+  Assert-TrialBinaryIdentityInfo -Info $info -Identity $binaryIdentity
+  $binaryHash = $binaryIdentity.NsisSha256
+  Write-Output 'PASS: generated NSIS payload source is the exact built trial executable.'
 
   $profileRoot = [Environment]::GetFolderPath('UserProfile')
   $local = [Environment]::GetFolderPath('LocalApplicationData')
@@ -265,7 +271,13 @@ try {
   }
   function Assert-TrialInstalled {
     $exe = Join-Path $trialDirectory 'zephium-subscription-trial.exe'; Assert-NoReparse $exe
-    if ((Get-Hash $exe) -cne $binaryHash -or (Get-Item -LiteralPath $exe).VersionInfo.ProductName -cne 'Zephium Subscription Trial') { throw 'Installed trial executable identity mismatch.' }
+    $installedHash = Get-Hash $exe
+    $installedProduct = (Get-Item -LiteralPath $exe).VersionInfo.ProductName
+    $hashMatches = $installedHash -ceq $binaryHash
+    $productMatches = $installedProduct -ceq 'Zephium Subscription Trial'
+    Write-Output "Installed trial identity: bytes_match=$hashMatches; product_match=$productMatches; product_length=$(([string]$installedProduct).Length)."
+    if (-not $hashMatches) { Write-Output "Expected NSIS SHA256=$binaryHash; installed SHA256=$installedHash." }
+    Assert-TrialInstalledBinary -ActualHash $installedHash -ExpectedHash $binaryHash -ProductName $installedProduct
     $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($trialKey, $false)
     if ($null -eq $key) { throw 'Missing trial uninstall registration.' }
     try {

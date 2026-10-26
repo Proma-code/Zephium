@@ -2,6 +2,7 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . "$PSScriptRoot/windows-trial-staging-checks.ps1"
+. "$PSScriptRoot/windows-trial-binary-identity.ps1"
 if (-not $IsWindows) { throw 'Windows artifact staging must run on Windows.' }
 Push-Location (Split-Path $PSScriptRoot -Parent)
 try {
@@ -18,6 +19,8 @@ try {
   Assert-TrialInstallerIdentity -Script $nsi
   $exe = Get-Item 'target/release/zephium-subscription-trial.exe'
   if ($exe.VersionInfo.ProductName -ne 'Zephium Subscription Trial') { throw 'Executable product name is not isolated.' }
+  if ((Get-AuthenticodeSignature -LiteralPath $exe.FullName).Status.ToString() -cne 'NotSigned') { throw 'Expected an unsigned compiler executable for the reviewed NSIS identity derivation.' }
+  $binaryIdentity = Get-TrialBinaryIdentity -Path $exe.FullName
   $out = 'target/windows-subscription-trial-artifact'
   if (Test-Path $out) { throw 'Artifact staging directory already exists; inspect it before retrying.' }
   New-Item -ItemType Directory $out | Out-Null
@@ -35,6 +38,10 @@ try {
     identifier = 'app.zephium.subscription-trial'
     productName = 'Zephium Subscription Trial'
     executable = $exe.Name
+    compilerExecutableSha256 = $binaryIdentity.CompilerSha256
+    nsisExecutableSha256 = $binaryIdentity.NsisSha256
+    executableBytes = $binaryIdentity.Length
+    bundleIdentityMethod = 'tauri-cli-2.11.4-unsigned-nsis'
     installer = $setupName
     authenticodeStatus = $signature.Status.ToString()
     createdUtc = [DateTime]::UtcNow.ToString('o')

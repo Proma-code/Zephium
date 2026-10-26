@@ -47,6 +47,15 @@ No signing key is configured. A checksum detects changed bytes; it does not prov
 publisher trust. If Windows or security software blocks the installer, stop and
 review the warning. Do not disable protection to proceed.
 
+## Before removing the trial
+
+Disconnect any connections you no longer want before uninstalling. Removing the
+application does not itself remove saved Windows Credential Manager entries, and
+is not the same as revoking provider access. Disconnecting a saved
+OpenCode Go or gateway key does not revoke that key at its issuer; use the
+provider's account controls if you also want to revoke it. If ChatGPT reports
+that remote sign-out could not be confirmed, review its account controls too.
+
 ## Trial checklist — not yet completed
 
 Use a disposable Windows test account before trying the build beside an important

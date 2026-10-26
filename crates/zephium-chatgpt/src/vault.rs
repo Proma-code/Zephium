@@ -410,6 +410,10 @@ impl AccountVault for SystemVault {
 }
 
 #[cfg(test)]
+#[path = "vault/native_tests.rs"]
+mod native_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};

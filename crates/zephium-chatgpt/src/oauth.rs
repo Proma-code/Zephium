@@ -24,6 +24,10 @@ const RESOURCE: &str = "https://api.openai.com/v1";
 const SCOPES: &str =
     "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
 const MAX_RESPONSE: usize = 128 * 1024;
+#[cfg(feature = "windows-subscription-trial")]
+const APP_NAME: &str = "Zephium Subscription Trial";
+#[cfg(not(feature = "windows-subscription-trial"))]
+const APP_NAME: &str = "Zephium";
 
 /// Closed, secret-free errors for native account UX.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,7 +180,7 @@ impl LoginAttempt {
                     .unwrap_or("dynamic_agent_client"),
             );
             if self.registered_client.is_none() {
-                query.append_pair("agent_name_hint", "Zephium");
+                query.append_pair("agent_name_hint", APP_NAME);
             }
             query
                 .append_pair("ext_agent_host_id", &self.host_id)
@@ -815,6 +819,9 @@ mod tests {
         let query: BTreeMap<_, _> = url.query_pairs().into_owned().collect();
         assert_eq!(url.origin().ascii_serialization(), ISSUER);
         assert_eq!(query["client_id"], "dynamic_agent_client");
+        #[cfg(feature = "windows-subscription-trial")]
+        assert_eq!(query["agent_name_hint"], "Zephium Subscription Trial");
+        #[cfg(not(feature = "windows-subscription-trial"))]
         assert_eq!(query["agent_name_hint"], "Zephium");
         assert_eq!(query["redirect_uri"], first.redirect_uri());
         assert_eq!(query["scope"], SCOPES);
