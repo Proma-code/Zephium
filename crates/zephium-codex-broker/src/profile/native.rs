@@ -63,6 +63,55 @@ pub(crate) enum Error {
     Scope,
 }
 
+// Closed numeric diagnostics for the explicit synthetic native tests only.
+// Production returns the same Error::Io without printing paths, contents, or errors.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum IoStage {
+    BaseMetadata = 1,
+    RootMetadata = 2,
+    LeaseSeek = 3,
+    LeaseWrite = 4,
+    LeaseLength = 5,
+    LeaseSync = 6,
+    FileLength = 7,
+    NewWrite = 8,
+    NewSync = 9,
+    StageMetadata = 10,
+    StageDiscardOpen = 11,
+    StageDiscardDelete = 12,
+    StageWrite = 13,
+    StageSync = 14,
+    StageReopen = 15,
+    MoveReplace = 16,
+    ReadSeek = 17,
+    ReadExact = 18,
+    DirectoryCreate = 19,
+    FileCreate = 20,
+    ReadOpen = 21,
+    VerifyMetadata = 22,
+}
+fn io_failure(stage: IoStage, error: std::io::Error) -> Error {
+    #[cfg(test)]
+    eprintln!(
+        "owned-profile-io: stage={} win32={:?}",
+        stage as u8,
+        error.raw_os_error()
+    );
+    let _ = (stage, error);
+    Error::Io
+}
+fn win_failure(stage: IoStage, error: windows::core::Error) -> Error {
+    #[cfg(test)]
+    eprintln!(
+        "owned-profile-io: stage={} hresult={:#010x}",
+        stage as u8,
+        error.code().0 as u32
+    );
+    let _ = (stage, error);
+    Error::Io
+}
+
 /// Never Clone. Every live runtime keeps this exact exclusive lease and pins.
 pub(crate) struct ProfileLease {
     pub(crate) root: PathBuf,
@@ -84,7 +133,7 @@ impl ProfileLease {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 create_dir(&base, &owner)?
             }
-            Err(_) => return Err(Error::Io),
+            Err(error) => return Err(io_failure(IoStage::BaseMetadata, error)),
         }
         ancestors.push(hold_directory(&base, &owner)?);
         Self::under(&base, profile, &owner, ancestors)
@@ -110,7 +159,7 @@ impl ProfileLease {
                 create_dir(&root, owner)?;
                 true
             }
-            Err(_) => return Err(Error::Io),
+            Err(error) => return Err(io_failure(IoStage::RootMetadata, error)),
         };
         let root_hold = hold_directory(&root, owner)?;
         let mut lock = if fresh {
@@ -281,14 +330,22 @@ fn write_marker(file: &mut File, bytes: &[u8; 8]) -> Result<(), Error> {
     write_lease(file, bytes)
 }
 fn write_lease(file: &mut File, bytes: &[u8]) -> Result<(), Error> {
-    file.seek(SeekFrom::Start(0)).map_err(|_| Error::Io)?;
-    file.write_all(bytes).map_err(|_| Error::Io)?;
-    file.set_len(bytes.len() as u64).map_err(|_| Error::Io)?;
-    file.sync_all().map_err(|_| Error::Io)
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| io_failure(IoStage::LeaseSeek, error))?;
+    file.write_all(bytes)
+        .map_err(|error| io_failure(IoStage::LeaseWrite, error))?;
+    file.set_len(bytes.len() as u64)
+        .map_err(|error| io_failure(IoStage::LeaseLength, error))?;
+    file.sync_all()
+        .map_err(|error| io_failure(IoStage::LeaseSync, error))
 }
 fn read_variable(file: &mut File, max: usize) -> Result<Vec<u8>, Error> {
-    let len = usize::try_from(file.metadata().map_err(|_| Error::Io)?.len())
-        .map_err(|_| Error::Invalid)?;
+    let len = usize::try_from(
+        file.metadata()
+            .map_err(|error| io_failure(IoStage::FileLength, error))?
+            .len(),
+    )
+    .map_err(|_| Error::Invalid)?;
     if len > max {
         return Err(Error::Invalid);
     }
@@ -304,8 +361,10 @@ fn require_absent(path: &Path) -> Result<(), Error> {
 }
 fn write_new(path: &Path, owner: &str, bytes: &[u8]) -> Result<(), Error> {
     let mut file = create_file(path, owner, 1)?;
-    file.write_all(bytes).map_err(|_| Error::Io)?;
-    file.sync_all().map_err(|_| Error::Io)
+    file.write_all(bytes)
+        .map_err(|error| io_failure(IoStage::NewWrite, error))?;
+    file.sync_all()
+        .map_err(|error| io_failure(IoStage::NewSync, error))
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MigrationPoint {
@@ -331,7 +390,7 @@ fn migration_checkpoint(point: MigrationPoint) -> Result<(), Error> {
 fn discard_reserved_stage(path: &Path, owner: &str) -> Result<(), Error> {
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err(Error::Io),
+        Err(error) => return Err(io_failure(IoStage::StageMetadata, error)),
         Ok(_) => {}
     }
     let file = OpenOptions::new()
@@ -339,7 +398,7 @@ fn discard_reserved_stage(path: &Path, owner: &str) -> Result<(), Error> {
         .share_mode(1)
         .custom_flags(0x0020_0000)
         .open(path)
-        .map_err(|_| Error::Io)?;
+        .map_err(|error| io_failure(IoStage::StageDiscardOpen, error))?;
     verify_file(&file, owner)?;
     let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
     unsafe {
@@ -350,7 +409,7 @@ fn discard_reserved_stage(path: &Path, owner: &str) -> Result<(), Error> {
             size_of::<FILE_DISPOSITION_INFO>() as u32,
         )
     }
-    .map_err(|_| Error::Io)?;
+    .map_err(|error| win_failure(IoStage::StageDiscardDelete, error))?;
     drop(file);
     require_absent(path)
 }
@@ -361,7 +420,18 @@ fn replace_metadata(
     old: &[u8],
     new: &[u8],
 ) -> Result<File, Error> {
+    // Test output is finite phase/role numbers only; no path or metadata bytes.
+    let phase = |number: u8| {
+        #[cfg(test)]
+        eprintln!(
+            "owned-profile-replace: role={} phase={number}",
+            u8::from(stage.file_name() == Some(OsStr::new(RECORD_STAGE)))
+        );
+        let _ = number;
+    };
+    phase(1); // Validate/discard the reserved staging leaf under the journal.
     discard_reserved_stage(stage, owner)?;
+    phase(2); // Open and verify the current target.
     let mut current = open_read(path)?;
     verify_file(&current, owner)?;
     let bytes = read_variable(&mut current, old.len().max(new.len()))?;
@@ -371,22 +441,28 @@ fn replace_metadata(
     if bytes != old {
         return Err(Error::Configuration);
     }
+    phase(3); // Create and sync the fixed new metadata.
     let mut staged = create_file(stage, owner, 1)?;
     migration_checkpoint(if stage.file_name() == Some(OsStr::new(RECORD_STAGE)) {
         MigrationPoint::RegistrationStageCreated
     } else {
         MigrationPoint::StageCreated
     })?;
-    staged.write_all(new).map_err(|_| Error::Io)?;
-    staged.sync_all().map_err(|_| Error::Io)?;
+    staged
+        .write_all(new)
+        .map_err(|error| io_failure(IoStage::StageWrite, error))?;
+    staged
+        .sync_all()
+        .map_err(|error| io_failure(IoStage::StageSync, error))?;
     let expected = identity(&staged)?;
     drop(staged);
+    phase(4); // Reopen and verify the staged object before rename.
     let staged = OpenOptions::new()
         .access_mode(0x8001_0000)
         .share_mode(5)
         .custom_flags(0x0020_0000)
         .open(stage)
-        .map_err(|_| Error::Io)?;
+        .map_err(|error| io_failure(IoStage::StageReopen, error))?;
     verify_file(&staged, owner)?;
     if identity(&staged)? != expected {
         return Err(Error::Scope);
@@ -396,6 +472,7 @@ fn replace_metadata(
     drop(current);
     let source = wide(stage.as_os_str())?;
     let target = wide(path.as_os_str())?;
+    phase(5); // Path-based atomic replacement, unchanged flags.
     unsafe {
         MoveFileExW(
             PCWSTR(source.as_ptr()),
@@ -403,8 +480,9 @@ fn replace_metadata(
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
     }
-    .map_err(|_| Error::Io)?;
+    .map_err(|error| win_failure(IoStage::MoveReplace, error))?;
     drop(staged);
+    phase(6); // Reopen, verify exact identity, and verify exact new bytes.
     let mut held = open_read(path)?;
     verify_file(&held, owner)?;
     if identity(&held)? != expected || read_bounded(&mut held, new.len())? != new {
@@ -446,12 +524,19 @@ fn finish_migration(
     Ok(new)
 }
 fn read_bounded(file: &mut File, max: usize) -> Result<Vec<u8>, Error> {
-    if file.metadata().map_err(|_| Error::Io)?.len() != max as u64 {
+    if file
+        .metadata()
+        .map_err(|error| io_failure(IoStage::FileLength, error))?
+        .len()
+        != max as u64
+    {
         return Err(Error::Invalid);
     }
-    file.seek(SeekFrom::Start(0)).map_err(|_| Error::Io)?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| io_failure(IoStage::ReadSeek, error))?;
     let mut bytes = vec![0; max];
-    file.read_exact(&mut bytes).map_err(|_| Error::Io)?;
+    file.read_exact(&mut bytes)
+        .map_err(|error| io_failure(IoStage::ReadExact, error))?;
     Ok(bytes)
 }
 fn wide(value: &OsStr) -> Result<Vec<u16>, Error> {
@@ -529,7 +614,8 @@ impl Drop for Descriptor {
 fn create_dir(path: &Path, owner: &str) -> Result<(), Error> {
     let sd = Descriptor::new(owner, true)?;
     let path = wide(path.as_os_str())?;
-    unsafe { CreateDirectoryW(PCWSTR(path.as_ptr()), Some(&sd.attrs())) }.map_err(|_| Error::Io)
+    unsafe { CreateDirectoryW(PCWSTR(path.as_ptr()), Some(&sd.attrs())) }
+        .map_err(|error| win_failure(IoStage::DirectoryCreate, error))
 }
 fn create_file(path: &Path, owner: &str, share: u32) -> Result<File, Error> {
     let sd = Descriptor::new(owner, false)?;
@@ -545,7 +631,7 @@ fn create_file(path: &Path, owner: &str, share: u32) -> Result<File, Error> {
             None,
         )
     }
-    .map_err(|_| Error::Io)?;
+    .map_err(|error| win_failure(IoStage::FileCreate, error))?;
     Ok(unsafe { File::from_raw_handle(handle.0) })
 }
 fn open_read(path: &Path) -> Result<File, Error> {
@@ -554,7 +640,7 @@ fn open_read(path: &Path) -> Result<File, Error> {
         .share_mode(1)
         .custom_flags(0x0020_0000)
         .open(path)
-        .map_err(|_| Error::Io)
+        .map_err(|error| io_failure(IoStage::ReadOpen, error))
 }
 fn hold_directory(path: &Path, owner: &str) -> Result<File, Error> {
     let file = crate::image::pin_directory(path).map_err(|_| Error::Invalid)?;
@@ -562,7 +648,9 @@ fn hold_directory(path: &Path, owner: &str) -> Result<File, Error> {
     Ok(file)
 }
 fn verify_file(file: &File, owner: &str) -> Result<(), Error> {
-    let meta = file.metadata().map_err(|_| Error::Io)?;
+    let meta = file
+        .metadata()
+        .map_err(|error| io_failure(IoStage::VerifyMetadata, error))?;
     if !meta.is_file() || meta.file_attributes() & 0x400 != 0 {
         return Err(Error::Invalid);
     }
@@ -778,7 +866,8 @@ mod tests {
                 std::fs::read(root.join("lease")).unwrap().len(),
                 MIGRATION_LENGTH
             );
-            let reopened = ProfileLease::fixture(parent.path(), profile).unwrap();
+            let reopened = ProfileLease::fixture(parent.path(), profile)
+                .unwrap_or_else(|error| panic!("migration recovery after {point:?}: {error:?}"));
             assert_eq!(reopened.record, old.managed());
             assert_eq!(
                 std::fs::read(root.join("codex-home/config.toml")).unwrap(),
@@ -880,7 +969,9 @@ mod tests {
                     std::fs::write(root.join("registration"), old.managed().encode().unwrap())
                         .unwrap();
                 }
-                let reopened = ProfileLease::fixture(parent.path(), profile).unwrap();
+                let reopened = ProfileLease::fixture(parent.path(), profile).unwrap_or_else(|error| {
+                    panic!("migration pair config_new={config_new} registration_new={registration_new}: {error:?}")
+                });
                 assert_eq!(reopened.record, old.managed());
                 drop(reopened);
                 assert_eq!(std::fs::read(root.join("lease")).unwrap(), CLEAN);
