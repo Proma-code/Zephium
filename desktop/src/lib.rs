@@ -5896,7 +5896,7 @@ pub fn run() {
 
     let specta = specta_builder();
     let existing_handler = specta.invoke_handler();
-    let account_handler = tauri::generate_handler![
+    let account_handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
         chatgpt::chatgpt_account,
         chatgpt::chatgpt_sign_in,
         chatgpt::chatgpt_cancel,

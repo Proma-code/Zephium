@@ -40,6 +40,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: windows-subscription-trial
+          cache-on-failure: true
       - run: pnpm install --frozen-lockfile
       - name: Isolation contract and build guard tests
         run: |
@@ -129,4 +130,63 @@ jobs:
           name: Zephium-Subscription-Trial-Windows-x64-${{ github.sha }}
           path: target/windows-subscription-trial-artifact/
           if-no-files-found: error
+          retention-days: 14
+
+  full_work_regressions:
+    name: Full Windows Work regressions after trial build
+    needs: windows
+    if: github.repository == 'Proma-code/Zephium'
+    runs-on: windows-2025
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.95.0 --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: windows-subscription-trial
+          cache-on-failure: true
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        with:
+          tool: cargo-nextest@0.9.137
+          fallback: none
+      - name: All application, provider and durable composition tests without retries
+        run: |
+          $reportDirectory = Join-Path $PWD 'target/windows-trial-regressions'
+          New-Item -ItemType Directory -Path $reportDirectory -Force | Out-Null
+          $suites = @(
+            @{ Name = 'app'; Package = 'zephium-app'; Features = 'work-runtime,work-execution' },
+            @{ Name = 'agentic'; Package = 'zephium-agentic'; Features = 'provider-transport,probe-harness' },
+            @{ Name = 'composition'; Package = 'zephium-work-composition'; Features = 'durable-runtime' }
+          )
+          $results = @()
+          foreach ($suite in $suites) {
+            $junit = Join-Path $PWD 'target/nextest/ci/junit.xml'
+            if (Test-Path -LiteralPath $junit) { Remove-Item -LiteralPath $junit }
+            cargo nextest run --profile ci --no-fail-fast --retries 0 --locked -p $suite.Package --features $suite.Features
+            $code = $LASTEXITCODE
+            $hasReport = Test-Path -LiteralPath $junit
+            if ($hasReport) {
+              Copy-Item -LiteralPath $junit -Destination (Join-Path $reportDirectory ($suite.Name + '.xml'))
+            }
+            $results += [pscustomobject]@{
+              suite = $suite.Name
+              source_revision = $env:GITHUB_SHA
+              exit_code = $code
+              junit_written = $hasReport
+            }
+          }
+          $results | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $reportDirectory 'results.json') -Encoding utf8
+          if (@($results | Where-Object { $_.exit_code -ne 0 -or -not $_.junit_written }).Count -ne 0) { exit 1 }
+      - name: Retain exact-source test results, including failures
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Windows-Work-Regressions-${{ github.sha }}
+          path: target/windows-trial-regressions/
+          if-no-files-found: warn
           retention-days: 14
