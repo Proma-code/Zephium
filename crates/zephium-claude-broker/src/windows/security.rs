@@ -190,6 +190,19 @@ impl Profile {
             _holds: holds,
         })
     }
+    /// Windows derives its AppContainer LOCALAPPDATA from the input base. Use
+    /// only the held own-SID API path's exact documented ancestor; no ambient
+    /// environment value or fallback is accepted, and this grants no data rights.
+    #[cfg(feature = "native-fixtures")]
+    pub(super) fn fixture_environment_base(
+        &self,
+        folder: &HeldProfileFolder,
+    ) -> Result<std::path::PathBuf, &'static str> {
+        let name = String::from_utf16(&self.name[..self.name.len() - 1])
+            .map_err(|_| "fresh profile name encoding failed")?;
+        let sid = sid_string(PSID(self.sid.as_ptr().cast_mut().cast()))?;
+        fixture_profile_base(&folder.path, &name, &sid)
+    }
     /// Only freshly generated identities are admitted by this candidate. Persistent
     /// vendor identity/retirement remains part of the production qualification.
     pub(super) fn create(name: &str) -> Result<Self, &'static str> {
@@ -517,6 +530,47 @@ fn plain_local_path(path: &Path) -> bool {
         _ => false,
     })
 }
+#[cfg(feature = "native-fixtures")]
+fn fixture_profile_base(
+    path: &Path,
+    name: &str,
+    sid: &str,
+) -> Result<std::path::PathBuf, &'static str> {
+    if !plain_local_path(path)
+        || !path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|leaf| leaf.eq_ignore_ascii_case("AC"))
+    {
+        return Err("fresh profile folder structure rejected");
+    }
+    let package = path.parent().ok_or("fresh package folder missing")?;
+    let leaf = package
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or("fresh package folder malformed")?;
+    if !leaf.eq_ignore_ascii_case(name) && leaf != sid {
+        return Err("fresh package folder identity mismatch");
+    }
+    let packages = package
+        .parent()
+        .ok_or("fresh profile packages folder missing")?;
+    if !packages
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|leaf| leaf.eq_ignore_ascii_case("Packages"))
+    {
+        return Err("fresh profile packages structure rejected");
+    }
+    let base = packages
+        .parent()
+        .ok_or("fresh profile environment base missing")?;
+    if base.components().count() < 3 {
+        return Err("fresh profile environment base rejected");
+    }
+    Ok(base.to_owned())
+}
+
 /// File and all ancestors remain held against write/delete replacement through reap.
 pub(super) struct HeldImage {
     pub(super) path: std::path::PathBuf,
@@ -588,4 +642,28 @@ pub(super) fn hash(file: &mut File) -> Result<[u8; 32], &'static str> {
         digest.update(&bytes[..count]);
     }
     Ok(digest.finalize().into())
+}
+
+#[cfg(all(test, feature = "native-fixtures"))]
+mod fixture_profile_base_tests {
+    use super::*;
+    #[test]
+    fn environment_base_requires_exact_own_api_folder_structure() {
+        let name = "Zephium.ClaudeFixture.Synthetic";
+        let sid = "S-1-15-2-123";
+        let expected = Path::new(r"C:\synthetic\local");
+        for leaf in [name, sid] {
+            let path = expected.join("Packages").join(leaf).join("AC");
+            assert_eq!(fixture_profile_base(&path, name, sid).unwrap(), expected);
+        }
+        for path in [
+            r"C:\synthetic\local\Packages\Foreign\AC",
+            r"C:\synthetic\local\Other\Zephium.ClaudeFixture.Synthetic\AC",
+            r"C:\synthetic\local\Packages\Zephium.ClaudeFixture.Synthetic\Other",
+            r"\\server\local\Packages\Zephium.ClaudeFixture.Synthetic\AC",
+            r"C:\Packages\Zephium.ClaudeFixture.Synthetic\AC",
+        ] {
+            assert!(fixture_profile_base(Path::new(path), name, sid).is_err());
+        }
+    }
 }

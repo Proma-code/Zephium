@@ -227,16 +227,46 @@ unsafe extern "system" {
     fn NtFlushBuffersFile(file: HANDLE, status: *mut IO_STATUS_BLOCK) -> i32;
     fn RtlNtStatusToDosError(status: i32) -> u32;
 }
+// DOS device aliases must never be emitted as prospective Win32 config paths.
+// Microsoft also reserves superscript digits 1, 2 and 3 for COM/LPT aliases.
+fn reserved_device_component(name: &[u16]) -> bool {
+    let mut stem = name
+        .split(|unit| *unit == b'.' as u16)
+        .next()
+        .unwrap_or(&[]);
+    while stem.last() == Some(&(b' ' as u16)) {
+        stem = &stem[..stem.len() - 1];
+    }
+    let upper: Vec<u16> = stem
+        .iter()
+        .map(|unit| match *unit {
+            97..=122 => *unit - 32,
+            _ => *unit,
+        })
+        .collect();
+    let is = |word: &str| upper.iter().copied().eq(word.encode_utf16());
+    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$"]
+        .iter()
+        .any(|word| is(word))
+        || (upper.len() == 4
+            && (upper[..3] == [67, 79, 77] || upper[..3] == [76, 80, 84])
+            && matches!(upper[3], 49..=57 | 0x00b9 | 0x00b2 | 0x00b3))
+}
 fn component(name: &str) -> Result<Vec<u16>, Error> {
     if name.is_empty()
         || matches!(name, "." | "..")
         || name.ends_with(['.', ' '])
-        || name.chars().any(|c| matches!(c, '\\' | '/' | ':' | '\0'))
+        || name.chars().any(|c| {
+            matches!(
+                c,
+                '\0'..='\u{1f}' | '\\' | '/' | ':' | '<' | '>' | '"' | '|' | '?' | '*'
+            )
+        })
     {
         return Err(Error::Invalid);
     }
     let value: Vec<u16> = name.encode_utf16().collect();
-    if value.len() > 255 {
+    if value.len() > 255 || reserved_device_component(&value) {
         return Err(Error::Invalid);
     }
     Ok(value)
@@ -410,7 +440,106 @@ fn open_drive(drive: u8, owner: &str) -> Result<HeldDirectory, Error> {
         security,
     })
 }
+/// Validate raw Windows syntax before Path::components can normalize it.
+/// The fixture bootstrap may resolve native case/short-name aliases, but never
+/// dots, duplicate/mixed separators, device/UNC roots, ADS or trailing-name aliases.
+pub(super) fn valid_temp_hint_syntax(path: &Path) -> bool {
+    let raw: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if !(4..32768).contains(&raw.len())
+        || !matches!(raw[0], 65..=90 | 97..=122)
+        || raw[1] != b':' as u16
+        || raw[2] != b'\\' as u16
+    {
+        return false;
+    }
+    let mut rest = &raw[3..];
+    if rest.last() == Some(&(b'\\' as u16)) {
+        rest = &rest[..rest.len() - 1];
+    }
+    rest.split(|unit| *unit == b'\\' as u16).all(|name| {
+        !name.is_empty()
+            && name.len() <= 255
+            && name != [b'.' as u16]
+            && name != [b'.' as u16, b'.' as u16]
+            && !matches!(name.last(), Some(32 | 46))
+            && !name
+                .iter()
+                .any(|unit| matches!(*unit, 0..=31 | 34 | 42 | 47 | 58 | 60 | 62 | 63 | 124))
+            && !reserved_device_component(name)
+    })
+}
+
+/// Only the fresh fixture factory enters this ambient bootstrap. The native temp
+/// hint is never returned or used for creation, nor is it a caller-selected root.
+pub(super) fn pin_temp_parent(owner: &str) -> Result<Vec<HeldDirectory>, Error> {
+    let hint = std::env::temp_dir();
+    let bootstrap = super::stage("store-temp-bootstrap", pin_parent_inner(&hint, owner, true))?;
+    let canonical = canonical_parent(&bootstrap.last().ok_or(Error::Invalid)?.file)?;
+    // Preserve the whole bootstrap while independently re-pinning exact spelling.
+    // Only the strict chain is allowed to reach any create or receipt constructor.
+    let strict = super::stage("store-temp-strict-rebind", pin_parent(&canonical, owner))?;
+    compare_bootstrap_bindings(
+        &bootstrap
+            .iter()
+            .map(HeldDirectory::receipt)
+            .collect::<Vec<_>>(),
+        &strict
+            .iter()
+            .map(HeldDirectory::receipt)
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(strict)
+}
+
+fn compare_bootstrap_bindings(
+    bootstrap: &[DirectoryReceipt],
+    strict: &[DirectoryReceipt],
+) -> Result<(), Error> {
+    if bootstrap != strict {
+        return Err(invalid("store-temp-chain-binding", 1));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn assert_synthetic_bootstrap_binding_faults(chain: &[HeldDirectory]) {
+    // Deterministic receipt mutation, not a simulated native race or a substitute
+    // for the real held-handle canonical reopen above.
+    let receipts: Vec<_> = chain.iter().map(HeldDirectory::receipt).collect();
+    compare_bootstrap_bindings(&receipts, &receipts).unwrap();
+    let mut identity = receipts.clone();
+    identity.last_mut().unwrap().identity.file[0] ^= 1;
+    assert!(matches!(
+        compare_bootstrap_bindings(&receipts, &identity),
+        Err(Error::Invalid)
+    ));
+    let mut control = receipts.clone();
+    control.last_mut().unwrap().security.control ^= 0x1000;
+    assert!(matches!(
+        compare_bootstrap_bindings(&receipts, &control),
+        Err(Error::Invalid)
+    ));
+    let mut dacl = receipts.clone();
+    dacl.last_mut().unwrap().security.dacl[0].mask ^= 1;
+    assert!(matches!(
+        compare_bootstrap_bindings(&receipts, &dacl),
+        Err(Error::Invalid)
+    ));
+}
+
+/// Stored receipts and explicit fixture reopens retain exact canonical spelling.
 pub(super) fn pin_parent(path: &Path, owner: &str) -> Result<Vec<HeldDirectory>, Error> {
+    pin_parent_inner(path, owner, false)
+}
+
+fn pin_parent_inner(
+    path: &Path,
+    owner: &str,
+    temp_bootstrap: bool,
+) -> Result<Vec<HeldDirectory>, Error> {
+    if !valid_temp_hint_syntax(path) {
+        return Err(invalid("store-parent-raw-syntax", 1));
+    }
     let mut components = path.components();
     let drive = match components.next() {
         Some(Component::Prefix(prefix)) => match prefix.kind() {
@@ -433,30 +562,66 @@ pub(super) fn pin_parent(path: &Path, owner: &str) -> Result<Vec<HeldDirectory>,
     if names.is_empty() {
         return Err(invalid("store-parent-empty", 1));
     }
-    let mut chain = vec![super::stage(
-        "store-parent-drive",
-        open_drive(drive, owner),
-    )?];
+    let mut drive_node = super::stage("store-parent-drive", open_drive(drive, owner))?;
+    if temp_bootstrap {
+        // Bind the drive's native spelling too; strict replay must be identical.
+        drive_node.name = canonical_parent(&drive_node.file)?
+            .to_str()
+            .ok_or(Error::Invalid)?
+            .to_owned();
+    }
+    let mut chain = vec![drive_node];
     for (index, name) in names.iter().enumerate() {
+        let parent = &chain.last().ok_or(Error::Invalid)?.file;
         let file = open(
-            &chain.last().ok_or(Error::Invalid)?.file,
+            parent,
             name,
             true,
             READ | if index + 1 == names.len() { WRITE } else { 0 },
             OPEN,
             None,
         )?;
-        super::stage("store-parent-component-spelling", exact_name(&file, name))?;
+        let node_identity = identity(&file, true)?;
         let security = super::stage("store-parent-component-security", ancestor(&file, owner))?;
+        let recorded_name = if temp_bootstrap {
+            let canonical = normalized(&file)?
+                .rsplit('\\')
+                .next()
+                .ok_or(Error::Invalid)?
+                .to_owned();
+            component(&canonical)?;
+            exact_name(&file, &canonical)?;
+            // A canonical string alone is not authority. Reopen that component
+            // under the SAME held parent and compare full identity and security.
+            let rebound = open(parent, &canonical, true, READ, OPEN, None)?;
+            exact_name(&rebound, &canonical)?;
+            if identity(&rebound, true)? != node_identity || snapshot(&rebound)? != security {
+                return Err(invalid("store-temp-component-binding", 1));
+            }
+            super::super::diagnostic(
+                "store-temp-component-spelling",
+                if *name == canonical {
+                    0
+                } else if name.eq_ignore_ascii_case(&canonical) {
+                    1
+                } else {
+                    2
+                },
+            );
+            canonical
+        } else {
+            super::stage("store-parent-component-spelling", exact_name(&file, name))?;
+            (*name).to_owned()
+        };
         chain.push(HeldDirectory {
-            identity: identity(&file, true)?,
+            identity: node_identity,
             file,
-            name: (*name).to_owned(),
+            name: recorded_name,
             security,
         });
     }
     let canonical = canonical_parent(&chain.last().ok_or(Error::Invalid)?.file)?;
-    if !exact_parent_spelling(path, &canonical) {
+    if !temp_bootstrap && !exact_parent_spelling(path, &canonical) {
         return Err(invalid("store-parent-raw-spelling", 1));
     }
     Ok(chain)

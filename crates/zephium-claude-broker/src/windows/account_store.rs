@@ -115,12 +115,8 @@ impl FixtureStoreOwner {
             "store-create-principals",
             profile.fixture_sids().map_err(|_| Error::Invalid),
         )?;
-        let ambient_parent = std::env::temp_dir();
-        let mut chain = stage(
-            "store-create-parent",
-            native::pin_parent(&ambient_parent, &owner_sid),
-        )?;
-        // Store only the held canonical spelling, after exact raw input proof.
+        let mut chain = stage("store-create-parent", native::pin_temp_parent(&owner_sid))?;
+        // Only a fully rebound strict canonical chain reaches fresh creation.
         let parent = stage(
             "store-create-canonical-parent",
             native::canonical_parent(&chain.last().ok_or(Error::Invalid)?.file),

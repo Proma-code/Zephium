@@ -200,6 +200,34 @@ impl Command {
         }
     }
     #[cfg(feature = "native-fixtures")]
+    fn fixture_profile_environment(self) -> bool {
+        // Repair only ordinary fixed fixtures/startup. Both sides of the network
+        // capability differential retain the SAME original environment.
+        match self {
+            Self::Vendor(_) => false,
+            Self::Fixture(
+                Fixture::NetworkBaseline
+                | Fixture::NetworkRegistryRead
+                | Fixture::TokenAppContainerControl
+                | Fixture::TokenLpacControl,
+            ) => false,
+            Self::Fixture(
+                Fixture::HandleProbe
+                | Fixture::LoginInput
+                | Fixture::LoginExit
+                | Fixture::VendorVersion
+                | Fixture::VendorHelp
+                | Fixture::Echo
+                | Fixture::Argv
+                | Fixture::Isolation
+                | Fixture::Flood
+                | Fixture::StderrFlood
+                | Fixture::CancelWait
+                | Fixture::Stall,
+            ) => true,
+        }
+    }
+    #[cfg(feature = "native-fixtures")]
     fn token_probe(self) -> Option<bool> {
         match self {
             Self::Fixture(Fixture::TokenAppContainerControl) => Some(false),
@@ -243,7 +271,7 @@ impl Command {
         }
     }
 }
-fn environment(layout: &Layout) -> Result<Vec<u16>, &'static str> {
+fn environment(layout: &Layout, initial_localappdata: &Path) -> Result<Vec<u16>, &'static str> {
     let mut system = [0u16; 32768];
     let len = unsafe { GetSystemDirectoryW(Some(&mut system)) } as usize;
     if len == 0 || len >= system.len() {
@@ -261,7 +289,7 @@ fn environment(layout: &Layout) -> Result<Vec<u16>, &'static str> {
         ("APPDATA".into(), layout.appdata.as_os_str().to_owned()),
         (
             "LOCALAPPDATA".into(),
-            layout.localappdata.as_os_str().to_owned(),
+            initial_localappdata.as_os_str().to_owned(),
         ),
         ("TEMP".into(), layout.temporary.as_os_str().to_owned()),
         ("TMP".into(), layout.temporary.as_os_str().to_owned()),
@@ -419,7 +447,24 @@ fn run_owned(
     )
     .map_err(|_| "invalid fixed argv")?;
     let cwd = wide(layout.work.as_os_str())?;
-    let env = environment(layout)?;
+    // This candidate is fixed to the reviewed debug-only fixture/startup list.
+    // Keep the own-SID folder/ancestor holds until physical process settlement.
+    #[cfg(feature = "native-fixtures")]
+    let fixture_environment = if command.fixture_profile_environment() {
+        let folder = profile.fixture_folder()?;
+        let base = profile.fixture_environment_base(&folder)?;
+        Some((folder, base))
+    } else {
+        None
+    };
+    #[cfg(feature = "native-fixtures")]
+    let initial_localappdata = fixture_environment
+        .as_ref()
+        .map(|(_, base)| base.as_path())
+        .unwrap_or(&layout.localappdata);
+    #[cfg(not(feature = "native-fixtures"))]
+    let initial_localappdata = &layout.localappdata;
+    let env = environment(layout, initial_localappdata)?;
     let raw_job =
         unsafe { CreateJobObjectW(None, PCWSTR::null()) }.map_err(|_| "job creation failed")?;
     let job = Job(unsafe { OwnedHandle::from_raw_handle(raw_job.0) });
@@ -913,6 +958,41 @@ fn inspect_identity(
 #[cfg(all(test, feature = "native-fixtures"))]
 mod research_admission_tests {
     use super::*;
+    #[test]
+    fn environment_repair_preserves_both_sides_of_capability_differential() {
+        for operation in [
+            Operation::ReadStatus,
+            Operation::StartLogin,
+            Operation::Logout,
+            Operation::TextTurn,
+        ] {
+            assert!(!Command::Vendor(operation).fixture_profile_environment());
+        }
+        for fixture in [
+            Fixture::NetworkBaseline,
+            Fixture::NetworkRegistryRead,
+            Fixture::TokenAppContainerControl,
+            Fixture::TokenLpacControl,
+        ] {
+            assert!(!Command::Fixture(fixture).fixture_profile_environment());
+        }
+        for fixture in [
+            Fixture::VendorVersion,
+            Fixture::VendorHelp,
+            Fixture::HandleProbe,
+            Fixture::LoginInput,
+            Fixture::LoginExit,
+            Fixture::Echo,
+            Fixture::Argv,
+            Fixture::Isolation,
+            Fixture::Flood,
+            Fixture::StderrFlood,
+            Fixture::CancelWait,
+            Fixture::Stall,
+        ] {
+            assert!(Command::Fixture(fixture).fixture_profile_environment());
+        }
+    }
     #[test]
     fn fixture_runtime_capability_is_never_a_real_operation_or_baseline() {
         for operation in [

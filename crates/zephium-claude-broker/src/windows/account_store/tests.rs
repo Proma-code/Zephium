@@ -26,6 +26,8 @@ fn clean_exact_in_process_reopen_preserves_identity_and_profile_sid() {
     let (owner, lease) = fixture();
     let receipt = owner.receipt();
     let identity = receipt.0.config;
+    let parent = &lease.inner.chain[lease.inner.chain.len() - 2].file;
+    assert!(receipt.0.parent.as_os_str() == native::canonical_parent(parent).unwrap().as_os_str());
     let sids = receipt.0.profile.fixture_sids().unwrap();
     assert!(matches!(
         StoreLease::reopen(&receipt, key()),
@@ -368,4 +370,79 @@ fn parent_spelling_rejects_normalized_aliases_but_accepts_one_os_separator() {
             canonical
         ));
     }
+}
+
+#[test]
+#[ignore = "native synthetic fixture; explicit Windows qualification only"]
+fn temp_bootstrap_raw_syntax_rejects_ambiguity_before_lookup() {
+    use std::path::Path;
+    for accepted in [
+        r"C:\fixture\temp",
+        r"C:\fixture\temp\",
+        r"c:\fixture\temp",
+        r"C:\Users\RUNNER~1\Temp\",
+        r"C:\COM10\temp",
+        r"C:\.config\temp",
+    ] {
+        assert!(native::valid_temp_hint_syntax(Path::new(accepted)));
+    }
+    for rejected in [
+        r"C:\",
+        r"C:/fixture/temp",
+        r"C:\fixture\\temp",
+        r"C:\fixture\.\temp",
+        r"C:\fixture\..\temp",
+        r"C:\fixture\temp\\",
+        r"C:\fixture\temp.",
+        r"C:\fixture\temp ",
+        r"C:\fixture\temp:stream",
+        r"\\?\C:\fixture\temp",
+        r"\\.\C:\fixture\temp",
+        r"\\server\fixture\temp",
+        "C:\\fixture\\te\0mp",
+        "C:\\fixture\\te\u{1f}mp",
+        r"C:\fixture\te?mp",
+        r"C:\fixture\te*mp",
+        r"C:\fixture\te|mp",
+        r"C:\fixture\te<mp",
+        r"C:\fixture\te>mp",
+        "C:\\fixture\\te\"mp",
+        r"C:\CON\temp",
+        r"C:\con.txt\temp",
+        r"C:\CON .txt\temp",
+        r"C:\COM1\temp",
+        r"C:\LPT9.log\temp",
+        r"C:\COM¹\temp",
+        r"C:\LPT².log\temp",
+        r"C:\COM³\temp",
+        r"C:\CONIN$\temp",
+    ] {
+        assert!(!native::valid_temp_hint_syntax(Path::new(rejected)));
+    }
+}
+
+#[test]
+#[ignore = "native synthetic fixture; explicit Windows qualification only"]
+fn strict_replay_rejects_case_alias_after_native_temp_bootstrap() {
+    let (owner, lease) = fixture();
+    let receipt = owner.receipt();
+    let exact = &receipt.0;
+    let canonical = exact.parent.join(&exact.root_name);
+    let pinned = native::pin_parent(&canonical, &exact.owner_sid).unwrap();
+    assert!(pinned.last().unwrap().identity == lease.inner.chain.last().unwrap().identity);
+    let alias = exact.parent.join(exact.root_name.to_ascii_lowercase());
+    assert!(alias.as_os_str() != canonical.as_os_str());
+    assert!(matches!(
+        native::pin_parent(&alias, &exact.owner_sid),
+        Err(Error::Invalid)
+    ));
+    lease.verify().unwrap();
+}
+
+#[test]
+#[ignore = "native synthetic fixture; explicit Windows qualification only"]
+fn bootstrap_receipt_binding_rejects_synthetic_identity_and_security_changes() {
+    let (_owner, lease) = fixture();
+    native::assert_synthetic_bootstrap_binding_faults(&lease.inner.chain);
+    lease.verify().unwrap();
 }
