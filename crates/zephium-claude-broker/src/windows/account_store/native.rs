@@ -7,7 +7,7 @@ use std::{
     os::windows::{
         ffi::OsStrExt,
         fs::OpenOptionsExt,
-        io::{AsRawHandle, FromRawHandle},
+        io::{AsRawHandle, FromRawHandle, OwnedHandle},
     },
     path::{Component, Path, PathBuf, Prefix},
 };
@@ -22,9 +22,10 @@ use windows::{
             },
             Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG},
             GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
-            GetSecurityDescriptorOwner, GetSecurityDescriptorSacl, IsValidSid, ACCESS_ALLOWED_ACE,
-            ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION,
-            OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+            GetSecurityDescriptorOwner, GetSecurityDescriptorSacl, GetTokenInformation, IsValidSid,
+            TokenIntegrityLevel, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION,
+            LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+            TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
         },
         Storage::FileSystem::{
             FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
@@ -32,7 +33,10 @@ use windows::{
             BY_HANDLE_FILE_INFORMATION, FILE_ID_INFO, GETFINALPATHNAMEBYHANDLE_FLAGS,
             LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
         },
-        System::IO::{IO_STATUS_BLOCK, OVERLAPPED},
+        System::{
+            Threading::OpenProcessToken,
+            IO::{IO_STATUS_BLOCK, OVERLAPPED},
+        },
     },
 };
 
@@ -130,6 +134,70 @@ pub(super) fn fixture_binding(file: &File, directory: bool) -> Result<([u8; 32],
     }
     Ok((hash.finalize().into(), security.owner))
 }
+// Closed numeric labels for a debug-only fixture comparison. Never project a
+// SID, path or descriptor. Unknown/query failure remains diagnostic only.
+fn integrity_category(sid: &str) -> i32 {
+    match sid {
+        "S-1-16-0" => 0,
+        "S-1-16-4096" => 4096,
+        "S-1-16-8192" => 8192,
+        "S-1-16-8448" => 8448,
+        "S-1-16-12288" => 12288,
+        "S-1-16-16384" => 16384,
+        _ => -1,
+    }
+}
+pub(super) fn fixture_file_integrity(file: &File) -> Result<i32, Error> {
+    let security = snapshot(file)?;
+    let [label] = security.labels.as_slice() else {
+        return Ok(-1);
+    };
+    Ok(if label.kind == 17 {
+        integrity_category(&label.sid)
+    } else {
+        -1
+    })
+}
+pub(super) fn fixture_process_integrity(process: HANDLE) -> Result<i32, Error> {
+    let mut raw = HANDLE::default();
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut raw) }.map_err(|_| Error::Invalid)?;
+    let token = unsafe { OwnedHandle::from_raw_handle(raw.0) };
+    let mut buffer = [0usize; 64];
+    let mut length = 0;
+    unsafe {
+        GetTokenInformation(
+            HANDLE(token.as_raw_handle()),
+            TokenIntegrityLevel,
+            Some(buffer.as_mut_ptr().cast()),
+            std::mem::size_of_val(&buffer) as u32,
+            &mut length,
+        )
+    }
+    .map_err(|_| Error::Invalid)?;
+    if (length as usize) < size_of::<TOKEN_MANDATORY_LABEL>()
+        || length as usize > std::mem::size_of_val(&buffer)
+    {
+        return Err(Error::Invalid);
+    }
+    let label = unsafe { &*buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>() };
+    Ok(integrity_category(&sid_string(label.Label.Sid)?))
+}
+#[cfg(test)]
+#[test]
+fn fixture_integrity_categories_do_not_project_unknown_identities() {
+    assert_eq!(integrity_category("S-1-16-4096"), 4096);
+    assert_eq!(integrity_category("S-1-16-8192"), 8192);
+    assert_eq!(integrity_category("S-1-16-12288"), 12288);
+    for value in [
+        "S-1-5-21-123",
+        "S-1-16-4096-extra",
+        "S-1-16-04096",
+        "private",
+    ] {
+        assert_eq!(integrity_category(value), -1);
+    }
+}
+
 impl Policy {
     pub(super) fn directory(owner: &str, package: &str, writable: bool) -> Self {
         let directory = if writable {

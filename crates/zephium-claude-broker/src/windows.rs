@@ -5,6 +5,7 @@ mod account_store;
 pub(super) mod fixtures;
 #[cfg(feature = "native-fixtures")]
 pub(super) mod network_research;
+mod port;
 mod process;
 mod security;
 mod signature;

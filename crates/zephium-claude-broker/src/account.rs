@@ -109,10 +109,15 @@ pub(super) trait Port {
 
 /// The native worker reads this fence; a provider/renderer cannot reset it.
 pub(super) struct Control {
+    owner: Owner,
     cancelled: Arc<AtomicBool>,
     deadline: Instant,
 }
 impl Control {
+    /// Immutable native resource owner; never supplied by renderer input.
+    pub fn owner(&self) -> Owner {
+        self.owner
+    }
     pub fn cancelled(&self, now: Instant) -> bool {
         self.cancelled.load(Ordering::Acquire) || now >= self.deadline
     }
@@ -317,6 +322,7 @@ impl AccountOwner {
             ticket,
             request: Some(request),
             control: Control {
+                owner: self.inner.owner,
                 cancelled,
                 deadline,
             },

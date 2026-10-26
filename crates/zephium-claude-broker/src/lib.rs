@@ -16,8 +16,14 @@ mod fresh_status;
 #[cfg(any(test, all(windows, feature = "native-fixtures")))]
 mod help_metadata;
 pub mod plan;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/port.rs"]
+mod portable_port;
 pub mod protocol;
 mod strict_json;
+#[cfg(any(test, windows))]
+#[allow(dead_code)]
+mod transport_control;
 
 #[cfg(windows)]
 #[allow(dead_code)]

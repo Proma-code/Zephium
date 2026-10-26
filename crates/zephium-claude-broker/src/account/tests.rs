@@ -767,3 +767,30 @@ fn post_port_cancel_and_expiry_invalidate_cached_turn_auth() {
         );
     }
 }
+
+#[test]
+fn native_control_binds_the_complete_owner_tuple_without_changing_deadline() {
+    for (account_generation, profile_generation) in [(1, 2), (13, 17)] {
+        let expected = Owner {
+            account_generation,
+            profile_generation,
+            ..native_owner()
+        };
+        let owner = AccountOwner::new(expected).unwrap();
+        let now = Instant::now();
+        let work = owner
+            .begin(owner.scope().unwrap(), Request::ReadStatus, now)
+            .unwrap();
+        let expected_deadline = now + CommandPlan::for_operation(Operation::ReadStatus).deadline();
+        let result = work.run(
+            &mut |_: Request, control: &Control| {
+                assert_eq!(control.owner(), expected);
+                assert_eq!(control.deadline(), expected_deadline);
+                assert!(!control.cancelled(now));
+                Ok(Reply::Status(AuthStatus::SignedOut))
+            },
+            || now,
+        );
+        assert_eq!(result, Ok(Reply::Status(AuthStatus::SignedOut)));
+    }
+}

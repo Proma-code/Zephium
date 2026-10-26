@@ -3,7 +3,10 @@ use super::{
     security::{HeldImage, Profile},
     wide,
 };
-use crate::plan::{self, CommandPlan, Operation};
+use crate::{
+    plan::{self, CommandPlan, Operation},
+    transport_control::Fence,
+};
 use std::{
     ffi::OsString,
     fs::File,
@@ -56,6 +59,72 @@ impl Job {
 impl Drop for Job {
     fn drop(&mut self) {
         let _ = self.stop();
+    }
+}
+// This guard is installed before any post-create inspection can unwind. Its
+// Drop is intentionally blocking: cancellation/panic never releases actual
+// profile/image resources while the process or stdin writer is still alive.
+struct ChildGuard<'a> {
+    process: OwnedHandle,
+    job: &'a Job,
+    writer: Option<std::thread::JoinHandle<bool>>,
+    finished: Arc<AtomicBool>,
+    panic_probe: Option<Arc<PanicProbe>>,
+}
+impl AsRawHandle for ChildGuard<'_> {
+    fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
+        self.process.as_raw_handle()
+    }
+}
+impl ChildGuard<'_> {
+    fn join_writer(&mut self) -> bool {
+        let Some(writer) = self.writer.take() else {
+            return false;
+        };
+        let joined = writer.join();
+        if let Some(probe) = &self.panic_probe {
+            probe
+                .writer_panicked
+                .store(joined.is_err(), Ordering::Release);
+            probe.writer_joined.store(true, Ordering::Release);
+        }
+        joined.unwrap_or(false)
+    }
+}
+impl Drop for ChildGuard<'_> {
+    fn drop(&mut self) {
+        self.finished.store(true, Ordering::Release);
+        terminate_and_reap(self.job, &self.process);
+        if let Some(probe) = &self.panic_probe {
+            probe.reaped.store(true, Ordering::Release);
+        }
+        if self.writer.is_some() {
+            let _ = self.join_writer();
+        }
+    }
+}
+// Only debug synthetic qualification constructs a fault probe. No command,
+// environment or production caller can request injection.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PanicPoint {
+    CreatedSuspended,
+    LiveBlockedWriter,
+}
+struct PanicProbe {
+    point: PanicPoint,
+    created: AtomicBool,
+    injected: AtomicBool,
+    reaped: AtomicBool,
+    writer_entered: AtomicBool,
+    writer_joined: AtomicBool,
+    writer_panicked: AtomicBool,
+}
+#[derive(Debug)]
+struct FixturePanic;
+fn inject_panic(probe: &Option<Arc<PanicProbe>>, point: PanicPoint) {
+    if let Some(probe) = probe.as_ref().filter(|probe| probe.point == point) {
+        probe.injected.store(true, Ordering::Release);
+        std::panic::panic_any(FixturePanic);
     }
 }
 struct Attributes {
@@ -345,6 +414,73 @@ pub(super) struct Output {
     pub(super) stderr: Vec<u8>,
     pub(super) stopped: Option<&'static str>,
 }
+/// Exclusive native resources for a single fresh-status qualification. This is
+/// not a persistent-store constructor and cannot run any other vendor operation.
+#[cfg(feature = "native-fixtures")]
+pub(super) struct FreshSession {
+    owner: crate::custody::Owner,
+    image: HeldImage,
+    layout: Layout,
+    profile: Profile,
+}
+#[cfg(feature = "native-fixtures")]
+impl FreshSession {
+    pub(super) fn new(
+        owner: crate::custody::Owner,
+        image: HeldImage,
+        layout: Layout,
+        profile: Profile,
+    ) -> Self {
+        Self {
+            owner,
+            image,
+            layout,
+            profile,
+        }
+    }
+    pub(super) fn config(&self) -> &Path {
+        &self.layout.config
+    }
+    pub(super) fn run(&mut self, control: &crate::account::Control) -> SettledCall<'_> {
+        let result = if control.owner() != self.owner {
+            Err("native process owner mismatch")
+        } else {
+            run_owned(
+                &self.profile,
+                &self.image,
+                &self.layout,
+                Command::Fixture(Fixture::VendorFreshStatus),
+                Input::Once(zeroize::Zeroizing::new(Vec::new())),
+                Fence::Admitted(control),
+                FixtureHooks::default(),
+            )
+        };
+        // run_owned returns only after never-created or physical settlement.
+        // A panic/uncertain wait cannot mint this receipt. Its exclusive borrow
+        // prevents another call/close on these resources until it is consumed.
+        SettledCall {
+            result,
+            _session: std::marker::PhantomData,
+        }
+    }
+    pub(super) fn close(self) -> Result<(), &'static str> {
+        drop(self.image);
+        self.profile.close()
+    }
+}
+/// Non-Clone, call-local evidence, not a transferable store-clean authority.
+/// There is intentionally no constructor or generic settlement-token export.
+#[cfg(feature = "native-fixtures")]
+pub(super) struct SettledCall<'a> {
+    result: Result<Output, &'static str>,
+    _session: std::marker::PhantomData<&'a mut FreshSession>,
+}
+#[cfg(feature = "native-fixtures")]
+impl SettledCall<'_> {
+    pub(super) fn into_output(self) -> Result<Output, &'static str> {
+        self.result
+    }
+}
 enum Input {
     Once(zeroize::Zeroizing<Vec<u8>>),
     Manual(crate::auth::InputReceiver),
@@ -379,9 +515,108 @@ pub(super) fn run_login_fixture(
         layout,
         Command::Fixture(fixture),
         Input::Manual(input),
-        cancelled,
-        Some(events),
+        Fence::Atomic(cancelled),
+        FixtureHooks {
+            events: Some(events),
+            ..FixtureHooks::default()
+        },
     )
+}
+/// Deliberately unwind only fixed synthetic child stages, and verify actual
+/// guard reap/join observations. No arbitrary panic/crash counts as success.
+#[cfg(feature = "native-fixtures")]
+pub(super) fn panic_controls(
+    profile: &Profile,
+    image: &HeldImage,
+    layout: &Layout,
+) -> Result<(), &'static str> {
+    for point in [PanicPoint::CreatedSuspended, PanicPoint::LiveBlockedWriter] {
+        let probe = Arc::new(PanicProbe {
+            point,
+            created: AtomicBool::new(false),
+            injected: AtomicBool::new(false),
+            reaped: AtomicBool::new(false),
+            writer_entered: AtomicBool::new(false),
+            writer_joined: AtomicBool::new(false),
+            writer_panicked: AtomicBool::new(false),
+        });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_owned(
+                profile,
+                image,
+                layout,
+                Command::Fixture(Fixture::CancelWait),
+                Input::Once(zeroize::Zeroizing::new(vec![b'x'; plan::MAX_STDIN_BYTES])),
+                Fence::Atomic(&AtomicBool::new(false)),
+                FixtureHooks {
+                    panic: Some(Arc::clone(&probe)),
+                    ..FixtureHooks::default()
+                },
+            )
+        }));
+        if !outcome
+            .err()
+            .is_some_and(|payload| panic_receipt(payload.as_ref(), &probe))
+        {
+            return Err("synthetic panic custody was not established");
+        }
+        super::diagnostic(
+            match point {
+                PanicPoint::CreatedSuspended => "panic-created-reaped",
+                PanicPoint::LiveBlockedWriter => "panic-writer-reaped-joined",
+            },
+            0,
+        );
+    }
+    Ok(())
+}
+#[cfg(feature = "native-fixtures")]
+fn panic_receipt(payload: &(dyn std::any::Any + Send), probe: &PanicProbe) -> bool {
+    payload.is::<FixturePanic>()
+        && probe.created.load(Ordering::Acquire)
+        && probe.injected.load(Ordering::Acquire)
+        && probe.reaped.load(Ordering::Acquire)
+        && !probe.writer_panicked.load(Ordering::Acquire)
+        && probe.writer_joined.load(Ordering::Acquire)
+            == (probe.point == PanicPoint::LiveBlockedWriter)
+        && probe.writer_entered.load(Ordering::Acquire)
+            == (probe.point == PanicPoint::LiveBlockedWriter)
+}
+#[cfg(all(test, feature = "native-fixtures"))]
+mod panic_receipt_tests {
+    use super::*;
+    fn observed(point: PanicPoint) -> PanicProbe {
+        let writer = point == PanicPoint::LiveBlockedWriter;
+        PanicProbe {
+            point,
+            created: AtomicBool::new(true),
+            injected: AtomicBool::new(true),
+            reaped: AtomicBool::new(true),
+            writer_entered: AtomicBool::new(writer),
+            writer_joined: AtomicBool::new(writer),
+            writer_panicked: AtomicBool::new(false),
+        }
+    }
+    #[test]
+    fn arbitrary_crash_or_missing_physical_observation_never_passes() {
+        for point in [PanicPoint::CreatedSuspended, PanicPoint::LiveBlockedWriter] {
+            let probe = observed(point);
+            assert!(panic_receipt(&FixturePanic, &probe));
+            assert!(!panic_receipt(&"other panic", &probe));
+            for bit in [
+                &probe.created,
+                &probe.injected,
+                &probe.reaped,
+                &probe.writer_entered,
+                &probe.writer_joined,
+                &probe.writer_panicked,
+            ] {
+                let original = bit.fetch_xor(true, Ordering::AcqRel);
+                assert!(!panic_receipt(&FixturePanic, &probe));
+                bit.store(original, Ordering::Release);
+            }
+        }
+    }
 }
 /// Blocking owning worker. It never returns while a native process/pipe writer is
 /// live, even if its caller cancels or its deadline expires. A disconnected UI
@@ -400,9 +635,14 @@ pub(super) fn run(
         layout,
         command,
         Input::Once(zeroize::Zeroizing::new(input)),
-        cancelled,
-        None,
+        Fence::Atomic(cancelled),
+        FixtureHooks::default(),
     )
+}
+#[derive(Default)]
+struct FixtureHooks {
+    events: Option<SyncSender<LoginFixtureEvent>>,
+    panic: Option<Arc<PanicProbe>>,
 }
 fn run_owned(
     profile: &Profile,
@@ -410,9 +650,13 @@ fn run_owned(
     layout: &Layout,
     command: Command,
     input: Input,
-    cancelled: &AtomicBool,
-    fixture_events: Option<SyncSender<LoginFixtureEvent>>,
+    control: Fence<'_>,
+    hooks: FixtureHooks,
 ) -> Result<Output, &'static str> {
+    let FixtureHooks {
+        events: fixture_events,
+        panic: panic_probe,
+    } = hooks;
     // Before creation/preparation, never after spawn.
     let started = Instant::now();
     // Retain independently of controller and stdin-writer lifetime. This lease
@@ -421,9 +665,11 @@ fn run_owned(
         Input::Manual(receiver) => Some(receiver.admission()),
         Input::Once(_) => None,
     };
-    let mut deadline = started
-        .checked_add(command.deadline())
-        .ok_or("deadline unavailable")?;
+    let mut deadline = control.bound(
+        started
+            .checked_add(command.deadline())
+            .ok_or("deadline unavailable")?,
+    );
     if let Input::Manual(receiver) = &input {
         deadline = deadline.min(receiver.deadline());
     }
@@ -452,7 +698,7 @@ fn run_owned(
     } else {
         None
     };
-    if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+    if control.cancelled(Instant::now()) || Instant::now() >= deadline {
         return Err("cancelled before creation");
     }
     let application = wide(image.path.as_os_str())?;
@@ -567,9 +813,11 @@ fn run_owned(
     startup.StartupInfo.hStdError = handle(&stderr_write);
     startup.lpAttributeList = attributes.list;
     let mut info = PROCESS_INFORMATION::default();
+    // Allocate before creation, so installing the physical guard cannot allocate.
+    let writer_finished = Arc::new(AtomicBool::new(false));
     // Security capability storage is live until process creation and token check.
     let create =
-        |capabilities: &SECURITY_CAPABILITIES| -> Result<(OwnedHandle, OwnedHandle), &'static str> {
+        |capabilities: &SECURITY_CAPABILITIES| -> Result<(ChildGuard<'_>, OwnedHandle), &'static str> {
             unsafe {
                 UpdateProcThreadAttribute(
                     attributes.list,
@@ -582,7 +830,7 @@ fn run_owned(
                 )
             }
             .map_err(|_| "LPAC capabilities unavailable")?;
-            if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+            if control.cancelled(Instant::now()) || Instant::now() >= deadline {
                 return Err("cancelled before creation");
             }
             let created = unsafe {
@@ -602,16 +850,22 @@ fn run_owned(
                     &mut info,
                 )
             };
-            // Attribute values must outlive the list, not only CreateProcessW.
-            // This FnOnce owns the list, so early returns also destroy it while
-            // the caller's capability SID arrays are still alive.
-            drop(attributes);
             created.map_err(|error| {
                 super::diagnostic("create-process", error.code().0);
                 "confined process creation failed"
             })?;
             let process = unsafe { OwnedHandle::from_raw_handle(info.hProcess.0) };
             let thread = unsafe { OwnedHandle::from_raw_handle(info.hThread.0) };
+            let process = ChildGuard {
+                process, job: &job, writer: None,
+                finished: Arc::clone(&writer_finished), panic_probe: panic_probe.clone(),
+            };
+            // Attribute values must outlive the list, not only CreateProcessW.
+            // This FnOnce owns the list; the physical guard is already installed
+            // before its destruction or any subsequent inspection can unwind.
+            drop(attributes);
+            if let Some(probe) = &panic_probe { probe.created.store(true, Ordering::Release); }
+            inject_panic(&panic_probe, PanicPoint::CreatedSuspended);
             #[cfg(feature = "native-fixtures")]
             if let Some(expect_lpac) = command.token_probe() {
                 let result = inspect_identity(handle(&process), capabilities).and_then(|token| {
@@ -637,7 +891,7 @@ fn run_owned(
     }?;
     #[cfg(not(feature = "native-fixtures"))]
     let created = profile.with_capabilities(create)?;
-    let (process, thread) = created;
+    let (mut process, thread) = created;
     #[cfg(feature = "native-fixtures")]
     if command.token_probe().is_some() {
         // Both actual-token controls die suspended. No vendor or synthetic child
@@ -664,7 +918,7 @@ fn run_owned(
             return Err("synthetic auth controller unavailable");
         }
     }
-    if cancelled.load(Ordering::Acquire)
+    if control.cancelled(Instant::now())
         || Instant::now() >= deadline
         || unsafe { ResumeThread(handle(&thread)) } == u32::MAX
     {
@@ -672,29 +926,36 @@ fn run_owned(
         return Err("cancelled or resume failed");
     }
     drop(thread);
-    let writer_finished = Arc::new(AtomicBool::new(false));
     let writer_signal = Arc::clone(&writer_finished);
-    let writer = match std::thread::Builder::new()
-        .name("claude-private-stdin".into())
-        .spawn(move || {
-            let mut file = File::from(stdin_write);
-            let result = match input {
-                Input::Once(mut input) => {
-                    let result = file.write_all(&input).is_ok();
-                    input.fill(0);
-                    result
+    let writer_probe = panic_probe.clone();
+    process.writer = Some(
+        match std::thread::Builder::new()
+            .name("claude-private-stdin".into())
+            .spawn(move || {
+                let mut file = File::from(stdin_write);
+                if let Some(probe) = writer_probe {
+                    probe.writer_entered.store(true, Ordering::Release);
                 }
-                Input::Manual(receiver) => receiver.write_one(&mut file, &writer_signal).is_ok(),
-            };
-            drop(file);
-            result
-        }) {
-        Ok(writer) => writer,
-        Err(_) => {
-            terminate_and_reap(&job, &process);
-            return Err("stdin writer unavailable");
-        }
-    };
+                let result = match input {
+                    Input::Once(mut input) => {
+                        let result = file.write_all(&input).is_ok();
+                        input.fill(0);
+                        result
+                    }
+                    Input::Manual(receiver) => {
+                        receiver.write_one(&mut file, &writer_signal).is_ok()
+                    }
+                };
+                drop(file);
+                result
+            }) {
+            Ok(writer) => writer,
+            Err(_) => {
+                terminate_and_reap(&job, &process);
+                return Err("stdin writer unavailable");
+            }
+        },
+    );
     let mut stdout = File::from(stdout_read);
     let mut stderr = File::from(stderr_read);
     let mut out = Vec::new();
@@ -705,7 +966,7 @@ fn run_owned(
     let mut stopped = None;
     let mut prompt_sent = false;
     loop {
-        if stopped.is_none() && (cancelled.load(Ordering::Acquire) || Instant::now() >= deadline) {
+        if stopped.is_none() && (control.cancelled(Instant::now()) || Instant::now() >= deadline) {
             stopped = Some("cancelled or deadline exceeded");
         }
         let previous_stdout = out.len();
@@ -728,6 +989,19 @@ fn run_owned(
                     stopped.get_or_insert(failure);
                 }
             }
+        }
+        if panic_probe.as_ref().is_some_and(|probe| {
+            probe.point == PanicPoint::LiveBlockedWriter
+                && out == b"ready"
+                && !out_closed
+                && !err_closed
+                && probe.writer_entered.load(Ordering::Acquire)
+                && process
+                    .writer
+                    .as_ref()
+                    .is_some_and(|writer| !writer.is_finished())
+        }) {
+            inject_panic(&panic_probe, PanicPoint::LiveBlockedWriter);
         }
         if stopped.is_none() {
             if let Some(decoder) = decoder.as_mut() {
@@ -776,7 +1050,7 @@ fn run_owned(
         std::thread::sleep(Duration::from_millis(5));
     }
     // No slot release until writer settlement; child-side handles are already gone.
-    if !writer.join().unwrap_or(false) {
+    if !process.join_writer() {
         stopped.get_or_insert("stdin interrupted");
     }
     let code = exit.ok_or("process exit unconfirmed")?;
@@ -803,7 +1077,7 @@ fn run_owned(
 // Even failed setup retains the held image/profile/job and process custody until
 // the kernel confirms exit. WAIT_FAILED is not a successful reap; no timeout
 // releases an uncertain process into a newly admitted account operation.
-fn terminate_and_reap(job: &Job, process: &OwnedHandle) {
+fn terminate_and_reap(job: &Job, process: &impl AsRawHandle) {
     loop {
         let _ = job.stop();
         if unsafe { WaitForSingleObject(handle(process), 50) } == WAIT_OBJECT_0 {

@@ -401,6 +401,18 @@ impl Context {
             .state
             .lock()
             .map_err(|_| "store handoff state unavailable")?;
+        super::super::diagnostic(
+            "store-image-integrity",
+            native::fixture_file_integrity(&image.file).unwrap_or(-1),
+        );
+        super::super::diagnostic(
+            "store-lock-integrity",
+            native::fixture_file_integrity(&lease.inner.lock).unwrap_or(-1),
+        );
+        super::super::diagnostic(
+            "store-parent-integrity",
+            native::fixture_process_integrity(unsafe { GetCurrentProcess() }).unwrap_or(-1),
+        );
         let bindings = Bindings([
             native::fixture_binding(root, true)
                 .map_err(|_| "store handoff root proof failed")?
@@ -739,6 +751,12 @@ fn run_child(
         }),
         settled: false,
     };
+    if let Some(handles) = &running.handles {
+        super::super::diagnostic(
+            "store-child-integrity",
+            native::fixture_process_integrity(handle(&handles.process)).unwrap_or(-1),
+        );
+    }
     drop(thread);
     drop(stdin);
     drop(stdout_write);

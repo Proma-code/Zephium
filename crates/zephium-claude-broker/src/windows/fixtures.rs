@@ -364,6 +364,7 @@ pub(crate) fn qualify() -> Result<(), &'static str> {
     {
         return Err("mid-run cancel did not observe exit and settle");
     }
+    process::panic_controls(&profile, &image, &layout)?;
     let stall = process::run(
         &profile,
         &image,
@@ -587,85 +588,29 @@ pub(crate) fn vendor_probe(source: &std::path::Path) -> Result<(), &'static str>
 // This is not a read of an existing account. A different, exclusively new
 // AppContainer and empty private layout are provisioned after help succeeds.
 fn fresh_empty_status(original: &HeldImage) -> Result<(), &'static str> {
-    use super::signature;
-    let suffix = format!(
-        "{}.{}.FreshStatus",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| "clock unavailable")?
-            .as_nanos()
-    );
-    let profile = Profile::create(&format!("Zephium.ClaudeFixture.{suffix}"))?;
-    let root = Root::create(
-        std::env::temp_dir().join(format!("Zephium.ClaudeFixture.{suffix}")),
-        &profile,
-    )?;
-    let layout = Layout::create(&root.0, &profile)?;
-    // Every credential/configuration search root supplied in the fresh process
-    // environment starts empty. No prior CLI child has run in this identity.
-    for path in [
-        &layout.config,
-        &layout.home,
-        &layout.appdata,
-        &layout.localappdata,
-        &layout.temporary,
-        &layout.work,
-    ] {
-        if std::fs::read_dir(path)
-            .map_err(|_| "fresh status empty-root proof failed")?
-            .next()
-            .is_some()
-        {
-            return Err("fresh status root was not empty; no status admitted");
-        }
-    }
-    let expected_directory = layout
-        .config
-        .to_str()
-        .ok_or("fresh status path not UTF-8")?;
-    let target = root.0.join("claude.exe");
-    profile.copy_image(&original.path, &target)?;
-    let image = HeldImage::open(&target, signature::CANDIDATE_SHA256)?;
-    signature::verify(&image)?;
-    let mut output = process::run(
-        &profile,
-        &image,
-        &layout,
-        Command::Fixture(Fixture::VendorFreshStatus),
-        Vec::new(),
-        &AtomicBool::new(false),
-    )?;
-    receipt("fresh-empty-status", &output);
-    let stdout = zeroize::Zeroizing::new(std::mem::take(&mut output.stdout));
-    let stderr = zeroize::Zeroizing::new(std::mem::take(&mut output.stderr));
-    if output.stopped.is_some() || !stderr.is_empty() {
-        return Err("fresh status did not settle cleanly");
-    }
-    let projects = layout.config.join("projects");
-    let expected_projects = projects
-        .to_str()
-        .ok_or("fresh status projects path not UTF-8")?;
-    if let Err(reason) =
-        crate::fresh_status::validate(&stdout, output.code, expected_directory, expected_projects)
+    use crate::account::{Reply, Request};
+    use crate::protocol::AuthStatus;
+    use std::time::Instant;
+    let (owner, mut port) = super::port::FreshStatusPort::create(original)?;
+    let work = owner
+        .begin(
+            owner
+                .scope()
+                .map_err(|_| "fresh status scope unavailable")?,
+            Request::ReadStatus,
+            Instant::now(),
+        )
+        .map_err(|_| "fresh status admission failed")?;
+    if work.run(&mut port, Instant::now) != Ok(Reply::Status(AuthStatus::SignedOut))
+        || !owner.drained()
+        || owner.view().status != Some(AuthStatus::SignedOut)
     {
-        super::diagnostic("fresh-status-rejected", reason as i32);
-        if let Some(facts) = crate::fresh_status::shape(&stdout, expected_projects) {
-            super::diagnostic("fresh-status-extra-keys", facts.extra_keys);
-            super::diagnostic("fresh-status-extra-nulls", facts.extra_nulls);
-            super::diagnostic("fresh-status-known-extra-shape", facts.known_extra);
-            super::diagnostic("fresh-status-identity-fields", facts.identity_fields);
-        }
-        return Err("fresh status was not an empty signed-out receipt");
+        return Err("fresh status owner did not settle signed out");
     }
-    // Raw status/stderr is never printed or retained. Generic JSON parsing can
-    // make temporary copies; this is not a claim of full process-memory erasure.
-    drop(stdout);
-    drop(stderr);
-    drop(image);
-    profile.close()?;
-    root.cleanup()?;
+    owner.close();
+    port.close()?;
     super::diagnostic("fresh-status-signed-out", 1);
+    super::diagnostic("fresh-status-owner-settled", 1);
     Ok(())
 }
 
