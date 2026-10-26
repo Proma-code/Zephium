@@ -10,6 +10,7 @@ mod agent_work;
 mod blocker;
 mod bookmarks;
 mod chats;
+mod codex_store;
 mod compatibility;
 mod deletion;
 mod downloads;

@@ -7,6 +7,7 @@ use ::windows::Win32::Storage::FileSystem::{
 use sha2::{Digest, Sha256};
 use std::{
     fs::OpenOptions,
+    io::Write,
     os::windows::fs::{MetadataExt, OpenOptionsExt},
     process::{Command, Stdio},
 };
@@ -22,6 +23,22 @@ pub(super) enum Mode {
     Truncated,
     Blocked,
     Tree,
+    #[cfg(feature = "native-fixtures")]
+    OwnerTwoTurns,
+    #[cfg(feature = "native-fixtures")]
+    OwnerColdRestore,
+    #[cfg(feature = "native-fixtures")]
+    OwnerCancel,
+    #[cfg(feature = "native-fixtures")]
+    OwnerInvalidate,
+    #[cfg(feature = "native-fixtures")]
+    OwnerCancelBeforeTurn,
+    #[cfg(feature = "native-fixtures")]
+    OwnerRevisionBeforeWrite,
+    #[cfg(feature = "native-fixtures")]
+    OwnerLostSettleAck,
+    #[cfg(feature = "native-fixtures")]
+    OwnerLostStartAck,
 }
 impl Mode {
     pub(super) fn args(self) -> &'static [&'static str] {
@@ -30,6 +47,22 @@ impl Mode {
             Self::Truncated => &["transport-child", "truncated"],
             Self::Blocked => &["transport-child", "blocked"],
             Self::Tree => &["transport-child", "tree"],
+            #[cfg(feature = "native-fixtures")]
+            Self::OwnerTwoTurns => &["transport-child", "owner-two-turns"],
+            #[cfg(feature = "native-fixtures")]
+            Self::OwnerColdRestore => &["transport-child", "owner-cold-restore"],
+            #[cfg(feature = "native-fixtures")]
+            Self::OwnerCancel => &["transport-child", "owner-cancel"],
+            #[cfg(feature = "native-fixtures")]
+            Self::OwnerInvalidate => &["transport-child", "owner-invalidate"],
+            #[cfg(feature = "native-fixtures")]
+            Self::OwnerCancelBeforeTurn => &["transport-child", "owner-cancel-before-turn"],
+            #[cfg(feature = "native-fixtures")]
+            Self::OwnerRevisionBeforeWrite => &["transport-child", "owner-revision-before-write"],
+            #[cfg(feature = "native-fixtures")]
+            Self::OwnerLostSettleAck => &["transport-child", "owner-lost-settle-ack"],
+            #[cfg(feature = "native-fixtures")]
+            Self::OwnerLostStartAck => &["transport-child", "owner-lost-start-ack"],
         }
     }
 }
@@ -139,7 +172,13 @@ impl FixtureImage {
 }
 
 fn fresh(mode: Mode) -> Result<(Session, Arc<RuntimePaths>), &'static str> {
-    let runtime = Arc::new(RuntimePaths::fresh()?);
+    fresh_runtime(mode, RuntimePaths::fresh()?)
+}
+fn fresh_runtime(
+    mode: Mode,
+    runtime: RuntimePaths,
+) -> Result<(Session, Arc<RuntimePaths>), &'static str> {
+    let runtime = Arc::new(runtime);
     let image = Arc::new(FixtureImage::copy_current(&runtime)?);
     let session = Session::spawn_image(Image::Fixture(image, mode), runtime.clone())
         .map_err(|_| "helper-spawn")?;
@@ -286,9 +325,42 @@ pub(crate) fn child(mode: &str) -> Result<(), &'static str> {
             let _ = child.wait().map_err(|_| "helper-child-wait")?;
         }
         "leaf" => std::thread::sleep(Duration::from_secs(60)),
+        #[cfg(feature = "native-fixtures")]
+        mode @ ("owner-cold-restore"
+        | "owner-two-turns"
+        | "owner-cancel"
+        | "owner-invalidate"
+        | "owner-cancel-before-turn"
+        | "owner-revision-before-write"
+        | "owner-lost-settle-ack"
+        | "owner-lost-start-ack") => {
+            let scenario =
+                crate::connection::fixture_peer::Scenario::parse(mode).ok_or("helper-mode")?;
+            crate::connection::fixture_peer::child(scenario)?;
+        }
         _ => return Err("helper-mode"),
     }
     Ok(())
+}
+
+#[cfg(feature = "native-fixtures")]
+pub(crate) fn owner_session(
+    scenario: crate::connection::fixture_peer::Scenario,
+) -> Result<(Session, Arc<RuntimePaths>), &'static str> {
+    use crate::connection::fixture_peer::Scenario;
+    fresh_runtime(
+        match scenario {
+            Scenario::TwoTurns => Mode::OwnerTwoTurns,
+            Scenario::ColdRestore => Mode::OwnerColdRestore,
+            Scenario::Cancel => Mode::OwnerCancel,
+            Scenario::Invalidate => Mode::OwnerInvalidate,
+            Scenario::CancelBeforeTurn => Mode::OwnerCancelBeforeTurn,
+            Scenario::RevisionBeforeWrite => Mode::OwnerRevisionBeforeWrite,
+            Scenario::LostSettleAck => Mode::OwnerLostSettleAck,
+            Scenario::LostStartAck => Mode::OwnerLostStartAck,
+        },
+        RuntimePaths::fresh_managed()?,
+    )
 }
 
 #[cfg(test)]

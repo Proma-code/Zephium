@@ -8,15 +8,20 @@ publish = false
 [features]
 # Credential-free native qualification only; no login or model request dispatcher.
 native-fixtures = []
+# Native trial actor only. No renderer or ordinary-product activation.
+trial-integration = []
 
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "=0.10.9"
+zephium-provider-accounts = { path = "../zephium-provider-accounts" }
 
 [target.'cfg(windows)'.dependencies]
+zephium-core = { path = "../zephium-core" }
 tempfile.workspace = true
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_IO", "Win32_System_SystemInformation"] }
+zephium-credentials = { path = "../zephium-credentials" }
+windows = { version = "0.61", features = ["Win32_Networking_WinHttp", "Win32_UI_Shell", "Win32_System_Com", "Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_IO", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
 toml = "=0.9.12"

@@ -402,6 +402,11 @@ enum Cmd {
         Sender<zephium_core::bookmarks::BookmarkReply>,
     ),
     ClearHistory(ProfileId, Option<i64>, Sender<Option<u32>>),
+    Codex(
+        ProfileId,
+        zephium_core::codex_store::Call,
+        Sender<zephium_core::codex_store::Reply>,
+    ),
     Chats(ProfileId, u32, Sender<Vec<ChatSummary>>),
     Chat(ProfileId, String, Sender<Option<String>>),
     SaveChat {
@@ -1445,6 +1450,33 @@ impl Store for SqliteStore {
         rx.recv_timeout(STORE_RPC_TIMEOUT).ok().flatten()
     }
 
+    fn codex_call(
+        &self,
+        profile: ProfileId,
+        call: zephium_core::codex_store::Call,
+    ) -> zephium_core::codex_store::Reply {
+        use zephium_core::codex_store::{Fault, Reply};
+        if !call.valid() {
+            return Reply::Failed(Fault::Invalid);
+        }
+        let lifecycle = self.lifecycle.read().unwrap_or_else(|p| p.into_inner());
+        if lifecycle.terminal_admitted || self.shutdown_clean.load(Ordering::Acquire) {
+            return Reply::Failed(Fault::Unavailable);
+        }
+        let mutates = call.mutates();
+        let (tx, rx) = mpsc::channel();
+        if self.tx.try_send(Cmd::Codex(profile, call, tx)).is_err() {
+            return Reply::Failed(Fault::Unavailable);
+        }
+        drop(lifecycle);
+        rx.recv_timeout(STORE_RPC_TIMEOUT)
+            .unwrap_or(Reply::Failed(if mutates {
+                Fault::OutcomeUnknown
+            } else {
+                Fault::Unavailable
+            }))
+    }
+
     fn chats(&self, profile: ProfileId, limit: u32) -> Vec<ChatSummary> {
         let limit = limit.min(MAX_CHATS as u32);
         if limit == 0 {
@@ -1978,6 +2010,16 @@ fn actor(
                     hub.clear_history_checked(profile, since)
                 } else {
                     None
+                };
+                let _ = reply.send(result);
+            }
+            Some(Cmd::Codex(profile, call, reply)) => {
+                let result = if hub.knows(profile) || flush(&mut hub, &mut pending) {
+                    hub.codex_call(profile, call)
+                } else {
+                    zephium_core::codex_store::Reply::Failed(
+                        zephium_core::codex_store::Fault::Unavailable,
+                    )
                 };
                 let _ = reply.send(result);
             }

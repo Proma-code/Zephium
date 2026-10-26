@@ -558,6 +558,8 @@ fn scrub_profile_database(path: &Path) -> rusqlite::Result<()> {
          DELETE FROM time_spent;
          DELETE FROM time_batch_receipts;
          DELETE FROM bookmarks;
+         DELETE FROM codex_conversations;
+         DELETE FROM codex_owner;
          DELETE FROM chats;
          DELETE FROM search_queries;
          DELETE FROM history;
@@ -700,6 +702,8 @@ mod tests {
             [PROFILE_SCRUB_MARKER],
         )
         .unwrap();
+        conn.execute("INSERT INTO codex_owner(singleton,schema_version,incarnation,grant_epoch) VALUES(1,1,?1,1)",[vec![7_u8;16]]).unwrap();
+        conn.execute("INSERT INTO codex_conversations(conversation,incarnation,grant_epoch,thread_id,revision,dispatch,reply,turn_id,outcome) VALUES('scrub-chat',?1,1,?2,2,1,2,NULL,NULL)",params![vec![7_u8;16],PROFILE_SCRUB_MARKER]).unwrap();
         conn.execute(
             "INSERT INTO blocker_statistics VALUES(1,?1)",
             [r#"{"day":700000,"days":[0,0,0,0,0,0,12]}"#],
@@ -736,6 +740,8 @@ mod tests {
             "blocker_statistics",
             "bookmarks",
             "chats",
+            "codex_conversations",
+            "codex_owner",
             "download_cleanup",
             "download_preferences",
             "downloads",
@@ -802,6 +808,8 @@ mod tests {
             "time_batch_receipts",
             "bookmarks",
             "chats",
+            "codex_conversations",
+            "codex_owner",
             "download_cleanup",
             "download_preferences",
             "downloads",

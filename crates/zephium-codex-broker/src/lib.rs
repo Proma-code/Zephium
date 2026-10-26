@@ -1,22 +1,48 @@
-//! Fixed original Codex app-server transport qualification for a Windows trial.
-//!
-//! The application/renderer has no process, login or turn constructor here yet.
-//! Pure protocol/config validation and explicitly selected credential-free
-//! fixtures are separate from any future user-authorized account integration.
+//! Original Codex app-server integration for the Windows subscription trial.
+//! Pure catalog/protocol reducers have no process or account authority. Native
+//! ownership is feature-gated and fixed to the reviewed original release;
+//! credential-free fixtures remain separate from explicit user login/turns.
 #![deny(unsafe_op_in_unsafe_fn)]
 
-#[cfg(any(test, all(windows, feature = "native-fixtures")))]
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
 mod config;
-#[cfg(any(test, all(windows, feature = "native-fixtures")))]
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
 mod pin;
-#[cfg(any(test, all(windows, feature = "native-fixtures")))]
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
 mod protocol;
 
-#[cfg(all(windows, feature = "native-fixtures"))]
+#[cfg(all(
+    windows,
+    any(feature = "native-fixtures", feature = "trial-integration")
+))]
 mod image;
-#[cfg(all(windows, feature = "native-fixtures"))]
+#[cfg(all(
+    windows,
+    any(feature = "native-fixtures", feature = "trial-integration")
+))]
 mod runtime;
-#[cfg(all(windows, feature = "native-fixtures"))]
+#[cfg(all(
+    windows,
+    any(feature = "native-fixtures", feature = "trial-integration")
+))]
 mod windows;
 
 /// Exact original standalone app-server release, not a mutable PATH lookup.
@@ -28,9 +54,15 @@ pub const IMAGE_SHA256: &str = "82314aa236834a8b7240cc5fe4fdf71d4502822e476105cc
 /// Exact original image byte count.
 pub const IMAGE_BYTES: u64 = 273_012_016;
 
-#[cfg(all(windows, feature = "native-fixtures"))]
+#[cfg(all(
+    windows,
+    any(feature = "native-fixtures", feature = "trial-integration")
+))]
 use image::PinnedImage;
-#[cfg(all(windows, feature = "native-fixtures"))]
+#[cfg(all(
+    windows,
+    any(feature = "native-fixtures", feature = "trial-integration")
+))]
 use runtime::RuntimePaths;
 
 #[cfg(all(test, not(windows)))]
@@ -40,7 +72,7 @@ mod framing;
 #[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
 mod qualification;
 #[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
-pub use qualification::qualify_original;
+pub use qualification::{qualify_compatibility, qualify_original};
 
 #[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
 pub fn qualify_transport() -> Result<(), &'static str> {
@@ -49,4 +81,100 @@ pub fn qualify_transport() -> Result<(), &'static str> {
 #[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
 pub fn fixture_child(mode: &str) -> Result<(), &'static str> {
     windows::fixtures::child(mode)
+}
+
+pub mod catalog;
+pub mod conversation;
+#[cfg(all(
+    windows,
+    any(feature = "native-fixtures", feature = "trial-integration")
+))]
+mod discovery;
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
+pub mod profile;
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
+mod text_policy;
+
+#[cfg(all(test, not(windows)))]
+#[path = "discovery/plan.rs"]
+mod discovery_plan;
+
+#[cfg(all(
+    windows,
+    any(feature = "native-fixtures", feature = "trial-integration")
+))]
+mod vault_probe;
+
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
+mod managed_account;
+
+#[cfg(all(
+    windows,
+    any(feature = "native-fixtures", feature = "trial-integration")
+))]
+pub mod connection;
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
+mod wire;
+
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
+mod compatibility;
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
+mod release_admission;
+
+#[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
+pub fn qualify_owner() -> Result<(), &'static str> {
+    connection::fixtures::qualify()
+}
+
+#[cfg(all(test, not(windows)))]
+#[path = "windows/write_fence.rs"]
+mod write_fence;
+
+#[cfg(all(
+    windows,
+    any(feature = "native-fixtures", feature = "trial-integration")
+))]
+mod release_fetch;
+
+#[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
+pub fn qualify_vault() -> Result<(), &'static str> {
+    vault_probe::verify()?;
+    println!("codex-vault-nonsecret-roundtrip: native-code=0");
+    Ok(())
 }

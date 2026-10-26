@@ -1,5 +1,7 @@
-//! Fresh credential-free runtime used only by the reviewed native qualifier.
-//! A durable application profile constructor is deliberately not exposed yet.
+//! Retained runtime paths for disposable qualification or a private trial profile.
+//! The exact lease/config/directory pins outlive every native process and writer.
+use crate::profile::native::ProfileLease;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     fs::{File, OpenOptions},
     io::Write,
@@ -11,6 +13,11 @@ use std::{
 };
 use tempfile::TempDir;
 
+enum Custody {
+    Temporary(TempDir),
+    Persistent(Box<ProfileLease>),
+}
+
 pub(crate) struct RuntimePaths {
     // Drop pins before TempDir cleanup. Session retains the whole RuntimePaths.
     _pins: Vec<File>,
@@ -20,7 +27,8 @@ pub(crate) struct RuntimePaths {
     appdata: PathBuf,
     localappdata: PathBuf,
     userprofile: PathBuf,
-    _root: TempDir,
+    _custody: Custody,
+    active: AtomicBool,
 }
 impl RuntimePaths {
     #[cfg(all(debug_assertions, feature = "native-fixtures"))]
@@ -29,6 +37,26 @@ impl RuntimePaths {
             .prefix("Zephium.CodexFixture.")
             .tempdir()
             .map_err(|_| "runtime-create")?;
+        Self::fresh_root(root, crate::config::CONFIG_TOML, Vec::new())
+    }
+    /// Disposable credential-free compatibility home under one validated local
+    /// native KnownFolder, never ambient TEMP/PATH or the retained account home.
+    pub(crate) fn fresh_managed() -> Result<Self, &'static str> {
+        let parent =
+            crate::discovery::known_folder(&windows::Win32::UI::Shell::FOLDERID_LocalAppData)
+                .map_err(|_| "probe-known-folder")?;
+        crate::image::resolution::local_drive(&parent).map_err(|_| "probe-local-drive")?;
+        let mut pins = Vec::new();
+        for path in parent.ancestors().collect::<Vec<_>>().into_iter().rev() {
+            pins.push(crate::image::pin_directory(path)?);
+        }
+        let root = tempfile::Builder::new()
+            .prefix("Zephium.CodexProbe.")
+            .tempdir_in(&parent)
+            .map_err(|_| "probe-create")?;
+        Self::fresh_root(root, &crate::compatibility::managed_config(), pins)
+    }
+    fn fresh_root(root: TempDir, config: &str, mut pins: Vec<File>) -> Result<Self, &'static str> {
         crate::image::require_absolute_local(root.path())?;
         let canonical_root = canonical_wire_path(root.path())?;
         let home = canonical_root.join("codex-home");
@@ -41,7 +69,7 @@ impl RuntimePaths {
             std::fs::create_dir(path).map_err(|_| "runtime-directory")?;
         }
         for (name, bytes) in [
-            ("config.toml", crate::config::CONFIG_TOML),
+            ("config.toml", config),
             ("environments.toml", crate::config::ENVIRONMENTS_TOML),
         ] {
             let mut file = OpenOptions::new()
@@ -53,7 +81,6 @@ impl RuntimePaths {
                 .map_err(|_| "runtime-config-write")?;
             file.sync_all().map_err(|_| "runtime-config-sync")?;
         }
-        let mut pins = Vec::new();
         for path in [
             canonical_root.as_path(),
             &home,
@@ -83,14 +110,54 @@ impl RuntimePaths {
             appdata,
             localappdata,
             userprofile,
-            _root: root,
+            _custody: Custody::Temporary(root),
+            active: AtomicBool::new(false),
         })
     }
-    #[cfg(all(debug_assertions, feature = "native-fixtures"))]
     pub(crate) fn close(self) -> Result<(), &'static str> {
-        let Self { _pins, _root, .. } = self;
+        let Self {
+            _pins, _custody, ..
+        } = self;
         drop(_pins);
-        _root.close().map_err(|_| "runtime-cleanup")
+        match _custody {
+            Custody::Temporary(root) => root.close().map_err(|_| "runtime-cleanup"),
+            Custody::Persistent(_) => Err("runtime-not-disposable"),
+        }
+    }
+    pub(crate) fn persistent(lease: ProfileLease) -> Result<Self, &'static str> {
+        let root = canonical_wire_path(&lease.root)?;
+        Ok(Self {
+            _pins: Vec::new(),
+            home: root.join("codex-home"),
+            cwd: root.join("work"),
+            temp: root.join("temp"),
+            appdata: root.join("appdata"),
+            localappdata: root.join("localappdata"),
+            userprofile: root.join("userprofile"),
+            _custody: Custody::Persistent(Box::new(lease)),
+            active: AtomicBool::new(false),
+        })
+    }
+    pub(crate) fn begin_connection(&self) -> Result<(), &'static str> {
+        // A failed DIRTY write deliberately leaves active=true: this exact runtime
+        // cannot be retried after uncertain I/O, even if no child was created.
+        self.active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "runtime-busy")?;
+        if let Custody::Persistent(lease) = &self._custody {
+            lease.dirty().map_err(|_| "runtime-dirty")?;
+        }
+        Ok(())
+    }
+    pub(crate) fn physically_settled(&self) -> Result<(), &'static str> {
+        if !self.active.load(Ordering::Acquire) {
+            return Err("runtime-not-active");
+        }
+        if let Custody::Persistent(lease) = &self._custody {
+            lease.physically_settled().map_err(|_| "runtime-clean")?;
+        }
+        self.active.store(false, Ordering::Release);
+        Ok(())
     }
     pub(crate) fn home(&self) -> &Path {
         &self.home

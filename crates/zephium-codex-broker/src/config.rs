@@ -396,6 +396,55 @@ pub fn validate_fixture_requirements(result: &Value) -> Result<(), ConfigReadbac
     Ok(())
 }
 
+#[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
+pub(crate) fn synthetic_readback(owned_config: &str) -> Value {
+    let mut config = fixed_layer_config();
+    config
+        .get_mut("features")
+        .and_then(Value::as_object_mut)
+        .expect("fixed features")
+        .remove("multi_env_copy_file");
+    let metadata = serde_json::json!({"name":{"type":"user","file":owned_config,"profile":null},"version":layer_version(&config)});
+    let mut user = metadata.clone();
+    user["config"] = config.clone();
+    let mut origins = serde_json::Map::new();
+    for path in CONFIG_REQUIRED_FALSE_PATHS
+        .iter()
+        .copied()
+        .chain(CONFIG_REQUIRED_STRING_PAIRS.iter().map(|(path, _)| *path))
+    {
+        if path == "/features/multi_env_copy_file" {
+            continue;
+        }
+        let key = if path == "/features/multi_agent_v2" {
+            "features.multi_agent_v2.enabled".to_owned()
+        } else {
+            path[1..].replace('/', ".")
+        };
+        origins.insert(key, metadata.clone());
+    }
+    serde_json::json!({"config":config,"layers":[user],"origins":origins})
+}
+#[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
+pub(crate) fn synthetic_requirements() -> Value {
+    let mut requirements = serde_json::Map::new();
+    for key in OWNED_LOGIN_NULL_REQUIREMENTS {
+        requirements.insert((*key).into(), Value::Null);
+    }
+    requirements.insert("allowedLoginMethods".into(), serde_json::json!(["chatgpt"]));
+    serde_json::json!({"requirements":requirements,"supportsIndependentSpeedModes":true})
+}
+
+#[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
+pub(crate) fn synthetic_features() -> Value {
+    let data: Vec<_> = CONFIG_REQUIRED_FALSE_PATHS
+        .iter()
+        .filter_map(|path| path.strip_prefix("/features/"))
+        .map(|name| serde_json::json!({"name":name,"enabled":false}))
+        .collect();
+    serde_json::json!({"data":data,"nextCursor":null})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,3 +830,6 @@ mod tests {
         );
     }
 }
+
+// Fixed synthetic peer only. These values carry no product policy authority;
+// the same real validators below the Connection handshake still check them.

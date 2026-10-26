@@ -5,6 +5,8 @@ on:
     branches: [windows/subscription-accounts]
     paths:
       - 'crates/zephium-codex-broker/**'
+      - 'crates/zephium-core/**'
+      - 'crates/zephium-store/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/windows-codex-broker.yml'
@@ -15,7 +17,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   codex_broker:
-    name: Exact original Codex CLI and app-server (no account or turn)
+    name: Original Codex runtime and managed ownership (no account or turn)
     if: github.repository == 'Proma-code/Zephium'
     runs-on: windows-2025
     timeout-minutes: 20
@@ -37,7 +39,25 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo clippy -p zephium-codex-broker --locked --features native-fixtures --all-targets -- -D warnings
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Canonical Store migration and continuity tests
+        run: |
+          cargo test -p zephium-store --locked --lib -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build debug-only credential-free qualifier
         run: cargo build -p zephium-codex-broker --locked --features native-fixtures --bin codex-broker-fixture
+      - name: Exact owned profile migration and image resolution negatives
+        run: |
+          $profile = @(cargo test -p zephium-codex-broker --locked --features native-fixtures,trial-integration --lib profile::native::tests:: -- --ignored --test-threads=1)
+          $code = $LASTEXITCODE
+          $profile | Write-Output
+          if ($code -ne 0) { exit $code }
+          if (@($profile | Where-Object { $_ -cmatch '^test result: ok\. 8 passed; 0 failed; 0 ignored;' }).Count -ne 1) { throw 'Expected all eight owned profile tests.' }
+          $image = @(cargo test -p zephium-codex-broker --locked --features native-fixtures,trial-integration --lib image::resolution::tests:: -- --ignored --test-threads=1)
+          $code = $LASTEXITCODE
+          $image | Write-Output
+          if ($code -ne 0) { exit $code }
+          if (@($image | Where-Object { $_ -cmatch '^test result: ok\. 2 passed; 0 failed; 0 ignored;' }).Count -ne 1) { throw 'Expected both owned image-resolution tests.' }
       - name: Original CLI and standalone startup/config/close (no login or model request)
         run: pwsh -NoProfile -File crates/zephium-codex-broker/qualify-windows.ps1
+      - name: Managed synthetic owner and original adjacent compatibility (no login or model request)
+        run: pwsh -NoProfile -File crates/zephium-codex-broker/qualify-managed-windows.ps1

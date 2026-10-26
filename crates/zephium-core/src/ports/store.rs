@@ -301,6 +301,17 @@ pub enum AppSettingReadback {
 }
 
 pub trait Store {
+    /// Exact native Codex continuity barrier. Implementations must acknowledge
+    /// writes only after durable commit; an indeterminate answer never permits
+    /// an external dispatch. Caller retains current account/profile authority.
+    fn codex_call(
+        &self,
+        _profile: ProfileId,
+        _call: crate::codex_store::Call,
+    ) -> crate::codex_store::Reply {
+        crate::codex_store::Reply::Failed(crate::codex_store::Fault::Unavailable)
+    }
+
     /// Dormant product Work authoring lane. The application selects the profile;
     /// Store independently rejects unregistered/private/deleting profiles.
     fn work_document(

@@ -1,29 +1,37 @@
-# Codex Windows transport qualification
+# Codex Windows connection
 
-This crate prepares an original Codex app-server connection for the Windows
-subscription trial. It does not yet enable an account connection or chat source.
-The intended product path is an existing compatible Codex CLI; the standalone
-app-server is a reference used to compare the same protocol in CI. Neither path
-modifies the user's ordinary Codex installation, configuration or login.
+This crate supplies the original Codex app-server connection for the Windows
+subscription trial. Product UI activation is separate. It uses an existing
+compatible Codex CLI and does not install a second copy, import another client's
+credentials, or change the user's ordinary Codex home.
 
-The current pin is OpenAI's `rust-v0.164.0`, source
-[`6aaac694803004a63c6f393d153c96d22521a6b9`](https://github.com/openai/codex/tree/6aaac694803004a63c6f393d153c96d22521a6b9).
-The two original Windows x64 image hashes and distinct fixed arguments are
-checked independently; a version string or a PATH lookup is not admission.
+The offline reference releases are OpenAI's `rust-v0.163.0` and `rust-v0.164.0`.
+Other detected images require fixed-origin official release metadata and a full
+held-file digest match, followed by a disposable, signed-out compatibility probe.
+A version, PATH entry, or cached release hint is not executable authority. Lookup
+is bounded; unsupported or unverified images are not run against account data.
+Runtime versions do not define the managed profile, keyring namespace or saved
+conversation identity.
 
-The debug-only native qualification uses a fresh disposable home and only:
+The credential-free Windows qualification checks:
 
-- initializes private stdio;
-- checks signed-out account state without requesting refresh;
-- checks the owned configuration and exact effective ChatGPT-only login restriction;
-- closes stdin and requires process exit zero and an empty owned job;
-- checks cancellation and four fixed synthetic transport failure cases.
+- the original CLI and standalone reference server's startup and owned policy;
+- signed-out account state without requesting refresh;
+- process exit zero, empty owned jobs and cancellation settlement;
+- synthetic transport and conversation transcripts, including cold thread resume;
+- owned profile creation, reopen and managed-policy migration;
+- a unique nonsecret OS credential-store round trip;
+- the shared startup policy against both original reference CLI releases.
 
-It never requests login, starts a conversation, sends a prompt, or runs a model.
-Raw native output and account/config values are not printed. Ordinary builds
-expose no process constructor. The fixture feature is not a product enablement.
+Original images in CI never request login, start a conversation, send a prompt,
+or run a model. Synthetic peer transcripts are labeled separately. Raw account,
+login and configuration payloads are not printed. The fixture feature is not a
+product enablement, and ordinary builds expose no process constructor.
 
-Successful startup does not establish login persistence, keyring writes,
-text-turn behavior, absence of ambient skill discovery, browser tools or Ultra
-support. Those are separate integration and user-validation steps. Existing API
-and direct Sign in with ChatGPT records are not converted into Codex credentials.
+The trial-only actor includes explicit original login/logout, catalog and text
+conversation operations, with durable native thread associations. This remains
+an integration milestone: startup and simulated transcripts do not establish
+real authenticated conversation continuity, browser tools, Ultra, or all future
+runtime compatibility. Existing API and direct Sign in with ChatGPT records are
+not converted into Codex credentials. Actual account access requires the user's
+separate official login.

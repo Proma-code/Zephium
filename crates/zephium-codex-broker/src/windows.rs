@@ -27,7 +27,7 @@ use ::windows::{
 use std::{
     ffi::{OsStr, OsString},
     fs::File,
-    io::{Read, Write},
+    io::Read,
     mem::{size_of, size_of_val},
     os::windows::{
         ffi::{OsStrExt, OsStringExt},
@@ -45,6 +45,8 @@ use std::{
 #[path = "windows/framing.rs"]
 mod framing;
 use framing::{Frames, MAX_FRAME_BYTES};
+mod write_fence;
+pub(crate) use write_fence::WriteFence;
 
 #[cfg(debug_assertions)]
 pub(crate) mod fixtures;
@@ -234,6 +236,8 @@ fn environment(runtime: &RuntimePaths) -> Result<Vec<u16>, Fault> {
 }
 
 struct WriteRequest {
+    deadline: Instant,
+    fence: Option<WriteFence>,
     bytes: Vec<u8>,
     completed: mpsc::SyncSender<bool>,
     #[cfg(debug_assertions)]
@@ -255,6 +259,7 @@ pub(crate) struct Session {
     stdout_bytes: u64,
     stderr_bytes: u64,
     settled: bool,
+    runtime_admitted: bool,
     #[cfg(debug_assertions)]
     observed_pending_write: bool,
 }
@@ -342,9 +347,15 @@ impl Session {
             stdout_bytes: 0,
             stderr_bytes: 0,
             settled: false,
+            runtime_admitted: false,
             #[cfg(debug_assertions)]
             observed_pending_write: false,
         };
+        session
+            ._runtime
+            .begin_connection()
+            .map_err(|_| Fault::Custody)?;
+        session.runtime_admitted = true;
         unsafe {
             CreateProcessW(
                 PCWSTR(application.as_ptr()),
@@ -402,10 +413,17 @@ impl Session {
                 .name("codex-stdin".into())
                 .spawn(move || {
                     let mut stdin = File::from(stdin_write);
-                    while let Ok(request) = receiver.recv() {
+                    while let Ok(mut request) = receiver.recv() {
                         #[cfg(debug_assertions)]
                         request.started.store(true, Ordering::Release);
-                        let ok = stdin.write_all(&request.bytes).is_ok() && stdin.flush().is_ok();
+                        let ok = write_fence::write_frame(
+                            &mut stdin,
+                            &request.bytes,
+                            request.fence.as_ref(),
+                            request.deadline,
+                        )
+                        .is_ok();
+                        request.bytes.fill(0);
                         let _ = request.completed.send(ok);
                         if !ok {
                             break;
@@ -431,6 +449,15 @@ impl Session {
         deadline: Instant,
         cancelled: &AtomicBool,
     ) -> Result<(), Fault> {
+        self.send_frame_fenced(bytes, deadline, cancelled, None)
+    }
+    pub(crate) fn send_frame_fenced(
+        &mut self,
+        bytes: &[u8],
+        deadline: Instant,
+        cancelled: &AtomicBool,
+        fence: Option<WriteFence>,
+    ) -> Result<(), Fault> {
         if bytes.is_empty()
             || bytes.len() > MAX_FRAME_BYTES
             || bytes.contains(&b'\n')
@@ -453,6 +480,8 @@ impl Session {
         };
         if stdin
             .try_send(WriteRequest {
+                deadline,
+                fence,
                 bytes: owned,
                 completed,
                 #[cfg(debug_assertions)]
@@ -502,6 +531,22 @@ impl Session {
             }
             std::thread::sleep(POLL);
         }
+    }
+
+    pub(crate) fn poll_frame(
+        &mut self,
+        deadline: Instant,
+        cancelled: &AtomicBool,
+    ) -> Result<Option<Vec<u8>>, Fault> {
+        self.check(deadline, cancelled)?;
+        self.drain()?;
+        if let Some(frame) = self.frames.pop() {
+            return Ok(Some(frame));
+        }
+        if self.stdout.is_none() {
+            return self.fail(Fault::UnexpectedExit);
+        }
+        Ok(None)
     }
 
     fn check(&mut self, deadline: Instant, cancelled: &AtomicBool) -> Result<(), Fault> {
@@ -602,6 +647,10 @@ impl Session {
         unsafe { GetExitCodeProcess(self.process_handle()?, &mut code) }
             .map_err(|_| Fault::Custody)?;
         self.settled = true;
+        self._runtime
+            .physically_settled()
+            .map_err(|_| Fault::Custody)?;
+        self.runtime_admitted = false;
         Ok(Exit {
             code,
             stdout_bytes: self.stdout_bytes,
@@ -630,6 +679,10 @@ impl Session {
         self.stdout.take();
         self.stderr.take();
         self.settled = true;
+        if self.runtime_admitted {
+            let _ = self._runtime.physically_settled();
+            self.runtime_admitted = false;
+        }
     }
 }
 impl Drop for Session {

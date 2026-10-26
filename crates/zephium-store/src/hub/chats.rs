@@ -93,6 +93,14 @@ impl Hub {
             )?
             .execute(params![id, space, title, updated_ms, body])?;
             tx.prepare_cached(
+                "DELETE FROM codex_conversations WHERE conversation IN (
+                     SELECT id FROM chats
+                     ORDER BY updated_ms DESC, id DESC
+                     LIMIT -1 OFFSET ?1
+                 )",
+            )?
+            .execute([MAX_CHATS as i64])?;
+            tx.prepare_cached(
                 "DELETE FROM chats WHERE id IN (
                      SELECT id FROM chats
                      ORDER BY updated_ms DESC, id DESC
@@ -117,8 +125,16 @@ impl Hub {
             return false;
         }
         let result = self.profile_conn(profile).and_then(|conn| {
-            conn.prepare_cached("DELETE FROM chats WHERE id = ?1")?
-                .execute([id])
+            let tx = conn.transaction()?;
+            tx.execute(
+                "DELETE FROM codex_conversations WHERE conversation = ?1",
+                [id],
+            )?;
+            let removed = tx
+                .prepare_cached("DELETE FROM chats WHERE id = ?1")?
+                .execute([id])?;
+            tx.commit()?;
+            Ok(removed)
         });
         match result {
             Ok(removed) => removed > 0,
@@ -135,12 +151,21 @@ impl Hub {
         if !self.chats_available(profile) {
             return 0;
         }
-        let result = self.profile_conn(profile).and_then(|conn| match since {
-            Some(since) => conn.execute(
-                "DELETE FROM chats WHERE updated_ms >= ?1",
-                [since.saturating_mul(1000)],
-            ),
-            None => conn.execute("DELETE FROM chats", []),
+        let result = self.profile_conn(profile).and_then(|conn| {
+            let tx = conn.transaction()?;
+            let removed = match since {
+                Some(since) => {
+                    let since = since.saturating_mul(1000);
+                    tx.execute("DELETE FROM codex_conversations WHERE conversation IN (SELECT id FROM chats WHERE updated_ms >= ?1)", [since])?;
+                    tx.execute("DELETE FROM chats WHERE updated_ms >= ?1", [since])?
+                },
+                None => {
+                    tx.execute("DELETE FROM codex_conversations", [])?;
+                    tx.execute("DELETE FROM chats", [])?
+                },
+            };
+            tx.commit()?;
+            Ok(removed)
         });
         match result {
             Ok(removed) => u32::try_from(removed).unwrap_or(u32::MAX),

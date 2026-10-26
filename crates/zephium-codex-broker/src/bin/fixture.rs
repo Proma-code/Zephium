@@ -5,6 +5,15 @@ fn main() {
         let mode = args.get(1).and_then(|value| value.to_str());
         let result = match (mode, args.len()) {
             (Some("transport"), 2) => zephium_codex_broker::qualify_transport(),
+            (Some("owner"), 2) => zephium_codex_broker::qualify_owner(),
+            (Some("vault"), 2) => zephium_codex_broker::qualify_vault(),
+            (Some("compatibility"), 4) => match args[2].to_str() {
+                Some(version) => zephium_codex_broker::qualify_compatibility(
+                    version,
+                    std::path::Path::new(&args[3]),
+                ),
+                None => Err("compatibility-version"),
+            },
             (Some("transport-child"), 3) => match args[2].to_str() {
                 Some(mode) => zephium_codex_broker::fixture_child(mode),
                 None => Err("helper-mode"),
