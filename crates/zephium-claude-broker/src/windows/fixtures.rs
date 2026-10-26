@@ -197,10 +197,27 @@ pub(crate) fn qualify() -> Result<(), &'static str> {
     for (stage, prefix) in [
         ("isolation-reached-files", b"isolation-files\n".as_slice()),
         ("isolation-reached-network", b"isolation-files\nisolation-network\n".as_slice()),
-        ("isolation-reached-child", b"isolation-files\nisolation-network\nisolation-child\n".as_slice()),
-        ("isolation-reached-environment", b"isolation-files\nisolation-network\nisolation-child\nisolation-environment\n".as_slice()),
-        ("isolation-reached-config", b"isolation-files\nisolation-network\nisolation-child\nisolation-environment\nisolation-config\n".as_slice()),
+        ("isolation-reached-child", b"isolation-files\nisolation-network\nisolation-address-parsed\nwinsock-startup=0\nisolation-connect\nisolation-child\n".as_slice()),
+        ("isolation-reached-environment", b"isolation-files\nisolation-network\nisolation-address-parsed\nwinsock-startup=0\nisolation-connect\nisolation-child\nisolation-environment\n".as_slice()),
+        ("isolation-reached-config", b"isolation-files\nisolation-network\nisolation-address-parsed\nwinsock-startup=0\nisolation-connect\nisolation-child\nisolation-environment\nisolation-config\n".as_slice()),
     ] { if output.stdout.starts_with(prefix) { super::diagnostic(stage, 0); } }
+    if let Some(rest) = output.stdout.strip_prefix(
+        b"isolation-files\nisolation-network\nisolation-address-parsed\nwinsock-startup=",
+    ) {
+        if let Some(line) = rest
+            .split(|byte| *byte == b'\n')
+            .next()
+            .filter(|line| line.len() <= 11)
+        {
+            if let Ok(text) = std::str::from_utf8(line) {
+                if let Ok(code) = text.parse::<i32>() {
+                    if code.to_string() == text {
+                        super::diagnostic("synthetic-winsock-startup", code);
+                    }
+                }
+            }
+        }
+    }
     match output.stderr.as_slice() {
         b"fixture-panic=network-runtime\n" => {
             super::diagnostic("synthetic-panic-network-runtime", 101)
@@ -213,7 +230,7 @@ pub(crate) fn qualify() -> Result<(), &'static str> {
     }
     if output.code != 0
         || output.stopped.is_some()
-        || output.stdout != b"isolation-files\nisolation-network\nisolation-child\nisolation-environment\nisolation-config\nisolation-ok"
+        || output.stdout != b"isolation-files\nisolation-network\nisolation-address-parsed\nwinsock-startup=0\nisolation-connect\nisolation-child\nisolation-environment\nisolation-config\nisolation-ok"
         || !output.stderr.is_empty()
     {
         return Err("ACL, child or loopback denial fixture failed");

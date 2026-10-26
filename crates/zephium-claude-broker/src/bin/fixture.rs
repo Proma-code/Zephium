@@ -22,6 +22,8 @@ fn main() {
         let marker: &[u8] = if text.contains("WSAStartup")
             || text.contains("WinSock")
             || text.contains("Winsock")
+            || file.ends_with("/winsock.rs")
+            || file.ends_with("\\winsock.rs")
             || file.contains("/sys/net/")
             || file.contains("\\sys\\net\\")
         {
@@ -230,9 +232,58 @@ fn child(mode: &str) -> Result<(), &'static str> {
             let address = path("loopback")?
                 .parse()
                 .map_err(|_| "fixture address invalid")?;
-            if std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(500))
-                .is_ok()
-            {
+            std::io::stdout()
+                .write_all(b"isolation-address-parsed\n")
+                .map_err(|_| "isolation marker failed")?;
+            use windows::Win32::Networking::WinSock::{WSACleanup, WSAStartup, WSADATA};
+            struct Winsock(bool);
+            impl Winsock {
+                fn finish(mut self) -> Result<(), &'static str> {
+                    self.0 = false;
+                    if unsafe { WSACleanup() } != 0 {
+                        return Err("synthetic Winsock cleanup failed");
+                    }
+                    Ok(())
+                }
+            }
+            impl Drop for Winsock {
+                fn drop(&mut self) {
+                    if self.0 {
+                        unsafe {
+                            WSACleanup();
+                        }
+                    }
+                }
+            }
+            let mut data = WSADATA::default();
+            let code = unsafe { WSAStartup(0x0202, &mut data) };
+            let winsock = (code == 0).then(|| Winsock(true));
+            std::io::stdout()
+                .write_all(format!("winsock-startup={code}\n").as_bytes())
+                .map_err(|_| "Winsock marker failed")?;
+            std::io::stdout()
+                .flush()
+                .map_err(|_| "Winsock marker flush failed")?;
+            if code != 0 {
+                return Err("synthetic Winsock initialization failed");
+            }
+            let winsock = winsock.ok_or("synthetic Winsock initialization failed")?;
+            if data.wVersion != 0x0202 {
+                return Err("synthetic Winsock version mismatch");
+            }
+            std::io::stdout()
+                .write_all(b"isolation-connect\n")
+                .map_err(|_| "isolation marker failed")?;
+            std::io::stdout()
+                .flush()
+                .map_err(|_| "isolation marker flush failed")?;
+            let connected = std::net::TcpStream::connect_timeout(
+                &address,
+                std::time::Duration::from_millis(500),
+            )
+            .is_ok();
+            winsock.finish()?;
+            if connected {
                 return Err("loopback access succeeded");
             }
             std::io::stdout()
