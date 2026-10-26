@@ -5,8 +5,11 @@ import {
   dollars,
   effortLevels,
   hasChatGptModels,
+  hasGatewayModels,
+  connectionName,
   locked,
   modelName,
+  modelConnection,
   pickerGroups,
   priceTier,
   searchEntries,
@@ -73,7 +76,7 @@ describe("the picker's list", () => {
   test("the trigger drops a family name the mark already says", () => {
     const opus: WorkModelEntry = entry("anthropic", "claude-opus-5-5", "Claude Opus 5.5", true);
     expect(shortName(opus)).toBe("Opus 5.5");
-    expect(shortName(entry("open_ai", "gpt-6-sol", "GPT-6 Sol", true))).toBe("GPT-6 Sol · API");
+    expect(shortName(entry("open_ai", "gpt-6-sol", "GPT-6 Sol", true))).toBe("GPT-6 Sol");
   });
 });
 
@@ -117,7 +120,7 @@ describe("the picker's details", () => {
 
 describe("ChatGPT account models", () => {
   const chatgpt = () =>
-    entry("open_ai", "gpt-example", "GPT Example · ChatGPT", false, ["lead", "page"], {
+    entry("open_ai", "gpt-example", "GPT Example", false, ["lead", "page"], {
       id: "chatgpt/gpt-example",
       price: null,
     });
@@ -167,15 +170,15 @@ describe("ChatGPT account models", () => {
   });
 });
 
-test("OpenAI billing labels distinguish identical models without mutating native identities", () => {
+test("OpenAI names stay clean while connection metadata distinguishes identical native models", () => {
   const api = entry("open_ai", "gpt-example", "GPT Example", false);
   const subscription = { ...api, id: "chatgpt/gpt-example" };
-  expect(modelName(api)).toBe("GPT Example · API");
-  expect(modelName(subscription)).toBe("GPT Example · ChatGPT");
-  expect(modelName({ ...subscription, display_name: "GPT Example · ChatGPT" })).toBe(
-    "GPT Example · ChatGPT",
-  );
-  expect(modelName({ ...api, display_name: "GPT Example · API" })).toBe("GPT Example · API");
+  expect(modelName(api)).toBe("GPT Example");
+  expect(modelConnection(api)).toBe("api");
+  expect(modelConnection(subscription)).toBe("chatgpt");
+  expect(modelName(subscription)).toBe("GPT Example");
+  expect(modelName({ ...subscription, display_name: "GPT Example · ChatGPT" })).toBe("GPT Example");
+  expect(modelName({ ...api, display_name: "GPT Example · API" })).toBe("GPT Example");
   expect(api.display_name).toBe("GPT Example");
   expect(api.id).toBe("openai/gpt-example");
   const view = models({ keys: { open_ai: "valid" } });
@@ -183,4 +186,57 @@ test("OpenAI billing labels distinguish identical models without mutating native
   const groups = pickerGroups(view, "lead");
   expect(searchEntries(groups.ready, "gpt example api")).toEqual([api]);
   expect(searchEntries(groups.ready, "gpt example chatgpt")).toEqual([subscription]);
+});
+
+describe("local gateway catalog sources", () => {
+  const gateway = () =>
+    entry("compatible", "same-model", "Same model", false, ["lead", "page", "light"], {
+      id: `gateway/${"a".repeat(32)}/same-model`,
+      price: null,
+    });
+  test("only native checked gateway models are usable without enabling a legacy endpoint", () => {
+    const view = models({});
+    view.entries.push(gateway());
+    expect(hasGatewayModels(view)).toBe(true);
+    expect(usable(view, "compatible")).toBe(false);
+    expect(
+      pickerGroups(view, "page").ready.find((group) => group.provider === "compatible")?.entries,
+    ).toEqual([gateway()]);
+    expect(modelConnection(gateway())).toBe("gateway");
+    expect(connectionName("gateway")).toBe("Local gateway");
+    expect(priceTier(gateway().price)).toBeNull();
+    expect(modelName(gateway())).toBe("Same model");
+  });
+  test("endpoint discovery cannot fabricate gateway access, even when endpoint BYOK is usable", () => {
+    for (const base of [undefined, "http://localhost:11434/v1"]) {
+      const view = models({ base });
+      expect(hasGatewayModels(view)).toBe(false);
+      expect(
+        pickerGroups(view, "lead", [gateway()]).ready.flatMap((group) => group.entries),
+      ).not.toContainEqual(gateway());
+    }
+  });
+  test("independent endpoint model survives gateway disconnection and names need no source suffix", () => {
+    const endpoint = entry("compatible", "same-model", "Same model", false);
+    const view = models({ base: "http://localhost:11434/v1" });
+    view.entries.push(gateway());
+    expect(
+      pickerGroups(view, "lead", [endpoint]).ready.find((group) => group.provider === "compatible")
+        ?.entries,
+    ).toEqual([gateway(), endpoint]);
+    view.chosen.page = gateway().id;
+    view.entries = view.entries.filter((row) => !row.id.startsWith("gateway/"));
+    expect(
+      pickerGroups(view, "page", [endpoint]).ready.find((group) => group.provider === "compatible")
+        ?.entries,
+    ).toEqual([endpoint]);
+    expect(view.chosen.page).toBe(gateway().id);
+    expect(modelConnection(endpoint)).toBe("endpoint");
+  });
+  test("malformed gateway identities are not admitted merely because their provider is compatible", () => {
+    const view = models({ base: "http://localhost:11434/v1" });
+    view.entries.push({ ...gateway(), id: "gateway/not-a-native-connection/model" });
+    expect(hasGatewayModels(view)).toBe(false);
+    expect(pickerGroups(view, "lead").ready).toEqual([]);
+  });
 });

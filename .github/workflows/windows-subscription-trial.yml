@@ -40,24 +40,45 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Isolation contract and build guard tests
         run: |
+          ./scripts/test-windows-trial-staging.ps1
           node --test scripts/windows-trial.test.mjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked --manifest-path desktop/windows-trial-config-tests/Cargo.toml
       - name: Frame type checks, lint and unit tests
         run: pnpm --dir frame run check
-      - name: Frame style contract
-        run: pnpm --dir frame run check:styles
+      - name: Install pinned browser for component behavior tests
+        run: pnpm --dir frame exec playwright install chromium
+      - name: Real Chromium account and picker component regressions
+        run: >-
+          pnpm --dir frame run test:component
+          src/features/settings/tests/AiSubscriptions.component.test.ts
+          src/features/settings/tests/ChatGptAccount.component.test.ts
+          src/features/settings/tests/LocalGateway.component.test.ts
+          src/features/settings/tests/AiPage.component.test.ts
+          src/features/work/tests/ModelPicker.component.test.ts
+          src/shared/ui/Select/tests/Select.component.test.ts
+      - name: Build frame and verify emitted style contract
+        run: |
+          pnpm --dir frame run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm --dir frame run check:styles
       - name: Native account protocol and trial Credential Manager tests
-        run: cargo test -p zephium-chatgpt -p zephium-provider-accounts -p zephium-credentials --locked --features zephium-credentials/windows-subscription-trial
+        run: cargo test -p zephium-chatgpt -p zephium-gateway -p zephium-provider-accounts -p zephium-credentials --locked --features zephium-credentials/windows-subscription-trial
       - name: Subscription routing, accounting and profile-erasure journal regressions
         run: |
           cargo test -p zephium-app --features work-runtime,work-execution --locked work_models::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p zephium-app --features work-runtime,work-execution --locked work_lead::source_guard::tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p zephium-app --features work-runtime,work-execution --locked work_lead::call::tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p zephium-app --features work-runtime,work-execution --locked profile_deletion
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p zephium-ipc --locked chatgpt::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p zephium-ipc --locked local_gateway::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p zephium-agentic --features provider-transport --locked local_gateway::tests
       - name: Protected native trial identity test (no user profile)
         run: cargo test -p zephium-private-fs --lib --locked subscription_trial_has_a_distinct_closed_native_storage_component
       - name: Compile and lint the Windows trial including test targets

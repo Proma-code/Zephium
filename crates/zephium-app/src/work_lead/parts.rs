@@ -205,6 +205,8 @@ pub(crate) struct PartReport {
     pub need: Option<WorkPartNeedV1>,
     /// Its helper read what its pages gave and reported nothing usable.
     pub judged_empty: bool,
+    /// This run's selected source failed; another helper must not retry it.
+    pub terminal_model_failure: bool,
 }
 impl PartReport {
     fn ended(state: WorkPartStateV1, digest: &str, objects: Vec<WorkArtifactId>) -> Self {
@@ -215,8 +217,39 @@ impl PartReport {
             objects,
             need: None,
             judged_empty: false,
+            terminal_model_failure: false,
         }
     }
+}
+
+fn terminal_model_report(failure: CallFailure, objects: Vec<WorkArtifactId>) -> Option<PartReport> {
+    let (error, unknown) = match failure {
+        CallFailure::Refused(
+            error @ (WorkModelError::Gateway { .. } | WorkModelError::ChatGpt { .. }),
+        ) => (error, false),
+        CallFailure::ChatGptUnknownOutcome { fault, .. } => {
+            (WorkModelError::ChatGpt { fault }, true)
+        }
+        CallFailure::GatewayUsageUnknown { fault, .. } => (
+            WorkModelError::Gateway {
+                fault,
+                usage_unknown: true,
+            },
+            true,
+        ),
+        _ => return None,
+    };
+    let mut report = PartReport::ended(
+        WorkPartStateV1::Failed,
+        super::lead::model_stop(error),
+        objects,
+    );
+    report.terminal_model_failure = true;
+    if unknown {
+        report.digest.push_str(" Usage is unknown; a conservative local reservation is retained, not a confirmed charge.");
+    }
+    report.digest.push_str(" This run's model connection is stopped. Do not repeat this helper, reassign its request, or switch to another billing source; the person must start a new run after checking the connection.");
+    Some(report)
 }
 
 /// The digest with the commit lines the helper's own words left out.
@@ -583,7 +616,10 @@ where
         {
             if let Some((id, count)) = self.place_found(fact.id, &spec).await {
                 report.objects.push(id);
-                if report.state == WorkPartStateV1::Failed && report.need.is_none() {
+                if report.state == WorkPartStateV1::Failed
+                    && report.need.is_none()
+                    && !report.terminal_model_failure
+                {
                     report.state = WorkPartStateV1::Done;
                     report.summary = Some(format!("{count} found"));
                 }
@@ -697,7 +733,10 @@ where
             &site,
             report.objects.is_empty(),
             report.state == WorkPartStateV1::Failed,
-            public_retry && public_source_retry(&spec) && !self.run.browser_down(),
+            public_retry
+                && !report.terminal_model_failure
+                && public_source_retry(&spec)
+                && !self.run.browser_down(),
         ) {
             out.push_str(&format!(
                 "Before you settle for nothing from {site}: search the web once for what the part looked for there, and read the one to three best {site} pages the search lists; a product or listing page often reads where the site's search did not.\n"
@@ -1136,6 +1175,9 @@ where
                         model.entry.model.provider,
                     )
                     .await;
+                    if let Some(report) = terminal_model_report(failure, placed.clone()) {
+                        return report;
+                    }
                     let mut report = PartReport::ended(
                         WorkPartStateV1::Failed,
                         "The helper's model could not be reached.",
@@ -1361,6 +1403,7 @@ where
                     summary: Some(summary),
                     digest: with_committed(clip(&digest, 3_000), &committed),
                     judged_empty: !found,
+                    terminal_model_failure: false,
                     objects: placed,
                     need,
                 };
@@ -1384,6 +1427,7 @@ where
             objects: placed,
             need: None,
             judged_empty: false,
+            terminal_model_failure: false,
         }
     }
 
@@ -1606,6 +1650,11 @@ where
     /// what its steps show. A web part for a service the person has a
     /// connection for offers the connection.
     async fn settle_need(&self, part: WorkPartId, spec: &PartSpec, report: &mut PartReport) {
+        if report.terminal_model_failure {
+            // A model-source refusal is not a site failure or sign-in prompt.
+            // Do not rewrite it into Retry, a different connection or billing route.
+            return;
+        }
         let projection = self.run.probe.runtime_projection().await.ok();
         let execution = projection.as_ref().and_then(|projection| {
             projection
@@ -2570,6 +2619,28 @@ fn note_reason(note: Option<&str>, search: bool) -> Option<WorkPartReasonV1> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_failure_is_not_a_site_retry_or_account_switch() {
+        for error in [
+            WorkModelError::ChatGpt {
+                fault: ChatGptModelFault::UsageLimit,
+            },
+            WorkModelError::Gateway {
+                fault: GatewayModelFault::UsageUnavailable,
+                usage_unknown: true,
+            },
+        ] {
+            let report = terminal_model_report(CallFailure::Refused(error), vec![]).unwrap();
+            assert_eq!(report.state, WorkPartStateV1::Failed);
+            assert_eq!(report.need, None);
+            assert!(report.terminal_model_failure);
+            assert!(report.digest.contains("Do not repeat"));
+        }
+        assert!(
+            terminal_model_report(CallFailure::Refused(WorkModelError::Network), vec![]).is_none()
+        );
+    }
 
     #[test]
     fn a_digest_states_every_commit_the_helper_left_out() {

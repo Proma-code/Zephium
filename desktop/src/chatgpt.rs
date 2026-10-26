@@ -22,9 +22,38 @@ mod live {
         app: tauri::AppHandle,
         services: Mutex<HashMap<ProfileId, Arc<Service>>>,
         foreground: std::sync::RwLock<Option<String>>,
+        scope_epoch: std::sync::atomic::AtomicU64,
     }
 
     impl Registry {
+        // Read identity and epoch under one foreground lock so an A→B→A
+        // transition cannot revive a command awaiting the actor profile view.
+        fn capture_scope(&self, expected: &str) -> Option<u64> {
+            let current = self.foreground.read().ok()?;
+            (current.as_deref() == Some(expected))
+                .then(|| self.scope_epoch.load(std::sync::atomic::Ordering::Acquire))
+        }
+        fn owns_scope(&self, expected: &str, epoch: u64) -> bool {
+            self.capture_scope(expected) == Some(epoch)
+        }
+
+        // Check the registry epoch and capture the service generation under the
+        // same profile read lock. A concurrent away/back transition cannot pass
+        // an old IPC request a newly current service authority.
+        fn admit_scope(
+            &self,
+            expected: &str,
+            epoch: u64,
+            service: &Service,
+        ) -> Option<zephium_chatgpt::service::Scope> {
+            let current = self.foreground.read().ok()?;
+            if current.as_deref() != Some(expected)
+                || self.scope_epoch.load(std::sync::atomic::Ordering::Acquire) != epoch
+            {
+                return None;
+            }
+            service.scope().ok()
+        }
         fn get(&self, profile: ProfileId) -> Option<Arc<Service>> {
             self.services.lock().ok()?.get(&profile).cloned()
         }
@@ -91,6 +120,9 @@ mod live {
         service: Arc<Service>,
         model: String,
         lease: zephium_chatgpt::service::Lease,
+        /// One Work run owns this client. A failed or dropped call is never
+        /// replayed by model-driven helper reassignment within that run.
+        terminal: tokio::sync::Mutex<Option<WorkModelError>>,
     }
     impl WorkModelClient for AccountModelClient {
         fn call<'a>(
@@ -103,9 +135,28 @@ mod live {
                     || request.model.wire != WorkModelWire::OpenAiResponses
                     || request.model.model != self.model
                 {
-                    return Err(WorkModelError::BadRequest);
+                    return Err(WorkModelError::ChatGpt {
+                        fault: ChatGptModelFault::Unsupported,
+                    });
                 }
-                self.service.call(self.lease, request, events).await
+                let mut terminal = self.terminal.lock().await;
+                if let Some(error) = *terminal {
+                    return Err(error);
+                }
+                // Set before dispatch, not only on return: dropping this future
+                // must not reopen the same run's client for a second request.
+                *terminal = Some(WorkModelError::ChatGpt {
+                    fault: ChatGptModelFault::Unavailable,
+                });
+                let result = self.service.call(self.lease, request, events).await;
+                *terminal = match &result {
+                    Ok(_) => None,
+                    Err(error @ WorkModelError::ChatGpt { .. }) => Some(*error),
+                    Err(_) => Some(WorkModelError::ChatGpt {
+                        fault: ChatGptModelFault::Unavailable,
+                    }),
+                };
+                result
             })
         }
     }
@@ -150,6 +201,7 @@ mod live {
                 service,
                 model: model.into(),
                 lease,
+                terminal: tokio::sync::Mutex::new(None),
             }))
         }
     }
@@ -160,6 +212,7 @@ mod live {
                 app: app.clone(),
                 services: Mutex::new(HashMap::new()),
                 foreground: std::sync::RwLock::new(None),
+                scope_epoch: std::sync::atomic::AtomicU64::new(0),
             })
         });
         zephium_app::work_models::install_chatgpt_session(registry.clone());
@@ -176,7 +229,12 @@ mod live {
                 return;
             };
             if let Ok(mut foreground) = registry.foreground.write() {
-                *foreground = current.clone();
+                if *foreground != current {
+                    registry
+                        .scope_epoch
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    *foreground = current.clone();
+                }
             }
             for (id, service) in services.iter() {
                 let present = view.profiles.iter().any(|entry| {
@@ -347,18 +405,16 @@ mod live {
         action: ChatGptCommand,
         attempt: Option<String>,
     ) -> ChatGptViewV1 {
-        let Some(profile) = allowed(&caller, &expected, action).await else {
-            return ChatGptViewV1::unavailable(expected);
-        };
         let Some(registry) = REGISTRY.get() else {
             return ChatGptViewV1::unavailable(expected);
         };
-        if registry
-            .foreground
-            .read()
-            .ok()
-            .is_none_or(|current| current.as_deref() != Some(expected.as_str()))
-        {
+        let Some(scope_epoch) = registry.capture_scope(&expected) else {
+            return ChatGptViewV1::unavailable(expected);
+        };
+        let Some(profile) = allowed(&caller, &expected, action).await else {
+            return ChatGptViewV1::unavailable(expected);
+        };
+        if !registry.owns_scope(&expected, scope_epoch) {
             return ChatGptViewV1::unavailable(expected);
         }
         let service = match registry.service(profile, true) {
@@ -369,8 +425,11 @@ mod live {
                 return view;
             }
         };
+        let Some(service_scope) = registry.admit_scope(&expected, scope_epoch, &service) else {
+            return ChatGptViewV1::unavailable(expected);
+        };
         let result = match action {
-            ChatGptCommand::Account => service.load().await,
+            ChatGptCommand::Account => service.load_scoped(service_scope).await,
             ChatGptCommand::SignIn => {
                 match attempt.filter(|id| zephium_chatgpt::service::valid_attempt(id)) {
                     Some(attempt) => {
@@ -378,7 +437,9 @@ mod live {
                         let weak = Arc::downgrade(&service);
                         let expected = attempt.clone();
                         service
-                            .sign_in(attempt, move |url| open_browser(app, weak, expected, url))
+                            .sign_in_scoped(service_scope, attempt, move |url| {
+                                open_browser(app, weak, expected, url)
+                            })
                             .await
                     }
                     None => Err(Fault::Invalid),
@@ -386,22 +447,14 @@ mod live {
             }
             ChatGptCommand::Cancel => {
                 match attempt.filter(|id| zephium_chatgpt::service::valid_attempt(id)) {
-                    Some(attempt) => {
-                        service.cancel(&attempt).await;
-                        Ok(())
-                    }
+                    Some(attempt) => service.cancel_scoped(service_scope, &attempt).await,
                     None => Err(Fault::Invalid),
                 }
             }
-            ChatGptCommand::SignOut => service.sign_out().await,
-            ChatGptCommand::RefreshModels => service.refresh_models().await,
+            ChatGptCommand::SignOut => service.sign_out_scoped(service_scope).await,
+            ChatGptCommand::RefreshModels => service.refresh_models_scoped(service_scope).await,
         };
-        if registry
-            .foreground
-            .read()
-            .ok()
-            .is_none_or(|current| current.as_deref() != Some(expected.as_str()))
-        {
+        if !registry.owns_scope(&expected, scope_epoch) {
             return ChatGptViewV1::unavailable(expected);
         }
         view(expected, &service, result.err())

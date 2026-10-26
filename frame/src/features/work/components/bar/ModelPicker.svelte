@@ -13,8 +13,11 @@
     keyState,
     keyedProviders,
     hasChatGptModels,
+    hasGatewayModels,
+    connectionName,
     locked,
     modelName,
+    modelConnection,
     pickerGroups,
     providerName,
     requiredPlan,
@@ -81,6 +84,7 @@
   const current = $derived(entryOf(models, models?.effective[role]));
   const chosen = $derived(models?.effective[role] ?? null);
   const savedAccountChoice = $derived(models?.chosen[role]?.startsWith("chatgpt/") ?? false);
+  const savedGatewayChoice = $derived(models?.chosen[role]?.startsWith("gateway/") ?? false);
   const groups = $derived(pickerGroups(models, role, session?.endpoint ?? []));
   const tierOf = $derived(tiers(groups.ready));
 
@@ -105,7 +109,11 @@
           own.push({ provider, standing: "ready" });
         else if (account?.available && account.hosted_models === true)
           own.push({ provider, standing: "sign_in" });
-      } else if (usable(models, provider) || (provider === "open_ai" && hasChatGptModels(models)))
+      } else if (
+        usable(models, provider) ||
+        (provider === "open_ai" && hasChatGptModels(models)) ||
+        (provider === "compatible" && hasGatewayModels(models))
+      )
         ready.push({ provider, standing: "ready" });
       else
         rest.push({
@@ -142,7 +150,9 @@
       seats.find((row) => row.provider === picked)?.provider ??
       seats.find(
         (row) =>
-          row.provider === (current?.model.provider ?? (savedAccountChoice ? "open_ai" : null)),
+          row.provider ===
+          (current?.model.provider ??
+            (savedAccountChoice ? "open_ai" : savedGatewayChoice ? "compatible" : null)),
       )?.provider ??
       seats[0]?.provider ??
       null
@@ -160,6 +170,19 @@
         : "api"),
   );
 
+  let gatewaySourcePick = $state<"endpoint" | "gateway" | null>(null);
+  const gatewaySource = $derived(
+    gatewaySourcePick ??
+      (current?.id.startsWith("gateway/") ||
+      savedGatewayChoice ||
+      (!usable(models, "compatible") && hasGatewayModels(models))
+        ? "gateway"
+        : "endpoint"),
+  );
+  const shownSource = $derived(
+    shown === "open_ai" ? source : shown === "compatible" ? gatewaySource : null,
+  );
+
   let searchOpen = $state(false);
   let query = $state("");
   const searching = $derived(query.trim().length > 0);
@@ -171,21 +194,33 @@
       : null;
     return groups.ready
       .filter((group) => spanning || group.provider === shown)
-      .map((group) => ({
-        key: group.provider,
-        label: nameOf(group.provider),
-        provider: group.provider,
-        items: group.entries
-          .filter((entry) =>
-            matched ? matched.has(entry.id) : shown !== "favourites" || starred.has(entry.id),
-          )
-          .filter((entry) =>
-            spanning || group.provider !== "open_ai"
-              ? true
-              : entry.id.startsWith("chatgpt/") === (source === "chatgpt"),
-          )
-          .map((entry) => ({ id: entry.id, entry })),
-      }))
+      .flatMap((group) => {
+        const sources =
+          spanning && group.provider === "open_ai"
+            ? (["api", "chatgpt"] as const)
+            : spanning && group.provider === "compatible"
+              ? (["endpoint", "gateway"] as const)
+              : [null];
+        return sources.map((connection) => ({
+          key: connection ? `${group.provider}-${connection}` : group.provider,
+          label: connection
+            ? `${nameOf(group.provider)} · ${connectionName(connection)}`
+            : nameOf(group.provider),
+          provider: group.provider,
+          items: group.entries
+            .filter((entry) =>
+              matched ? matched.has(entry.id) : shown !== "favourites" || starred.has(entry.id),
+            )
+            .filter((entry) =>
+              connection
+                ? modelConnection(entry) === connection
+                : spanning ||
+                  (group.provider !== "open_ai" && group.provider !== "compatible") ||
+                  modelConnection(entry) === shownSource,
+            )
+            .map((entry) => ({ id: entry.id, entry })),
+        }));
+      })
       .filter((section) => section.items.length);
   });
   const hits = $derived(searching ? new Set(sections.map((section) => section.provider)) : null);
@@ -298,6 +333,7 @@
     intent = null;
     picked = null;
     sourcePick = null;
+    gatewaySourcePick = null;
     clearTimeout(fold);
     effortOpen = false;
     changed = false;
@@ -519,7 +555,8 @@
           !searching &&
           seat &&
           seat.standing !== "ready" &&
-          (shown !== "open_ai" || source === "api")
+          shownSource !== "chatgpt" &&
+          shownSource !== "gateway"
         )
           step(seat);
         return;
@@ -726,30 +763,55 @@
             onstir={stirred}
           />
         {/if}
-        {#if shown === "open_ai" && !spanning}
-          <div class="sources" role="group" aria-label={m.model_connection_sources()}>
+        {#if (shown === "open_ai" || shown === "compatible") && !spanning}
+          <div
+            class="sources"
+            role="group"
+            aria-label={shown === "open_ai"
+              ? m.model_connection_sources()
+              : m.model_compatible_connection_sources()}
+            aria-describedby={`${uid}-sources-note`}
+          >
             <button
               type="button"
-              aria-pressed={source === "api"}
+              aria-pressed={shownSource === "api" || shownSource === "endpoint"}
               onclick={() => {
-                sourcePick = "api";
+                if (shown === "open_ai") sourcePick = "api";
+                else gatewaySourcePick = "endpoint";
                 active = null;
-              }}>{m.model_source_api()}</button
+              }}>{shown === "open_ai" ? m.model_source_api() : m.model_source_endpoint()}</button
             >
             <button
               type="button"
-              aria-pressed={source === "chatgpt"}
+              aria-pressed={shownSource === "chatgpt" || shownSource === "gateway"}
               onclick={() => {
-                sourcePick = "chatgpt";
+                if (shown === "open_ai") sourcePick = "chatgpt";
+                else gatewaySourcePick = "gateway";
                 active = null;
-              }}>{m.model_source_chatgpt()}</button
+              }}>{shown === "open_ai" ? m.model_source_chatgpt() : m.model_source_gateway()}</button
             >
           </div>
-          <p class="source-note">{m.model_sources_note()}</p>
-          {#if savedAccountChoice && !hasChatGptModels(models)}
+          <span class="sr-only" id={`${uid}-sources-note`}>{m.model_sources_note()}</span>
+          {#if shown === "open_ai" && savedAccountChoice && !hasChatGptModels(models)}
             <p class="note" role="status">{m.ai_chatgpt_choice_unavailable()}</p>
           {/if}
-          {#if source === "chatgpt" && open}
+          {#if shown === "compatible" && savedGatewayChoice && !hasGatewayModels(models)}
+            <p class="note" role="status">{m.gateway_choice_unavailable()}</p>
+          {/if}
+          {#if shownSource === "gateway" && open}
+            {#await import("./ModelGateway.svelte")}
+              <p class="note" role="status">{m.gateway_loading()}</p>
+            {:then connection}
+              <connection.default
+                {profile}
+                hasModels={hasGatewayModels(models)}
+                onsettings={settings}
+              />
+            {:catch}
+              <p class="note failure" role="alert">{m.gateway_load_failed()}</p>
+            {/await}
+          {/if}
+          {#if shownSource === "chatgpt" && open}
             {#await import("./ModelChatGpt.svelte")}
               <p class="note" role="status">{m.model_chatgpt_loading()}</p>
             {:then connection}
@@ -759,13 +821,20 @@
             {/await}
           {/if}
         {/if}
-        {#if shown === "open_ai" && !spanning && source === "chatgpt" && !hasChatGptModels(models)}
-          <!-- The native account view above explains the missing catalog. -->
+        {#if !spanning && ((shownSource === "chatgpt" && !hasChatGptModels(models)) || (shownSource === "gateway" && !hasGatewayModels(models)))}
+          <!-- The native connection view above explains the missing catalog. -->
         {:else if shown === "open_ai" && !spanning && source === "api" && !usable(models, "open_ai")}
           <ModelAsk
             provider="open_ai"
             name={nameOf("open_ai")}
             standing={keyState(models, "open_ai") === "invalid" ? "refused" : "key"}
+            onact={settings}
+          />
+        {:else if shown === "compatible" && !spanning && gatewaySource === "endpoint" && !usable(models, "compatible")}
+          <ModelAsk
+            provider="compatible"
+            name={nameOf("compatible")}
+            standing={keyState(models, "compatible") === "invalid" ? "refused" : "server"}
             onact={settings}
           />
         {:else if seat && seat.standing !== "ready" && !searching}
@@ -779,6 +848,8 @@
           <!-- svelte-ignore a11y_click_events_have_key_events -->
           <div
             class="list"
+            class:account-list={!spanning &&
+              (shownSource === "chatgpt" || shownSource === "gateway")}
             id="{uid}-list"
             role="listbox"
             aria-label={searching ? m.model_search() : title}
@@ -1025,14 +1096,6 @@
     outline-offset: -2px;
   }
 
-  .source-note {
-    flex: none;
-    margin: 6px 14px 0;
-    color: var(--color-muted);
-    font-size: var(--text-caption);
-    line-height: 1.4;
-  }
-
   /* One row, 28px: the place's name and two small tools. The search field slides over the name. */
   .head {
     position: relative;
@@ -1211,6 +1274,10 @@
     outline: none;
     scrollbar-width: thin;
     mask-image: linear-gradient(to bottom, black calc(100% - 14px), transparent);
+  }
+
+  .list.account-list {
+    min-block-size: min(102px, 30%);
   }
 
   .plate {

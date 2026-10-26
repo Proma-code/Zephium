@@ -253,6 +253,36 @@ pub enum WorkModelError {
     ChatGpt {
         fault: ChatGptModelFault,
     },
+    /// An explicitly selected local gateway failure. Never automatically retried.
+    Gateway {
+        fault: GatewayModelFault,
+        /// The request may have reached upstream; preserve a local reservation.
+        /// This is not a claim that the gateway or provider charged anything.
+        usage_unknown: bool,
+    },
+}
+
+/// Closed local gateway errors, separate from native subscription and API keys.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GatewayModelFault {
+    /// The selected connection is absent or its saved identity changed.
+    NotConfigured,
+    /// The local gateway refused its own key; upstream entitlement is unknown.
+    Unauthorized,
+    /// The gateway refused the selected request/model.
+    Forbidden,
+    /// A gateway/upstream limit was reported; there is no automatic retry.
+    RateLimited,
+    /// The gateway could not be reached or the bounded operation timed out.
+    Unavailable,
+    /// The selected route cannot represent this request or its size.
+    Unsupported,
+    /// A response did not meet the bounded, validated Chat Completions contract.
+    Protocol,
+    /// A response was truncated or hit an output limit.
+    Incomplete,
+    /// Completed response but no final measured token usage; tools are withheld.
+    UsageUnavailable,
 }
 
 /// Closed direct ChatGPT errors. No provider-authored text or account data.

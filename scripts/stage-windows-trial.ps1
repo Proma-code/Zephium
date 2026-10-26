@@ -1,29 +1,21 @@
 # Validate the actual generated NSIS script, not just the input configuration.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+. "$PSScriptRoot/windows-trial-staging-checks.ps1"
 if (-not $IsWindows) { throw 'Windows artifact staging must run on Windows.' }
 Push-Location (Split-Path $PSScriptRoot -Parent)
 try {
+  $revision = (git rev-parse HEAD).Trim()
+  if ($LASTEXITCODE -ne 0) { throw 'Cannot identify source revision.' }
+  $sourceStatus = git status --porcelain --untracked-files=normal | Out-String
+  if ($LASTEXITCODE -ne 0) { throw 'Cannot establish a clean source checkout.' }
+  Assert-TrialSourceProvenance -Revision $revision -SourceStatus $sourceStatus -ExpectedSha "$env:GITHUB_SHA"
   $installers = @(Get-ChildItem 'target/release/bundle/nsis' -File -Filter 'Zephium Subscription Trial_*_x64-setup.exe')
   if ($installers.Count -ne 1) { throw 'Expected exactly one isolated x64 trial installer.' }
   $scripts = @(Get-ChildItem 'target/release/nsis' -File -Recurse -Filter installer.nsi)
   if ($scripts.Count -ne 1) { throw 'Expected one generated NSIS script to verify.' }
   $nsi = Get-Content $scripts[0].FullName -Raw
-  foreach ($line in @(
-    '!define PRODUCTNAME "Zephium Subscription Trial"',
-    '!define MAINBINARYNAME "zephium-subscription-trial"',
-    '!define BUNDLEID "app.zephium.subscription-trial"',
-    '!define INSTALLMODE "currentUser"',
-    '!define UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCTNAME}"'
-  )) {
-    if (-not $nsi.Contains($line)) { throw "Generated installer isolation mismatch: $line" }
-  }
-  if ($nsi -notmatch 'subscription-trial-hooks\.nsh' -or $nsi -match '(?m)^\s*!include\s+"[^"\r\n]*[\\/]installer-hooks\.nsh"') {
-    throw 'Generated installer did not select only the isolated trial hooks.'
-  }
-  if ($nsi -match '(?m)^\s*!insertmacro\s+(APP_ASSOCIATE|APP_ASSOCIATE_EX|APP_UNASSOCIATE)\b' -or $nsi -match 'Software\\Classes\\(http|https|ZephiumURL)') {
-    throw 'Unexpected browser/file association in trial installer.'
-  }
+  Assert-TrialInstallerIdentity -Script $nsi
   $exe = Get-Item 'target/release/zephium-subscription-trial.exe'
   if ($exe.VersionInfo.ProductName -ne 'Zephium Subscription Trial') { throw 'Executable product name is not isolated.' }
   $out = 'target/windows-subscription-trial-artifact'
@@ -34,18 +26,19 @@ try {
   Copy-Item 'docs/windows-subscription-trial.md' (Join-Path $out 'README.md')
   Copy-Item $scripts[0].FullName (Join-Path $out 'installer.nsi.txt')
   Copy-Item 'desktop/windows/subscription-trial-hooks.nsh' (Join-Path $out 'installer-hooks.nsh.txt')
-  $revision = (git rev-parse HEAD).Trim()
-  if ($LASTEXITCODE -ne 0) { throw 'Cannot identify source revision.' }
   $signature = Get-AuthenticodeSignature $installers[0].FullName
   @{
     sourceRevision = $revision
+    sourceState = 'clean'
+    workflowRunId = "$env:GITHUB_RUN_ID"
+    workflowRunAttempt = "$env:GITHUB_RUN_ATTEMPT"
     identifier = 'app.zephium.subscription-trial'
     productName = 'Zephium Subscription Trial'
     executable = $exe.Name
     installer = $setupName
     authenticodeStatus = $signature.Status.ToString()
     createdUtc = [DateTime]::UtcNow.ToString('o')
-    verification = 'Windows compile/tests/build and generated installer identity only; interactive side-by-side and account sign-in remain unverified.'
+    verification = 'Staging checked clean source identity, generated installer identity, executable product name and artifact hashes. Consult the exact workflow run for build/test results. Interactive side-by-side and account sign-in remain unverified.'
   } | ConvertTo-Json | Set-Content (Join-Path $out 'BUILD-INFO.json') -Encoding utf8
   $checksums = @(Get-ChildItem $out -File | Sort-Object Name | ForEach-Object {
     $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()

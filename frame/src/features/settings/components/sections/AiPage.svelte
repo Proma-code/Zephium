@@ -7,8 +7,11 @@
     entryOf,
     keyedProviders,
     hasChatGptModels,
+    hasGatewayModels,
+    connectionName,
     locked,
     modelName,
+    modelConnection,
     pickerGroups,
     providerName,
     usable,
@@ -19,8 +22,8 @@
   import SettingsRow from "$shared/ui/SettingsRow";
   import AiProviderRow from "../AiProviderRow.svelte";
   import AiVoiceRow from "../AiVoiceRow.svelte";
-  import ChatGptAccount from "../ChatGptAccount.svelte";
   import AiZephiumRow from "../AiZephiumRow.svelte";
+  import AiConnectionOptions from "../AiConnectionOptions.svelte";
   import WorkDecisions from "../WorkDecisions.svelte";
 
   let profile = $derived(tabs.profile());
@@ -44,7 +47,6 @@
   });
   const AUTO = "auto";
   let expanded = $state(false);
-  let otherAccountsOpen = $state(false);
   const roles: {
     role: Exclude<WorkModelRole, "decision">;
     title: () => string;
@@ -57,6 +59,7 @@
   const anyUsable = $derived(
     !!models &&
       (hasChatGptModels(models) ||
+        hasGatewayModels(models) ||
         usable(models, "cloud") ||
         keyedProviders.some((provider) => usable(models, provider))),
   );
@@ -74,10 +77,28 @@
       provider === "anthropic" ||
       provider === "deep_seek" ||
       provider === "cloud" ||
-      provider === "open_ai"
+      provider === "open_ai" ||
+      provider === "compatible"
         ? modelName(entry)
         : `${entry.display_name} · ${providerName(provider)}`;
     return note ? `${name} · ${note}` : name;
+  }
+
+  function connectionLabel(entry: WorkModelEntry | null) {
+    const connection = entry && modelConnection(entry);
+    return connection ? connectionName(connection) : undefined;
+  }
+
+  function roleDescription(row: (typeof roles)[number]) {
+    const selected = models?.chosen[row.role];
+    const connection = selected?.startsWith("chatgpt/")
+      ? m.model_source_chatgpt()
+      : selected?.startsWith("gateway/")
+        ? m.model_source_gateway()
+        : connectionLabel(entryOf(models, selected ?? models?.effective[row.role]));
+    return connection
+      ? `${row.description()} ${m.model_connection_info({ source: connection })}`
+      : row.description();
   }
 
   function options(role: Exclude<WorkModelRole, "decision">) {
@@ -92,16 +113,30 @@
     ]).ready.flatMap((group) => group.entries);
     const chosen = models?.chosen[role];
     const missingAccountChoice =
-      chosen?.startsWith("chatgpt/") && !offered.some((entry) => entry.id === chosen)
-        ? [{ value: chosen, label: m.ai_chatgpt_choice_unavailable(), disabled: true }]
+      (chosen?.startsWith("chatgpt/") || chosen?.startsWith("gateway/")) &&
+      !offered.some((entry) => entry.id === chosen)
+        ? [
+            {
+              value: chosen,
+              label: chosen.startsWith("gateway/")
+                ? m.gateway_choice_unavailable()
+                : m.ai_chatgpt_choice_unavailable(),
+              disabled: true,
+            },
+          ]
         : [];
     return [
       automatic,
       ...missingAccountChoice,
       ...offered.map((entry) =>
         locked(models, entry.id)
-          ? { value: entry.id, label: m.ai_model_locked({ model: label(entry) }), disabled: true }
-          : { value: entry.id, label: label(entry) },
+          ? {
+              value: entry.id,
+              label: m.ai_model_locked({ model: label(entry) }),
+              detail: connectionLabel(entry),
+              disabled: true,
+            }
+          : { value: entry.id, label: label(entry), detail: connectionLabel(entry) },
       ),
     ];
   }
@@ -113,19 +148,14 @@
   {#if !anyUsable}<p class="ai-note">{m.ai_byok_start()}</p>{/if}
 
   <AiZephiumRow />
-  <ChatGptAccount profile={profile.id} />
-  <details class="other-accounts" bind:open={otherAccountsOpen}>
-    <summary>{m.ai_subscriptions_expand()}</summary>
-    {#if otherAccountsOpen}
-      {#await import("../AiSubscriptions.svelte")}
-        <p class="ai-note" role="status">{m.ai_subscriptions_loading()}</p>
-      {:then otherAccounts}
-        <otherAccounts.default />
-      {:catch}
-        <p class="ai-note" role="alert">{m.ai_subscriptions_load_failed()}</p>
-      {/await}
-    {/if}
-  </details>
+  {#await import("../ChatGptAccount.svelte")}
+    <p class="ai-note" role="status">{m.model_chatgpt_loading()}</p>
+  {:then account}
+    <account.default profile={profile.id} />
+  {:catch}
+    <p class="ai-note" role="alert">{m.model_chatgpt_load_failed()}</p>
+  {/await}
+  <AiConnectionOptions kind="accounts" profile={profile.id} />
 
   <SettingsGroup title={m.ai_keys_group()} description={m.ai_keys_note()}>
     {#if session}{#each keyedProviders as provider (provider)}<AiProviderRow
@@ -134,12 +164,14 @@
         />{/each}{/if}
   </SettingsGroup>
 
+  <AiConnectionOptions kind="gateway" profile={profile.id} />
+
   <SettingsGroup
     title={m.ai_roles_group()}
     description={anyUsable ? m.ai_roles_note() : m.ai_roles_none()}
   >
     {#each roles as row (row.role)}
-      <SettingsRow title={row.title()} description={row.description()}
+      <SettingsRow title={row.title()} description={roleDescription(row)}
         ><Select
           label={row.title()}
           labelHidden
@@ -178,59 +210,5 @@
 
   .more {
     padding: 12px 14px;
-  }
-
-  .other-accounts {
-    margin-block: 8px 34px;
-  }
-
-  /* Match AccountServer's existing advanced-settings disclosure. */
-  summary {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding-block: 4px;
-    padding-inline: 16px;
-    color: var(--color-muted);
-    font-size: var(--text-label);
-    font-weight: 500;
-    list-style: none;
-    cursor: default;
-  }
-
-  summary::-webkit-details-marker {
-    display: none;
-  }
-
-  summary::before {
-    inline-size: 0;
-    block-size: 0;
-    border-block: 4px solid transparent;
-    border-inline-start: 5px solid currentcolor;
-    content: "";
-    transition: rotate var(--motion-fast) var(--ease-out);
-  }
-
-  .other-accounts[open] summary::before {
-    rotate: 90deg;
-  }
-
-  summary:hover {
-    color: var(--color-text);
-  }
-
-  summary:focus-visible {
-    outline: 2px solid var(--color-ring);
-    outline-offset: 2px;
-  }
-
-  .other-accounts[open] summary {
-    margin-block-end: 10px;
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    summary::before {
-      transition: none;
-    }
   }
 </style>

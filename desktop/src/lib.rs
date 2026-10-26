@@ -91,6 +91,7 @@ mod linux_shortcut;
 mod linux_shortcut_portal;
 #[cfg(any(target_os = "linux", test))]
 mod linux_x11_shortcut;
+mod local_gateway;
 mod login_item;
 mod material;
 mod media;
@@ -879,6 +880,7 @@ impl ShutdownCoordinator {
         self.terminal_started.store(true, Ordering::Release);
         drop(admission);
         chatgpt::stop();
+        local_gateway::stop();
     }
 
     fn try_startup_admission(&self, admit: impl FnOnce() -> bool) -> bool {
@@ -940,6 +942,10 @@ impl ShutdownCoordinator {
                 if !chatgpt::drained().await {
                     coordinator.terminal_failure.store(true, Ordering::Release);
                     diagnostic!("shutdown: ChatGPT account mutation cleanup was not proven");
+                }
+                if !local_gateway::drained().await {
+                    coordinator.terminal_failure.store(true, Ordering::Release);
+                    diagnostic!("shutdown: local gateway mutation cleanup was not proven");
                 }
                 if !operations.shutdown().await {
                     coordinator.terminal_failure.store(true, Ordering::Release);
@@ -5767,6 +5773,7 @@ fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
         && !coordinator.terminal_failure.load(Ordering::Acquire)
     {
         chatgpt::stop();
+        local_gateway::stop();
         return;
     };
     if exit_request_is_authorized(
@@ -5886,6 +5893,10 @@ pub fn run() {
         chatgpt::chatgpt_cancel,
         chatgpt::chatgpt_sign_out,
         chatgpt::chatgpt_refresh_models,
+        local_gateway::gateway_status,
+        local_gateway::gateway_save,
+        local_gateway::gateway_check,
+        local_gateway::gateway_disconnect,
     ];
     #[cfg(target_os = "windows")]
     let attempted_privileged_environments = Arc::new(AtomicU8::new(0));
@@ -5914,7 +5925,9 @@ pub fn run() {
     let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
     let app = builder
         .invoke_handler(move |invoke| {
-            if zephium_ipc::chatgpt::ChatGptCommand::owns(invoke.message.command()) {
+            if zephium_ipc::chatgpt::ChatGptCommand::owns(invoke.message.command())
+                || zephium_ipc::local_gateway::GatewayCommand::owns(invoke.message.command())
+            {
                 account_handler(invoke)
             } else {
                 existing_handler(invoke)
@@ -6044,6 +6057,7 @@ pub fn run() {
                 updates::schedule_native_checks(app.handle());
                 work_models::install(app.handle());
                 chatgpt::install(app.handle());
+                local_gateway::install();
                 account::install(app.handle());
 
                 #[cfg(target_os = "windows")]
@@ -6511,6 +6525,7 @@ pub fn run() {
                 }
                 Projection::Profiles(view) => {
                     chatgpt::profiles_changed(&view);
+                    local_gateway::profiles_changed(&view);
                     emit_to_privileged(&emit_handle, MAIN_LABEL, "zephium:profiles", &view)
                 }
 

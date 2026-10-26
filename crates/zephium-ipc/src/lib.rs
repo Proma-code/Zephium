@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 
 pub mod chatgpt;
+pub mod local_gateway;
 pub mod page_assist;
 mod time;
 pub mod work;

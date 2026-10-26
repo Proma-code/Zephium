@@ -24,6 +24,16 @@ const native = vi.hoisted(() => ({
     fault: null,
   })),
 }));
+const gateway = vi.hoisted(() => ({ read: vi.fn() }));
+vi.mock("$shared/ipc/gateway-bindings", async () => {
+  const { gatewayView, mockGatewayBindings } = await import("$shared/testing/gateway");
+  return mockGatewayBindings({
+    gatewayStatus: async (profile) => {
+      gateway.read(profile);
+      return gatewayView(profile);
+    },
+  });
+});
 vi.mock("$shared/ipc/chatgpt-bindings", async () => {
   const { chatgptView, mockChatGptBindings } = await import("$shared/testing/chatgpt");
   return mockChatGptBindings({ chatgptAccount: async (profile) => chatgptView(profile) });
@@ -232,7 +242,7 @@ test("a custom server is asked for its models once per address, even when it has
 test("ChatGPT models can be chosen without enabling OpenAI API-key rows", async () => {
   const view = models({});
   view.entries.push(
-    entry("open_ai", "gpt-account", "GPT Account · ChatGPT", false, ["lead"], {
+    entry("open_ai", "gpt-account", "GPT Account", false, ["lead"], {
       id: "chatgpt/gpt-account",
       price: null,
     }),
@@ -240,7 +250,9 @@ test("ChatGPT models can be chosen without enabling OpenAI API-key rows", async 
   native.read.mockResolvedValue(view);
   const screen = await render(AiPage);
   await screen.getByRole("combobox", { name: "Work", exact: true }).click();
-  await expect.element(page.getByRole("option", { name: /GPT Account · ChatGPT/u })).toBeVisible();
+  await expect
+    .element(page.getByRole("option", { name: /GPT Account/u }))
+    .toHaveAccessibleDescription("ChatGPT");
   await expect.element(page.getByRole("option", { name: /GPT-6 Sol/u })).not.toBeInTheDocument();
 });
 
@@ -276,4 +288,46 @@ test("secondary account guidance loads on demand and remains keyboard-dismissibl
     .not.toBeInTheDocument();
   await userEvent.keyboard("{Enter}");
   await expect.element(screen.getByRole("heading", { name: "Google Antigravity" })).toBeVisible();
+});
+
+test("gateway Settings loads on explicit disclosure and can close and reopen by keyboard", async () => {
+  native.read.mockResolvedValue(models({}));
+  gateway.read.mockClear();
+  const screen = await render(AiPage);
+  const summary = screen.getByText("Local gateway", { exact: true });
+  expect(gateway.read).not.toHaveBeenCalled();
+  summary.element().focus();
+  await userEvent.keyboard("{Enter}");
+  await expect.element(screen.getByRole("button", { name: "Set up local gateway" })).toBeVisible();
+  expect(gateway.read).toHaveBeenCalledExactlyOnceWith(PROFILE);
+  await userEvent.keyboard("{Enter}");
+  await expect
+    .element(screen.getByRole("button", { name: "Set up local gateway" }))
+    .not.toBeInTheDocument();
+  await userEvent.keyboard("{Enter}");
+  await expect.element(screen.getByRole("button", { name: "Set up local gateway" })).toBeVisible();
+  expect(gateway.read).toHaveBeenCalledTimes(2);
+});
+
+test("native gateway models are selectable without a custom endpoint and source stays outside the model name", async () => {
+  const view = models({});
+  view.entries.push(
+    entry("compatible", "example", "Example model", false, ["lead"], {
+      id: `gateway/${"a".repeat(32)}/example`,
+      price: null,
+      supports: {
+        tools: true,
+        vision: false,
+        native_search: false,
+        reasoning: false,
+        prompt_cache: false,
+      },
+    }),
+  );
+  native.read.mockResolvedValue(view);
+  const screen = await render(AiPage);
+  await screen.getByRole("combobox", { name: "Work", exact: true }).click();
+  await expect
+    .element(page.getByRole("option", { name: "Example model", exact: true }))
+    .toHaveAccessibleDescription("Local gateway");
 });

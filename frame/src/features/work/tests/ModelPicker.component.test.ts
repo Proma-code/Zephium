@@ -7,6 +7,7 @@ import { preferences } from "$domain/preferences";
 import ModelPicker from "../components/bar/ModelPicker.svelte";
 import ModelBarStage from "./ModelBarStage.svelte";
 import { PROFILE, entry, models } from "$shared/testing/work-models";
+import { gatewayView } from "$shared/testing/gateway";
 import { chatgptView } from "$shared/testing/chatgpt";
 import type { ChatGptViewV1 } from "$shared/ipc/chatgpt-bindings";
 import { emitNativeEvent } from "$shared/testing/native-events";
@@ -65,7 +66,19 @@ vi.mock("$shared/ipc/chatgpt-bindings", async () => {
     chatgptRefreshModels: chatgpt.models,
   });
 });
+const gateway = vi.hoisted(() => ({ read: vi.fn(), check: vi.fn(), disconnect: vi.fn() }));
+vi.mock("$shared/ipc/gateway-bindings", async () => {
+  const { mockGatewayBindings } = await import("$shared/testing/gateway");
+  return mockGatewayBindings({
+    gatewayStatus: gateway.read,
+    gatewayCheck: gateway.check,
+    gatewayDisconnect: gateway.disconnect,
+  });
+});
 beforeEach(() => {
+  for (const command of Object.values(gateway)) command.mockReset();
+  gateway.read.mockResolvedValue(gatewayView(PROFILE));
+  gateway.disconnect.mockResolvedValue(gatewayView(PROFILE));
   native.openUrl.mockReset();
   native.openUrl.mockRejectedValue(new Error("mock browser unavailable"));
   for (const command of Object.values(chatgpt)) command.mockReset();
@@ -276,7 +289,7 @@ test("the effort shows in a word, and the card turns into its control to set it"
     view("openai/gpt-6-luna", null, effort),
   );
   const screen = await render(ModelPicker, { profile: PROFILE, onsettings: vi.fn() });
-  await screen.getByRole("button", { name: /Model: GPT-6 Luna · API, Medium effort/u }).click();
+  await screen.getByRole("button", { name: /Model: GPT-6 Luna, Medium effort/u }).click();
 
   // At rest the card is the model, with its effort in a word; the control is not built.
   const pill = page.getByRole("button", { name: "Effort: Medium" });
@@ -304,7 +317,7 @@ test("the effort shows in a word, and the card turns into its control to set it"
   expect(native.effort).toHaveBeenLastCalledWith(PROFILE, "max");
   await expect.poll(pace).toBeGreaterThan(calm);
   await expect
-    .element(screen.getByRole("button", { name: /Model: GPT-6 Luna · API, Max effort/u }))
+    .element(screen.getByRole("button", { name: /Model: GPT-6 Luna, Max effort/u }))
     .toBeInTheDocument();
 
   // Used, it turns back to the model and hands the keys to the button that opened it.
@@ -325,11 +338,9 @@ test("Escape turns the open effort back first, and only then closes the menu", a
   await expect
     .element(page.getByRole("button", { name: "Effort: Medium" }))
     .toHaveAttribute("aria-expanded", "false");
-  await expect.element(page.getByRole("region", { name: "GPT-6 Luna · API" })).toBeVisible();
+  await expect.element(page.getByRole("region", { name: "GPT-6 Luna" })).toBeVisible();
   await userEvent.keyboard("{Escape}");
-  await expect
-    .element(page.getByRole("region", { name: "GPT-6 Luna · API" }))
-    .not.toBeInTheDocument();
+  await expect.element(page.getByRole("region", { name: "GPT-6 Luna" })).not.toBeInTheDocument();
 });
 
 test("a star on a row keeps the model under Favourites, across providers", async () => {
@@ -650,7 +661,7 @@ test("a hosted model the plan leaves out names the plan that opens it and leads 
 test("ChatGPT models have a usable picker seat without an OpenAI API key", async () => {
   native.ready.mockImplementation(ready(true));
   native.account.mockResolvedValue({ account: accountFixture(), fault: null, retry_after: null });
-  const accountModel = entry("open_ai", "gpt-account", "GPT Account · ChatGPT", false, ["lead"], {
+  const accountModel = entry("open_ai", "gpt-account", "GPT Account", false, ["lead"], {
     id: "chatgpt/gpt-account",
     price: null,
   });
@@ -659,16 +670,16 @@ test("ChatGPT models have a usable picker seat without an OpenAI API key", async
   accountView.effective.lead = accountModel.id;
   native.read.mockResolvedValue(accountView);
   const screen = await render(ModelPicker, { profile: PROFILE, onsettings: vi.fn() });
-  await screen.getByRole("button", { name: "Model: GPT Account · ChatGPT" }).click();
+  await screen.getByRole("button", { name: "Model: GPT Account" }).click();
   await expect.element(page.getByRole("tab", { name: "OpenAI", exact: true })).toBeVisible();
-  await expect.element(page.getByRole("option", { name: /GPT Account · ChatGPT/u })).toBeVisible();
+  await expect.element(page.getByRole("option", { name: /GPT Account/u })).toBeVisible();
   await expect.element(page.getByRole("option", { name: /GPT-6 Sol/u })).not.toBeInTheDocument();
 });
 
 function bothConnections() {
   const value = view("openai/gpt-6-luna");
   value.entries.push(
-    entry("open_ai", "gpt-6-luna", "GPT-6 Luna · ChatGPT", false, ["lead", "page"], {
+    entry("open_ai", "gpt-6-luna", "GPT-6 Luna", false, ["lead", "page"], {
       id: "chatgpt/gpt-6-luna",
       price: null,
     }),
@@ -676,25 +687,36 @@ function bothConnections() {
   return value;
 }
 
-test("one OpenAI provider offers independent source catalogs and source-labelled search", async () => {
+test("one OpenAI provider keeps clean model names and separates source catalogs outside their titles", async () => {
   native.ready.mockImplementation(ready(true));
   native.read.mockResolvedValue(bothConnections());
   native.account.mockResolvedValue({ account: accountFixture(), fault: null, retry_after: null });
   native.choose.mockClear();
   chatgpt.read.mockResolvedValue(chatgptView(PROFILE, { state: "connected", models: 1 }));
   const screen = await render(ModelPicker, { profile: PROFILE });
-  await screen.getByRole("button", { name: /Model: GPT-6 Luna/u }).click();
+  const trigger = screen.getByRole("button", { name: /Model: GPT-6 Luna/u });
+  await trigger.click();
   expect(page.getByRole("tab", { name: "OpenAI", exact: true }).all()).toHaveLength(1);
-  await expect.element(page.getByRole("option", { name: /GPT-6 Luna · API/u })).toBeVisible();
-  expect(page.getByRole("option", { name: /GPT-6 Luna · ChatGPT/u }).query()).toBeNull();
+  await expect
+    .element(page.getByRole("option", { name: /GPT-6 Luna/u }))
+    .toHaveAttribute("data-id", "openai/gpt-6-luna");
   await page.getByRole("button", { name: "ChatGPT", exact: true }).click();
-  await expect.element(page.getByRole("option", { name: /GPT-6 Luna · ChatGPT/u })).toBeVisible();
-  expect(page.getByRole("option", { name: /GPT-6 Luna · API/u }).query()).toBeNull();
+  await expect
+    .element(page.getByRole("option", { name: /GPT-6 Luna/u }))
+    .toHaveAttribute("data-id", "chatgpt/gpt-6-luna");
+  await expect.element(trigger).not.toHaveTextContent("API");
+  await expect.element(trigger).not.toHaveTextContent("ChatGPT");
   expect(native.choose).not.toHaveBeenCalled();
   await page.getByRole("button", { name: "Search models" }).click();
   await page.getByRole("combobox").fill("gpt-6 luna");
-  await expect.element(page.getByRole("option", { name: /GPT-6 Luna · API/u })).toBeVisible();
-  await expect.element(page.getByRole("option", { name: /GPT-6 Luna · ChatGPT/u })).toBeVisible();
+  const api = page.getByRole("group", { name: "OpenAI · API key", exact: true });
+  const account = page.getByRole("group", { name: "OpenAI · ChatGPT", exact: true });
+  await expect
+    .element(api.getByRole("option", { name: /GPT-6 Luna/u }))
+    .toHaveAttribute("data-id", "openai/gpt-6-luna");
+  await expect
+    .element(account.getByRole("option", { name: /GPT-6 Luna/u }))
+    .toHaveAttribute("data-id", "chatgpt/gpt-6-luna");
 });
 
 test("the OpenAI source choice starts native login only after explicit consent, and switching cancels its own pending attempt", async () => {
@@ -759,7 +781,7 @@ test("disconnecting ChatGPT keeps the API catalog and does not select a billing 
   native.read.mockResolvedValue(view("openai/gpt-6-luna"));
   emitNativeEvent("workModelsChanged", { version: 1 });
   await page.getByRole("button", { name: "API key", exact: true }).click();
-  await expect.element(page.getByRole("option", { name: /GPT-6 Luna · API/u })).toBeVisible();
+  await expect.element(page.getByRole("option", { name: /GPT-6 Luna/u })).toBeVisible();
   expect(chatgpt.signOut).toHaveBeenCalledExactlyOnceWith(PROFILE);
   expect(native.choose).not.toHaveBeenCalled();
 });
@@ -772,9 +794,7 @@ test("subscription quota stays unknown and the official usage link cannot masque
   const screen = await render(ModelPicker, { profile: PROFILE });
   await screen.getByRole("button", { name: /Model: GPT-6 Luna/u }).click();
   await page.getByRole("button", { name: "ChatGPT", exact: true }).click();
-  await expect
-    .element(page.getByText("Remaining quota isn’t provided by this connection."))
-    .toBeVisible();
+  await expect.element(page.getByText("Quota not provided by this connection.")).toBeVisible();
   expect(native.openUrl).not.toHaveBeenCalled();
   await page.getByRole("button", { name: "ChatGPT usage" }).click();
   await expect.element(page.getByRole("alert")).toHaveTextContent("Could not confirm");
@@ -805,6 +825,141 @@ test("an unavailable saved subscription keeps its source pane instead of present
     .element(page.getByText("Saved ChatGPT model unavailable", { exact: false }))
     .toBeVisible();
   await expect.element(page.getByRole("button", { name: "Continue with ChatGPT" })).toBeVisible();
-  expect(page.getByRole("option", { name: /GPT-6 Luna · API/u }).query()).toBeNull();
+  expect(page.getByRole("option", { name: /GPT-6 Luna/u }).query()).toBeNull();
   expect(native.choose).not.toHaveBeenCalled();
+});
+
+test("connected account controls remain compact enough to show model choices beside quota errors", async () => {
+  await page.viewport(1200, 800);
+  native.ready.mockImplementation(ready(true));
+  const state = bothConnections();
+  for (const model of ["gpt-small", "gpt-large"])
+    state.entries.push(
+      entry("open_ai", model, model, false, ["lead", "page"], {
+        id: `chatgpt/${model}`,
+        price: null,
+      }),
+    );
+  native.read.mockResolvedValue(state);
+  chatgpt.read.mockResolvedValue(
+    chatgptView(PROFILE, {
+      state: "connected",
+      models: 3,
+      email: "reader@example.com",
+      error: "usage_limit",
+    }),
+  );
+  const screen = await render(ModelPicker, { profile: PROFILE });
+  await screen.getByRole("button", { name: /Model: GPT-6 Luna/u }).click();
+  await page.getByRole("button", { name: "ChatGPT", exact: true }).click();
+  await expect.element(page.getByRole("alert")).toHaveTextContent("usage limit");
+  await expect.element(page.getByRole("button", { name: "Refresh models" })).toBeVisible();
+  await expect.element(page.getByRole("button", { name: "Disconnect ChatGPT" })).toBeVisible();
+  await expect.element(page.getByRole("button", { name: "ChatGPT usage" })).toBeVisible();
+  const list = page.getByRole("listbox").element() as HTMLElement;
+  await expect.poll(() => list.getBoundingClientRect().height).toBeGreaterThanOrEqual(102);
+  expect(list.querySelectorAll('[role="option"]')).toHaveLength(3);
+});
+
+test("a narrow non-reasoning account card keeps its fixed-effort label in flow and exposes connection context accessibly", async () => {
+  await page.viewport(640, 600);
+  native.ready.mockImplementation(ready(true));
+  const state = bothConnections();
+  state.effective.lead = "chatgpt/gpt-6-luna";
+  state.chosen.lead = "chatgpt/gpt-6-luna";
+  native.read.mockResolvedValue(state);
+  chatgpt.read.mockResolvedValue(chatgptView(PROFILE, { state: "connected", models: 1 }));
+  const screen = await render(ModelPicker, { profile: PROFILE });
+  await screen.getByRole("button", { name: "Model: GPT-6 Luna", exact: true }).click();
+  const card = page.getByRole("region", { name: "GPT-6 Luna", exact: true });
+  await expect.element(card).toHaveAccessibleDescription(/Connection: ChatGPT/u);
+  const fixed = page.getByText("Its own pace", { exact: true }).element() as HTMLElement;
+  const identity = card.element().querySelector<HTMLElement>(".identity")!;
+  expect(getComputedStyle(fixed).position).toBe("static");
+  await expect
+    .poll(() => fixed.getBoundingClientRect().left - identity.getBoundingClientRect().right)
+    .toBeGreaterThanOrEqual(8);
+  expect(fixed.getBoundingClientRect().right).toBeLessThanOrEqual(
+    card.element().getBoundingClientRect().right,
+  );
+  expect(page.getByRole("button", { name: /Effort:/u }).query()).toBeNull();
+});
+
+test("one custom provider seat offers independent endpoint and local gateway sources", async () => {
+  await page.viewport(1000, 800);
+  const id = `gateway/${"a".repeat(32)}/example`;
+  const catalog = models({ base: "http://localhost:11434/v1", lead: id, chosen: id });
+  catalog.entries.push(
+    entry("compatible", "example", "Example", false, ["lead"], {
+      id,
+      price: null,
+      supports: {
+        tools: true,
+        vision: false,
+        reasoning: false,
+        prompt_cache: false,
+        native_search: false,
+      },
+    }),
+  );
+  native.read.mockResolvedValue(catalog);
+  native.ready.mockImplementation(ready(true));
+  native.more.mockResolvedValue({
+    provider: "compatible",
+    entries: [entry("compatible", "endpoint-model", "Endpoint model", false)],
+    fault: null,
+  });
+  gateway.read.mockResolvedValue(
+    gatewayView(PROFILE, {
+      state: "checked",
+      connection_id: "a".repeat(32),
+      base: "http://127.0.0.1:8080/v1",
+      label: "Local",
+      models: 1,
+    }),
+  );
+  const screen = await render(ModelPicker, { profile: PROFILE });
+  await screen.getByRole("button", { name: "Model: Example", exact: true }).click();
+  await expect
+    .element(screen.getByRole("button", { name: "Local gateway", exact: true }))
+    .toHaveAttribute("aria-pressed", "true");
+  await expect.element(screen.getByRole("option", { name: "Example", exact: true })).toBeVisible();
+  await expect
+    .element(screen.getByText("Gateway quota and pricing are not reported."))
+    .toBeVisible();
+  const calls = native.choose.mock.calls.length;
+  await screen.getByRole("button", { name: "Custom endpoint", exact: true }).click();
+  await expect
+    .element(screen.getByRole("option", { name: "Example", exact: true }))
+    .not.toBeInTheDocument();
+  expect(native.choose).toHaveBeenCalledTimes(calls);
+  expect(gateway.check).not.toHaveBeenCalled();
+  await screen.getByRole("button", { name: "Local gateway", exact: true }).click();
+  native.read.mockResolvedValue({
+    ...catalog,
+    entries: catalog.entries.filter((row) => row.id !== id),
+    effective: { ...catalog.effective, lead: null },
+  });
+  await screen.getByRole("button", { name: "Disconnect gateway" }).click();
+  emitNativeEvent("workModelsChanged", { version: 1 });
+  await expect
+    .element(screen.getByText("Saved gateway model unavailable", { exact: false }))
+    .toBeVisible();
+  expect(gateway.disconnect).toHaveBeenCalledExactlyOnceWith(PROFILE, "a".repeat(32));
+  expect(native.choose).toHaveBeenCalledTimes(calls);
+});
+
+test("gateway setup opens existing Settings, never inline secrets or automatic model checks", async () => {
+  await page.viewport(1000, 800);
+  native.read.mockResolvedValue(models({}));
+  native.ready.mockImplementation(ready(false));
+  const onsettings = vi.fn();
+  const screen = await render(ModelPicker, { profile: PROFILE, onsettings });
+  await screen.getByRole("button", { name: "Connect a model" }).click();
+  await screen.getByRole("tab", { name: /Custom/ }).click();
+  await screen.getByRole("button", { name: "Local gateway", exact: true }).click();
+  await expect.element(screen.getByText("No local gateway configured")).toBeVisible();
+  await screen.getByRole("button", { name: "Set up local gateway" }).click();
+  expect(onsettings).toHaveBeenCalledTimes(1);
+  expect(gateway.check).not.toHaveBeenCalled();
 });

@@ -16,5 +16,14 @@
   trial_directory_safe:
 !macroend
 
-; No protocol, credential or profile cleanup: uninstall removes only this
-; package's files/shortcuts/registration through Tauri's ordinary uninstaller.
+; Remove only this trial's optional startup values. Never delete either parent
+; key or the installed product's "Zephium" values, even during a trial upgrade.
+!macro NSIS_HOOK_POSTUNINSTALL
+  ${If} $UpdateMode <> 1
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Zephium Subscription Trial"
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" "Zephium Subscription Trial"
+  ${EndIf}
+!macroend
+
+; No protocol, credential or profile cleanup. Tauri's ordinary uninstaller owns
+; only this package's files, shortcuts and uninstall registration.

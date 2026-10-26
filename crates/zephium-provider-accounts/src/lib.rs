@@ -13,6 +13,8 @@
 
 /// Managed Codex app-server account protocol. This module performs no I/O.
 pub mod codex;
+/// Provider-reported quota fixtures and capability projections; no fetch authority.
+pub mod quota;
 /// Strict, non-secret classification of official CLI status responses.
 pub mod status;
 

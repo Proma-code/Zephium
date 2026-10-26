@@ -339,7 +339,10 @@ where
                     let _ = self.run.begin(step, vec![]).await;
                     return Err(WorkError::OutcomeUnknown);
                 }
-                Err(failure @ CallFailure::ChatGptAfterOutput { .. }) => {
+                Err(
+                    failure @ (CallFailure::ChatGptUnknownOutcome { .. }
+                    | CallFailure::GatewayUsageUnknown { .. }),
+                ) => {
                     self.record_turn(
                         None,
                         WorkStepStatus::Failed,
@@ -368,6 +371,7 @@ where
                             | WorkModelError::PlanLimit
                             | WorkModelError::Hosted { .. }
                             | WorkModelError::ChatGpt { .. }
+                            | WorkModelError::Gateway { .. }
                     );
                     if fatal {
                         return Ok(WorkAttemptStatus::Failed);
@@ -1615,10 +1619,20 @@ where
         failure: CallFailure,
         provider: WorkModelProvider,
     ) {
-        let partial_usage_unknown = matches!(failure, CallFailure::ChatGptAfterOutput { .. });
+        let partial_usage_unknown = matches!(
+            failure,
+            CallFailure::ChatGptUnknownOutcome { .. } | CallFailure::GatewayUsageUnknown { .. }
+        );
         let (failure, usage) = match failure {
-            CallFailure::ChatGptAfterOutput { fault, reservation } => (
+            CallFailure::ChatGptUnknownOutcome { fault, reservation } => (
                 CallFailure::Refused(WorkModelError::ChatGpt { fault }),
+                Some(reservation),
+            ),
+            CallFailure::GatewayUsageUnknown { fault, reservation } => (
+                CallFailure::Refused(WorkModelError::Gateway {
+                    fault,
+                    usage_unknown: true,
+                }),
                 Some(reservation),
             ),
             failure => (failure, usage),
@@ -1633,6 +1647,7 @@ where
         step.note = Some(
             match failure {
                 CallFailure::Refused(WorkModelError::ChatGpt { fault }) => chatgpt_note(fault),
+                CallFailure::Refused(WorkModelError::Gateway { fault, .. }) => gateway_note(fault),
                 CallFailure::Refused(WorkModelError::OverBudget) if hosted => {
                     "Zephium AI's included usage is spent; upgrade, buy extra usage or use your own key"
                 }
@@ -1694,7 +1709,7 @@ where
         );
         if partial_usage_unknown {
             if let Some(note) = step.note.as_mut() {
-                note.push_str(" Usage for the partial response is unknown; the local budget keeps a conservative reservation, not a confirmed charge.");
+                note.push_str(UNKNOWN_OUTCOME_NOTE);
             }
         }
         let _ = self.run.begin(step, vec![]).await;
@@ -2111,9 +2126,10 @@ const STUB: &str = "[Used; dropped to keep the conversation small.";
 /// by a stub with their source keys, and past the hard budget the older
 /// results are shortened too. The canvas keeps everything.
 /// Why the model stopped, as the closing reply says it.
-fn model_stop(error: WorkModelError) -> &'static str {
+pub(super) fn model_stop(error: WorkModelError) -> &'static str {
     match error {
         WorkModelError::ChatGpt { fault } => chatgpt_note(fault),
+        WorkModelError::Gateway { fault, .. } => gateway_note(fault),
         WorkModelError::RateLimited { .. } => {
             "The model provider kept limiting requests, so I stopped."
         }
@@ -2130,6 +2146,8 @@ fn model_stop(error: WorkModelError) -> &'static str {
     }
 }
 
+const UNKNOWN_OUTCOME_NOTE: &str = " The request did not finish with a confirmed result. Usage is unknown; the local budget keeps a conservative reservation, not a confirmed charge.";
+
 fn chatgpt_note(fault: ChatGptModelFault) -> &'static str {
     match fault {
         ChatGptModelFault::SignedOut => "The selected ChatGPT connection is unavailable; reconnect it in Settings → AI. Your API keys are unchanged.",
@@ -2140,12 +2158,26 @@ fn chatgpt_note(fault: ChatGptModelFault) -> &'static str {
     }
 }
 
+fn gateway_note(fault: GatewayModelFault) -> &'static str {
+    match fault {
+        GatewayModelFault::NotConfigured => "The selected local gateway connection is no longer active. Reconnect it and explicitly choose its model in Settings → AI; other keys are unchanged.",
+        GatewayModelFault::Unauthorized => "The local gateway refused its access key. Check the gateway connection in Settings → AI; this does not verify any upstream subscription.",
+        GatewayModelFault::Forbidden => "The local gateway refused access to this model or request. Check the gateway's own configuration and upstream permissions.",
+        GatewayModelFault::RateLimited => "The local gateway or its upstream provider reported a limit. The request was not automatically retried; check the gateway before trying again.",
+        GatewayModelFault::Unavailable => "The local gateway could not complete this request. Check that your gateway is running; the request was not automatically retried.",
+        GatewayModelFault::Unsupported => "The local gateway route cannot send this request or capability. Select a supported text/function model or reduce the request size.",
+        GatewayModelFault::Protocol => "The local gateway returned an invalid response. No proposed tools were committed; check its OpenAI-compatible streaming configuration.",
+        GatewayModelFault::Incomplete => "The local gateway response ended before a complete result. No proposed tools were committed and the request was not automatically retried.",
+        GatewayModelFault::UsageUnavailable => "The local gateway completed a response without measured token usage. Work requires final usage counters before committing proposed tools; enable usage forwarding in your gateway.",
+    }
+}
+
 /// A refused model call in the words the person acts on.
 fn model_fault(error: WorkModelError, hosted: bool) -> Option<WorkModelFaultV1> {
     Some(match error {
         // The exact note above is truthful; API-key and Zephium-plan UI actions
         // would misdirect a locally authorized ChatGPT account.
-        WorkModelError::ChatGpt { .. } => return None,
+        WorkModelError::ChatGpt { .. } | WorkModelError::Gateway { .. } => return None,
         WorkModelError::MissingKey if hosted => WorkModelFaultV1::SignedOut,
         WorkModelError::MissingKey => WorkModelFaultV1::MissingKey,
         WorkModelError::Unauthorized if hosted => WorkModelFaultV1::SignedOut,
@@ -2362,6 +2394,45 @@ mod compact_tests {
         assert!(chatgpt_note(ChatGptModelFault::UsageLimit).contains("reset time is not known"));
         assert!(chatgpt_note(ChatGptModelFault::Unavailable).contains("connection is kept"));
         assert!(chatgpt_note(ChatGptModelFault::SignedOut).contains("API keys are unchanged"));
+    }
+
+    #[test]
+    fn unknown_chatgpt_result_does_not_imply_visible_output_or_no_charge() {
+        let note = format!(
+            "{}{}",
+            chatgpt_note(ChatGptModelFault::Unavailable),
+            UNKNOWN_OUTCOME_NOTE
+        );
+        assert!(note.contains("ChatGPT"));
+        assert!(note.contains("did not finish with a confirmed result"));
+        assert!(note.contains("not a confirmed charge"));
+        assert!(!note.contains("partial response"));
+    }
+
+    #[test]
+    fn gateway_faults_keep_source_specific_actions_and_unknown_usage() {
+        for fault in [
+            GatewayModelFault::NotConfigured,
+            GatewayModelFault::Unauthorized,
+            GatewayModelFault::Forbidden,
+            GatewayModelFault::RateLimited,
+            GatewayModelFault::Unavailable,
+            GatewayModelFault::Unsupported,
+            GatewayModelFault::Protocol,
+            GatewayModelFault::Incomplete,
+            GatewayModelFault::UsageUnavailable,
+        ] {
+            let error = WorkModelError::Gateway {
+                fault,
+                usage_unknown: true,
+            };
+            assert_eq!(model_fault(error, false), None);
+            assert_eq!(model_fault(error, true), None);
+            assert!(model_stop(error).contains("gateway"));
+            assert!(!model_stop(error).contains("ChatGPT"));
+        }
+        assert!(gateway_note(GatewayModelFault::UsageUnavailable).contains("before committing"));
+        assert!(gateway_note(GatewayModelFault::RateLimited).contains("not automatically retried"));
     }
 
     #[test]

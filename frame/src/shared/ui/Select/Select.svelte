@@ -17,7 +17,7 @@
   }: {
     label: string;
     labelHidden?: boolean;
-    options: ReadonlyArray<{ value: string; label: string; disabled?: boolean }>;
+    options: ReadonlyArray<{ value: string; label: string; detail?: string; disabled?: boolean }>;
     value?: string;
     disabled?: boolean;
     onchange?: (value: string) => void;
@@ -122,11 +122,13 @@
         collisionPadding={12}
       >
         <Select.Viewport class="ui-menu-viewport">
-          {#each options as option (option.value)}
+          {#each options as option, index (option.value)}
             <Select.Item
               class="ui-menu-item"
               value={option.value}
               label={option.label}
+              aria-label={option.detail ? option.label : undefined}
+              aria-describedby={option.detail ? `${uid}-detail-${index}` : undefined}
               disabled={option.disabled}
               onpointerup={(event) => {
                 if (travelled(event)) pressed = null;
@@ -135,6 +137,9 @@
             >
               {#snippet children({ selected })}
                 {option.label}
+                {#if option.detail}<span class="option-detail" id={`${uid}-detail-${index}`}
+                    >{option.detail}</span
+                  >{/if}
                 <Mark on={selected} />
               {/snippet}
             </Select.Item>
@@ -175,6 +180,13 @@
     text-align: start;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .option-detail {
+    margin-inline-start: auto;
+    padding-inline-start: 16px;
+    color: var(--color-muted);
+    font-size: var(--text-caption);
   }
 
   /* Two chevrons, because this one picks from a set rather than opening a

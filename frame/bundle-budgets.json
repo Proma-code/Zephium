@@ -92,6 +92,14 @@
       "js": 6638,
       "css": 1280
     },
+    "lazy:features/settings/components/ChatGptAccount.svelte": {
+      "js": 13186,
+      "css": 521
+    },
+    "lazy:features/settings/components/LocalGateway.svelte": {
+      "js": 15479,
+      "css": 679
+    },
     "lazy:features/settings/components/Settings.svelte": {
       "js": 136678,
       "css": 9051
@@ -315,6 +323,10 @@
     "lazy:features/work/components/bar/ModelChatGpt.svelte": {
       "js": 12826,
       "css": 818
+    },
+    "lazy:features/work/components/bar/ModelGateway.svelte": {
+      "js": 12090,
+      "css": 1102
     },
     "lazy:features/work/components/bar/ModelPicker.svelte": {
       "js": 171673,

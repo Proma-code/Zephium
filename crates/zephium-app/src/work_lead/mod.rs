@@ -20,6 +20,7 @@ pub(crate) mod route;
 mod run;
 mod schema;
 pub mod skills;
+mod source_guard;
 pub mod tools;
 mod value_sources;
 
@@ -32,6 +33,7 @@ use zephium_core::work::{
 };
 
 pub use call::{LeadModel, WorkLeadModels};
+pub use source_guard::guard_run_sources;
 
 use crate::work_agent::{WorkAgentBrowseRequest, WorkBrowserOutcome};
 use crate::work_runtime::{

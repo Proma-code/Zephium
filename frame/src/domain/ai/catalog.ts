@@ -1,3 +1,4 @@
+import * as m from "$shared/i18n/messages";
 import type {
   WorkKeyStateV1,
   WorkModelEntry,
@@ -39,13 +40,39 @@ export function providerName(provider: WorkModelProvider): string {
   return names[provider];
 }
 
-/** Billing identity is presentation only; the native id remains the routing authority. */
+/** Names stay vendor-native; connection identity belongs to surrounding UI, never the name. */
 export function modelName(entry: WorkModelEntry): string {
-  if (entry.model.provider !== "open_ai") return entry.display_name;
-  const suffix = entry.id.startsWith("chatgpt/") ? " · ChatGPT" : " · API";
-  return entry.display_name.endsWith(suffix)
-    ? entry.display_name
-    : `${entry.display_name}${suffix}`;
+  return entry.model.provider === "open_ai"
+    ? entry.display_name.replace(/ · (?:ChatGPT|API)$/u, "")
+    : entry.display_name;
+}
+
+/** Independent routing source; display metadata must not become a model identity. */
+export function modelConnection(
+  entry: WorkModelEntry,
+): "chatgpt" | "api" | "gateway" | "endpoint" | null {
+  if (entry.model.provider === "open_ai")
+    return entry.id.startsWith("chatgpt/") ? "chatgpt" : "api";
+  if (entry.model.provider === "compatible")
+    return entry.id.startsWith("gateway/") ? "gateway" : "endpoint";
+  return null;
+}
+
+export function connectionName(source: NonNullable<ReturnType<typeof modelConnection>>): string {
+  return {
+    chatgpt: m.model_source_chatgpt,
+    api: m.model_source_api,
+    gateway: m.model_source_gateway,
+    endpoint: m.model_source_endpoint,
+  }[source]();
+}
+
+function gatewayEntry(entry: WorkModelEntry): boolean {
+  return entry.model.provider === "compatible" && /^gateway\/[0-9a-f]{32}\/.+$/u.test(entry.id);
+}
+
+export function hasGatewayModels(models: WorkModelsV1 | null): boolean {
+  return !!models?.entries.some(gatewayEntry);
 }
 
 /** The model's name as the trigger shows it: the mark beside it says the family. */
@@ -106,7 +133,11 @@ export function pickerGroups(
   const entries = [...(models?.entries ?? []), ...endpoint];
   const accountEntries = new Set(
     models?.entries
-      .filter((entry) => entry.model.provider === "open_ai" && entry.id.startsWith("chatgpt/"))
+      .filter(
+        (entry) =>
+          (entry.model.provider === "open_ai" && entry.id.startsWith("chatgpt/")) ||
+          gatewayEntry(entry),
+      )
       .map((entry) => entry.id) ?? [],
   );
   const order: readonly WorkModelProvider[] = ["cloud", ...keyedProviders];
@@ -128,7 +159,9 @@ export function pickerGroups(
       .sort((a, b) => Number(b.recommended) - Number(a.recommended));
     const providerUsable = usable(models, provider);
     const available = offered.filter((entry) =>
-      entry.id.startsWith("chatgpt/") ? accountEntries.has(entry.id) : providerUsable,
+      entry.id.startsWith("chatgpt/") || entry.id.startsWith("gateway/")
+        ? accountEntries.has(entry.id)
+        : providerUsable,
     );
     if (available.length) ready.push({ provider, entries: available });
     if (!providerUsable && !available.length && suggested.includes(provider))
@@ -195,7 +228,7 @@ export function searchEntries(groups: readonly ModelGroup[], query: string): Wor
   return groups.flatMap((group) =>
     group.entries.filter((entry) => {
       const text =
-        `${modelName(entry)} ${providerName(group.provider)} ${entry.model.model}`.toLocaleLowerCase();
+        `${modelName(entry)} ${providerName(group.provider)} ${entry.model.model} ${modelConnection(entry) ?? ""}`.toLocaleLowerCase();
       return words.every((word) => text.includes(word));
     }),
   );

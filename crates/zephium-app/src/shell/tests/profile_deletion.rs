@@ -710,3 +710,72 @@ fn subscription_erasure_failure_keeps_deletion_journal_until_retry_succeeds() {
         OperationReason::ProfileDeletionCompleted
     );
 }
+
+#[cfg(feature = "work-runtime")]
+#[test]
+fn gateway_erasure_failure_keeps_deletion_journal_until_retry_succeeds() {
+    use crate::work_models::{replace_gateway_for_test, WorkGatewaySession, CHATGPT_TEST_SERIAL};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use zephium_core::work::model::{WorkModelClient, WorkModelEntry, WorkModelError};
+    let _guard = CHATGPT_TEST_SERIAL.blocking_lock();
+    struct Account {
+        profile: ProfileId,
+        erased: AtomicBool,
+    }
+    impl WorkGatewaySession for Account {
+        fn entries(&self, _: ProfileId) -> Vec<WorkModelEntry> {
+            Vec::new()
+        }
+        fn client(
+            &self,
+            _: ProfileId,
+            _: &str,
+        ) -> Result<Arc<dyn WorkModelClient>, WorkModelError> {
+            Err(WorkModelError::BadRequest)
+        }
+        fn erase_profile(&self, profile: ProfileId, _: std::time::Instant) -> bool {
+            profile != self.profile || self.erased.load(Ordering::SeqCst)
+        }
+    }
+    struct Restore(Option<Arc<dyn WorkGatewaySession>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            replace_gateway_for_test(self.0.take());
+        }
+    }
+    let store = Arc::new(FakeStore::default());
+    store
+        .authorize_outcomes
+        .lock()
+        .unwrap()
+        .push_back(ProfileDeletionAuthorizeOutcome::Authorized);
+    store
+        .finalize_outcomes
+        .lock()
+        .unwrap()
+        .push_back(ProfileDeletionFinalizeOutcome::Completed);
+    let (mut shell, engine, _screen, operations) =
+        setup_with_operation_log_and_failure(store.clone(), Box::new(|_| {}));
+    shell.handle(Command::Bootstrap);
+    store.events.lock().unwrap().clear();
+    let profile = add_inactive_named_profile(&mut shell, 79_501);
+    let account = Arc::new(Account {
+        profile,
+        erased: AtomicBool::new(false),
+    });
+    let _restore = Restore(replace_gateway_for_test(Some(account.clone())));
+    engine.push_erasure_outcomes([ProfileDataErasureOutcome::Verified]);
+    shell.handle(delete_operation("delete-gateway", profile));
+    assert!(operations.lock().unwrap().is_empty());
+    assert!(!store.pending_deletions.lock().unwrap().is_empty());
+    assert!(!store.events.lock().unwrap().contains(&"finalize-delete"));
+    account.erased.store(true, Ordering::SeqCst);
+    shell.drive_profile_deletion(profile);
+    assert!(store.pending_deletions.lock().unwrap().is_empty());
+    let completions = operations.lock().unwrap();
+    assert_eq!(completions.len(), 1);
+    assert_eq!(
+        completions[0].reason,
+        OperationReason::ProfileDeletionCompleted
+    );
+}

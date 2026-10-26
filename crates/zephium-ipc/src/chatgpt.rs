@@ -163,6 +163,27 @@ mod tests {
         );
         for command in ChatGptCommand::ALL {
             assert!(native.contains(&format!("pub(crate) async fn {}(", command.native())));
+            let capture = native
+                .find("let Some(scope_epoch) = registry.capture_scope(&expected)")
+                .unwrap();
+            let fetch = native[capture..]
+                .find("allowed(&caller, &expected, action).await")
+                .unwrap()
+                + capture;
+            assert!(
+                capture < fetch,
+                "capture scope before the first actor await"
+            );
+            assert_eq!(
+                native
+                    .matches("registry.owns_scope(&expected, scope_epoch)")
+                    .count(),
+                2
+            );
+            assert!(
+                native.contains("if *foreground != current"),
+                "metadata-only projections must not rotate scope"
+            );
             assert!(root.contains(&format!("chatgpt::{},", command.native())));
         }
         assert!(native.contains("authorize(caller, CallerPolicy::Main, action.native())"));
@@ -172,6 +193,9 @@ mod tests {
         assert!(!native.contains("action != ChatGptCommand::Cancel"));
         assert!(root.contains("chatgpt::profiles_changed(&view)"));
         assert!(root.contains("ChatGptCommand::owns(invoke.message.command())"));
+        assert!(native.contains("registry.admit_scope(&expected, scope_epoch, &service)"));
+        assert!(native.contains("service.scope().ok()"));
+        assert!(native.contains("service.load_scoped(service_scope)"));
         assert!(native.contains("self.service.call(self.lease, request, events)"));
     }
 }

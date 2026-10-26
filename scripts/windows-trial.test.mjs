@@ -28,8 +28,20 @@ test('installer hook cannot clean up product data or browser registration', () =
   const hook = readFileSync(resolve(root, 'desktop/windows/subscription-trial-hooks.nsh'), 'utf8');
   assert.match(hook, /StrCmp \$INSTDIR "\$LOCALAPPDATA\\Zephium Subscription Trial"/);
   assert.match(hook, /IfFileExists "\$INSTDIR\\zephium-desktop\.exe"/);
-  assert.doesNotMatch(hook, /^\s*(Delete|DeleteRegKey|DeleteRegValue|RMDir|Exec|ExecWait)\b/im);
+  assert.doesNotMatch(hook, /^\s*(Delete|DeleteRegKey|RMDir|Exec|ExecWait)\b/im);
+  assert.deepEqual(hook.split(/\r?\n/).map((line) => line.trim()).filter((line) => /^DeleteRegValue\b/.test(line)), [
+    'DeleteRegValue HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Run" "Zephium Subscription Trial"',
+    'DeleteRegValue HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run" "Zephium Subscription Trial"',
+  ]);
+  assert.match(hook, /!macro NSIS_HOOK_POSTUNINSTALL\s+\$\{If\} \$UpdateMode <> 1\s+DeleteRegValue[^\n]+\n\s+DeleteRegValue[^\n]+\n\s+\$\{EndIf\}\s+!macroend/);
   assert.doesNotMatch(hook, /^\s*!include/im);
+});
+
+test('all native startup registry operations use the one trial-aware name without a product fallback', () => {
+  const startup = readFileSync(resolve(root, 'desktop/src/login_item.rs'), 'utf8');
+  assert.match(startup, /const NAME: &str = super::windows_startup_identity::login_item_name\(cfg!\(\s*feature = "windows-subscription-trial"\s*\)\);/);
+  assert.equal([...startup.matchAll(/let name = wide\(NAME\);/g)].length, 3, 'read, write and delete must use the selected name');
+  assert.doesNotMatch(startup, /(?:wide|read|write|delete)\("Zephium"\)/);
 });
 
 test('native release build requires both isolated feature and config', () => {

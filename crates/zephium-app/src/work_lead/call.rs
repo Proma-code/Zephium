@@ -39,10 +39,15 @@ impl WorkLeadModels {
 pub(crate) enum CallFailure {
     /// Nothing was sent or nothing was charged; the note says why.
     Refused(WorkModelError),
-    /// ChatGPT reported a terminal refusal after output began. Usage is unknown,
-    /// so retain a local conservative reservation without inventing a bill.
-    ChatGptAfterOutput {
+    /// A ChatGPT request may have dispatched, or output preceded a terminal
+    /// refusal. Retain unknown usage conservatively without inventing a bill.
+    ChatGptUnknownOutcome {
         fault: ChatGptModelFault,
+        reservation: WorkUsage,
+    },
+    /// A local gateway request may have reached upstream without measured usage.
+    GatewayUsageUnknown {
+        fault: GatewayModelFault,
         reservation: WorkUsage,
     },
     /// The call may have been charged, with no usable answer.
@@ -92,23 +97,38 @@ fn priced(price: &WorkModelPrice, fresh: u64, cached: u64, output: u64) -> u64 {
     .unwrap_or(u64::MAX)
 }
 
-fn subscription_failure_after_output(
+fn protected_source_failure(
+    source_id: &str,
     error: WorkModelError,
     observed_output: bool,
     remaining: WorkExecutionLimits,
 ) -> Option<CallFailure> {
-    let WorkModelError::ChatGpt { fault } = error else {
-        return None;
+    let reservation = WorkUsage {
+        model_tokens: remaining.model_tokens,
+        cost_micro_usd: remaining.cost_micro_usd,
+        operations: 1,
+        accounting: WorkUsageAccounting::ConservativeReservation,
     };
-    observed_output.then_some(CallFailure::ChatGptAfterOutput {
-        fault,
-        reservation: WorkUsage {
-            model_tokens: remaining.model_tokens,
-            cost_micro_usd: remaining.cost_micro_usd,
-            operations: 1,
-            accounting: WorkUsageAccounting::ConservativeReservation,
-        },
-    })
+    match error {
+        // Direct ChatGPT transport uses Protocol for a may-have-dispatched
+        // call that never reached a confirmed terminal, even before text.
+        WorkModelError::Protocol if source_id.starts_with("chatgpt/") => {
+            Some(CallFailure::ChatGptUnknownOutcome {
+                fault: ChatGptModelFault::Unavailable,
+                reservation,
+            })
+        }
+        WorkModelError::ChatGpt { fault } if observed_output => {
+            Some(CallFailure::ChatGptUnknownOutcome { fault, reservation })
+        }
+        WorkModelError::Gateway {
+            fault,
+            usage_unknown,
+        } if usage_unknown || observed_output => {
+            Some(CallFailure::GatewayUsageUnknown { fault, reservation })
+        }
+        _ => None,
+    }
 }
 
 /// Runs one call and charges the run. Transient refusals retry twice,
@@ -198,31 +218,29 @@ pub(crate) async fn call(
         {
             return Err(CallFailure::Lost);
         }
-        if let Some(failure @ CallFailure::ChatGptAfterOutput { reservation, .. }) =
-            subscription_failure_after_output(
-                error,
-                first_event.load(std::sync::atomic::Ordering::Relaxed) != 0,
-                run.remaining(),
-            )
-        {
-            // The provider can reject usage after streaming began. Keep the
+        if let Some(
+            failure @ (CallFailure::ChatGptUnknownOutcome { reservation, .. }
+            | CallFailure::GatewayUsageUnknown { reservation, .. }),
+        ) = protected_source_failure(
+            &model.entry.id,
+            error,
+            first_event.load(std::sync::atomic::Ordering::Relaxed) != 0,
+            run.remaining(),
+        ) {
+            // The provider can omit usage or fail after dispatch. Keep the
             // local reservation and the precise fault; do not retry or claim
             // that the account was charged this conservative amount.
             run.charge(reservation);
             return Err(failure);
         }
         let wait = match error {
-            WorkModelError::RateLimited { retry_after_ms } => rate_limit_wait(retry_after_ms),
             WorkModelError::Hosted {
                 refusal: HostedRefusal::AlreadySent,
                 ..
             } => return Err(CallFailure::Lost),
-            WorkModelError::Overloaded | WorkModelError::Network => {
-                Some(Duration::from_secs(2 + 3 * attempt as u64))
-            }
             WorkModelError::Cancelled => return Err(CallFailure::Stopped),
             WorkModelError::Protocol => return Err(CallFailure::Lost),
-            _ => None,
+            _ => retry_wait(error, attempt),
         };
         match wait {
             Some(wait) if attempt < RETRIES => {
@@ -238,6 +256,18 @@ pub(crate) async fn call(
             }
             _ => return Err(CallFailure::Refused(error)),
         }
+    }
+}
+
+/// Narrow retry admission. Explicit gateway and subscription sources never
+/// inherit API transport retries, even before the first visible text delta.
+fn retry_wait(error: WorkModelError, attempt: usize) -> Option<Duration> {
+    match error {
+        WorkModelError::RateLimited { retry_after_ms } => rate_limit_wait(retry_after_ms),
+        WorkModelError::Overloaded | WorkModelError::Network => {
+            Some(Duration::from_secs(2 + 3 * attempt as u64))
+        }
+        _ => None,
     }
 }
 
@@ -335,12 +365,12 @@ mod tests {
         ] {
             let error = WorkModelError::ChatGpt { fault };
             assert_eq!(
-                subscription_failure_after_output(error, false, remaining),
+                protected_source_failure("chatgpt/fixture", error, false, remaining),
                 None
             );
             assert_eq!(
-                subscription_failure_after_output(error, true, remaining),
-                Some(CallFailure::ChatGptAfterOutput {
+                protected_source_failure("chatgpt/fixture", error, true, remaining),
+                Some(CallFailure::ChatGptUnknownOutcome {
                     fault,
                     reservation: WorkUsage {
                         model_tokens: 1234,
@@ -352,8 +382,104 @@ mod tests {
             );
         }
         assert_eq!(
-            subscription_failure_after_output(WorkModelError::Unauthorized, true, remaining),
+            protected_source_failure(
+                "openai/fixture",
+                WorkModelError::Unauthorized,
+                true,
+                remaining
+            ),
             None
+        );
+    }
+
+    #[test]
+    fn chatgpt_protocol_without_output_retains_unknown_budget_and_source_fault() {
+        let remaining = WorkExecutionLimits {
+            model_tokens: 321,
+            cost_micro_usd: 654,
+            operations: 8,
+            timeout_seconds: 30,
+            max_workers: 1,
+        };
+        assert_eq!(
+            protected_source_failure(
+                "chatgpt/fixture",
+                WorkModelError::Protocol,
+                false,
+                remaining
+            ),
+            Some(CallFailure::ChatGptUnknownOutcome {
+                fault: ChatGptModelFault::Unavailable,
+                reservation: WorkUsage {
+                    model_tokens: 321,
+                    cost_micro_usd: 654,
+                    operations: 1,
+                    accounting: WorkUsageAccounting::ConservativeReservation,
+                },
+            })
+        );
+        assert_eq!(retry_wait(WorkModelError::Protocol, 0), None);
+        // Ordinary API protocol errors keep their original Lost path, not an
+        // account-specific refusal or fabricated exact usage.
+        for source in ["openai/fixture", "compatible/fixture"] {
+            assert_eq!(
+                protected_source_failure(source, WorkModelError::Protocol, false, remaining),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_dispatch_uncertainty_reserves_budget_and_never_retries() {
+        let remaining = WorkExecutionLimits {
+            model_tokens: 1234,
+            cost_micro_usd: 5678,
+            operations: 9,
+            timeout_seconds: 60,
+            max_workers: 1,
+        };
+        for fault in [
+            GatewayModelFault::NotConfigured,
+            GatewayModelFault::Unauthorized,
+            GatewayModelFault::Forbidden,
+            GatewayModelFault::RateLimited,
+            GatewayModelFault::Unavailable,
+            GatewayModelFault::Unsupported,
+            GatewayModelFault::Protocol,
+            GatewayModelFault::Incomplete,
+            GatewayModelFault::UsageUnavailable,
+        ] {
+            for usage_unknown in [false, true] {
+                let error = WorkModelError::Gateway {
+                    fault,
+                    usage_unknown,
+                };
+                assert_eq!(retry_wait(error, 0), None);
+                let result =
+                    protected_source_failure("gateway/fixture/model", error, false, remaining);
+                assert_eq!(result.is_some(), usage_unknown);
+                if let Some(CallFailure::GatewayUsageUnknown {
+                    reservation,
+                    fault: saved,
+                }) = result
+                {
+                    assert_eq!(saved, fault);
+                    assert_eq!(reservation.model_tokens, remaining.model_tokens);
+                    assert_eq!(reservation.cost_micro_usd, remaining.cost_micro_usd);
+                    assert_eq!(
+                        reservation.accounting,
+                        WorkUsageAccounting::ConservativeReservation
+                    );
+                }
+                assert!(matches!(
+                    protected_source_failure("gateway/fixture/model", error, true, remaining),
+                    Some(CallFailure::GatewayUsageUnknown { .. })
+                ));
+            }
+        }
+        assert!(
+            retry_wait(WorkModelError::Network, 0).is_some(),
+            "existing API behavior stays unchanged"
         );
     }
 

@@ -1,0 +1,15 @@
+{
+  "context_window": { "used_percentage": 99, "remaining_percentage": 1 },
+  "cost": { "total_cost_usd": 999 },
+  "rate_limits": {
+    "five_hour": { "used_percentage": 23.5, "resets_at": 1800018000 },
+    "seven_day": { "used_percentage": 41.25, "resets_at": 1800604800 },
+    "spend_limit": {
+      "used_percentage": 125,
+      "resets_at": 1802678400,
+      "used_usd": 625.5,
+      "limit_usd": 500,
+      "period": "monthly"
+    }
+  }
+}

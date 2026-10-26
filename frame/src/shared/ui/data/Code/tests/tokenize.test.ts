@@ -175,9 +175,15 @@ test("a 2,000-line file tokenizes in a few milliseconds", () => {
   ].join("\n");
   const text = Array.from({ length: 250 }, () => unit).join("\n");
   for (let warm = 0; warm < 3; warm += 1) tokenize("tsx", text);
-  const started = performance.now();
-  const rows = tokenize("tsx", text);
-  const took = performance.now() - started;
-  expect(rows).toHaveLength(2000);
-  expect(took).toBeLessThan(40);
+  // Shared CI runners can deschedule one sample or collect garbage between ticks.
+  // Keep the same 40ms bound on the median of seven warmed, complete tokenizations:
+  // a sustained slowdown still fails, but one scheduling outlier is not a regression.
+  const samples = Array.from({ length: 7 }, () => {
+    const started = performance.now();
+    const rows = tokenize("tsx", text);
+    const took = performance.now() - started;
+    expect(rows).toHaveLength(2000);
+    return took;
+  }).sort((a, b) => a - b);
+  expect(samples[3]).toBeLessThan(40);
 });

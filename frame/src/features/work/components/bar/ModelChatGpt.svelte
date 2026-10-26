@@ -4,6 +4,8 @@
   import { commands } from "$shared/ipc/bindings";
   import { ChatGptSession, chatGptFault, chatGptStatus } from "$domain/chatgpt";
   import Button from "$shared/ui/Button";
+  import IconButton from "$shared/ui/IconButton";
+  import { ArrowReloadHorizontalIcon, ArrowUpRight01Icon, Plug01Icon } from "../../lib/icons";
   import * as m from "$shared/i18n/messages";
 
   let { profile, hasModels }: { profile: string; hasModels: boolean } = $props();
@@ -20,6 +22,7 @@
   const view = $derived(session?.view ?? null);
   const signingIn = $derived(session?.signingIn ?? false);
   const busy = $derived(session?.busy ?? null);
+  const status = $derived(chatGptStatus(view, signingIn));
   let usagePending = $state(false);
   let usageUnconfirmed = $state(false);
   const lifetime = new AbortController();
@@ -43,52 +46,64 @@
 </script>
 
 <div class="connection" class:empty={!hasModels}>
-  <p class="status" aria-live="polite">{chatGptStatus(view, signingIn)}</p>
+  <div class="summary">
+    <p class="status" aria-live="polite" title={status}>{status}</p>
+    {#if view?.state === "connected" && !signingIn}
+      <div class="tools">
+        <IconButton
+          icon={ArrowReloadHorizontalIcon}
+          label={m.ai_chatgpt_refresh_models()}
+          pending={busy === "models"}
+          disabled={!!busy}
+          onclick={() => void session?.refreshModels()}
+        />
+        <IconButton
+          icon={Plug01Icon}
+          label={m.ai_chatgpt_disconnect()}
+          pending={busy === "sign_out"}
+          disabled={!!busy}
+          onclick={() => void session?.signOut()}
+        />
+        <IconButton
+          icon={ArrowUpRight01Icon}
+          label={m.ai_chatgpt_usage()}
+          pending={usagePending}
+          onclick={() => void openUsage()}
+        />
+      </div>
+    {/if}
+  </div>
   {#if signingIn}
     <p>{m.model_chatgpt_pending_note()}</p>
   {:else if view?.state === "signed_out"}
     <p>{m.ai_chatgpt_consent()}</p>
   {:else if view?.state === "connected"}
-    <p>{hasModels ? m.model_chatgpt_models() : m.ai_chatgpt_no_models()}</p>
-    <p>{m.ai_chatgpt_quota_unavailable()}</p>
+    {#if !hasModels}<p>{m.ai_chatgpt_no_models()}</p>{/if}
+    <p class="quota">{m.model_chatgpt_quota_unknown()}</p>
   {/if}
-  <div class="actions">
-    {#if signingIn || view?.state === "signed_out"}
-      <Button
-        size="compact"
-        pending={busy === "cancel"}
-        disabled={signingIn
-          ? !!busy && busy !== "sign_in" && busy !== "cancel"
-          : !!busy || !!session?.checking}
-        onclick={() => void (signingIn ? session?.cancel() : session?.signIn())}
-        >{signingIn ? m.ai_chatgpt_cancel() : m.ai_chatgpt_continue()}</Button
-      >
-    {:else if view?.state === "connected"}
-      <Button
-        size="compact"
-        pending={busy === "models"}
-        disabled={!!busy}
-        onclick={() => void session?.refreshModels()}>{m.ai_chatgpt_refresh_models()}</Button
-      >
-      <Button
-        size="compact"
-        pending={busy === "sign_out"}
-        disabled={!!busy}
-        onclick={() => void session?.signOut()}>{m.ai_chatgpt_disconnect()}</Button
-      >
-      <Button size="compact" pending={usagePending} onclick={() => void openUsage()}
-        >{m.ai_chatgpt_usage()}</Button
-      >
-    {/if}
-    {#if session?.observationFailed || session?.pollingPaused || view?.state === "unavailable"}
-      <Button
-        size="compact"
-        pending={session?.checking}
-        disabled={!!busy}
-        onclick={() => void session?.refresh()}>{m.ai_chatgpt_refresh()}</Button
-      >
-    {/if}
-  </div>
+  {#if signingIn || view?.state === "signed_out" || session?.observationFailed || session?.pollingPaused || view?.state === "unavailable"}
+    <div class="actions">
+      {#if signingIn || view?.state === "signed_out"}
+        <Button
+          size="compact"
+          pending={busy === "cancel"}
+          disabled={signingIn
+            ? !!busy && busy !== "sign_in" && busy !== "cancel"
+            : !!busy || !!session?.checking}
+          onclick={() => void (signingIn ? session?.cancel() : session?.signIn())}
+          >{signingIn ? m.ai_chatgpt_cancel() : m.ai_chatgpt_continue()}</Button
+        >
+      {/if}
+      {#if session?.observationFailed || session?.pollingPaused || view?.state === "unavailable"}
+        <Button
+          size="compact"
+          pending={session?.checking}
+          disabled={!!busy}
+          onclick={() => void session?.refresh()}>{m.ai_chatgpt_refresh()}</Button
+        >
+      {/if}
+    </div>
+  {/if}
   {#if session?.observationFailed}<p class="fault" role="alert">
       {m.ai_chatgpt_observation_failed()}
     </p>{/if}
@@ -103,10 +118,10 @@
 
 <style>
   .connection {
-    flex: none;
+    flex: 0 1 auto;
     min-block-size: 0;
-    max-block-size: 55%;
-    padding: 10px 14px;
+    max-block-size: 132px;
+    padding: 6px 14px;
     overflow-y: auto;
     overscroll-behavior: contain;
   }
@@ -135,9 +150,31 @@
     margin-block-start: 6px;
   }
 
+  .summary {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-inline-size: 0;
+  }
+
   .status {
+    min-inline-size: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     color: var(--color-text);
     font-weight: 550;
+  }
+
+  .tools {
+    display: flex;
+    flex: none;
+    gap: 2px;
+    margin-inline-start: auto;
+  }
+
+  .quota {
+    font-size: var(--text-caption);
   }
 
   .actions {
@@ -145,6 +182,20 @@
     flex-wrap: wrap;
     gap: 8px;
     margin-block-start: 10px;
+  }
+
+  .empty .summary {
+    max-inline-size: 100%;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  .empty .status {
+    white-space: normal;
+  }
+
+  .empty .tools {
+    margin-inline-start: 0;
   }
 
   .empty .actions {

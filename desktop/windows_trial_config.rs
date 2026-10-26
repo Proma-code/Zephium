@@ -2,6 +2,12 @@
 
 use serde_json::Value;
 
+// Exercise the same pure name selection used by the native Windows adapter,
+// without loading Tauri/WebView2 or changing a real registry value.
+#[cfg(test)]
+#[path = "windows_startup_identity.rs"]
+mod windows_startup_identity;
+
 pub const IDENTIFIER: &str = "app.zephium.subscription-trial";
 pub const PRODUCT: &str = "Zephium Subscription Trial";
 

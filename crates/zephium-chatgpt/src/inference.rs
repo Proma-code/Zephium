@@ -46,7 +46,7 @@ impl Model {
                 wire: WorkModelWire::OpenAiResponses,
                 model: self.slug.clone(),
             },
-            display_name: format!("{} · ChatGPT", self.display_name),
+            display_name: self.display_name.clone(),
             roles: vec![
                 WorkModelRole::Lead,
                 WorkModelRole::Page,
@@ -59,12 +59,27 @@ impl Model {
                 tools: true,
                 vision: false,
                 prompt_cache: false,
-                reasoning: false,
+                reasoning: supports_effort(&self.slug),
                 native_search: false,
             },
             price: None,
         }
     }
+}
+
+// Exact account-listed slugs intersected with the official model contracts.
+// Do not infer capabilities from a provider-controlled prefix or display name.
+// These are the existing Work slider's supported levels (low through max);
+// `None` in Work is the provider default, not the vendor's "none" effort.
+// https://developers.openai.com/api/docs/models/gpt-6.1-sol
+// https://developers.openai.com/api/docs/models/gpt-6-luna
+// https://developers.openai.com/api/docs/guides/deployment-checklist
+// https://developers.openai.com/api/docs/guides/latest-model
+fn supports_effort(slug: &str) -> bool {
+    matches!(
+        slug,
+        "gpt-6.1-sol" | "gpt-6-luna" | "gpt-6-sol" | "gpt-6-astra" | "gpt-5.6-terra"
+    )
 }
 
 /// Fixed-origin client. The caller owns token refresh, profile selection and
@@ -285,7 +300,7 @@ fn request_body(request: &WorkModelRequest) -> Result<Value, WorkModelError> {
         || request.tools.len() > MAX_TOOLS
         || request.system.len() > 64
         || request.native_search
-        || request.reasoning.is_some()
+        || (request.reasoning.is_some() && !supports_effort(&request.model.model))
     {
         return Err(WorkModelError::BadRequest);
     }
@@ -414,6 +429,9 @@ fn request_body(request: &WorkModelRequest) -> Result<Value, WorkModelError> {
         }
     }
     let mut body = json!({"model":request.model.model,"instructions":instructions,"input":input,"store":false,"stream":true,"include":["reasoning.encrypted_content"]});
+    if let Some(effort) = request.reasoning {
+        body["reasoning"] = json!({"effort": effort});
+    }
     if !tools.is_empty() {
         body["tools"] = json!([{"type":"namespace", "name":NAMESPACE, "description":"Tools explicitly offered by the local Zephium runtime.", "tools":tools}]);
         body["parallel_tool_calls"] = json!(request.parallel_tools);
@@ -898,6 +916,68 @@ mod tests {
     }
 
     #[test]
+    fn exact_known_account_models_offer_existing_effort_slider_and_wire_values() {
+        use WorkModelReasoning::*;
+        for slug in [
+            "gpt-6.1-sol",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6-astra",
+            "gpt-5.6-terra",
+        ] {
+            let entry = Model {
+                slug: slug.into(),
+                display_name: "Clean model name".into(),
+            }
+            .entry();
+            assert!(entry.supports.reasoning);
+            assert_eq!(entry.display_name, "Clean model name");
+            assert_eq!(entry.id, format!("chatgpt/{slug}"));
+            for (effort, wire) in [
+                (Low, "low"),
+                (Medium, "medium"),
+                (High, "high"),
+                (XHigh, "xhigh"),
+                (Max, "max"),
+            ] {
+                let mut request = request();
+                request.model = entry.model.clone();
+                request.reasoning = Some(effort);
+                assert_eq!(
+                    request_body(&request).unwrap()["reasoning"],
+                    json!({"effort":wire})
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_aliases_and_similar_names_do_not_acquire_effort_capabilities() {
+        for slug in [
+            "gpt-6-unknown",
+            "gpt-6.1-sol-custom",
+            "gpt-5.6",
+            "GPT-6-LUNA",
+            "gpt-fixture",
+        ] {
+            let entry = Model {
+                slug: slug.into(),
+                display_name: "GPT-6 Luna".into(),
+            }
+            .entry();
+            assert!(!entry.supports.reasoning);
+            let mut request = request();
+            request.model = entry.model;
+            request.reasoning = Some(WorkModelReasoning::High);
+            assert_eq!(
+                request_body(&request).err(),
+                Some(WorkModelError::BadRequest)
+            );
+        }
+        assert!(request_body(&request()).unwrap().get("reasoning").is_none());
+    }
+
+    #[test]
     fn preview_body_is_explicit_and_omits_incompatible_api_fields() {
         let body = request_body(&request()).unwrap();
         assert_eq!(body["store"], false);
@@ -974,7 +1054,7 @@ mod tests {
         );
         let entry = models[0].entry();
         assert_eq!(entry.id, "chatgpt/model-z");
-        assert_eq!(entry.display_name, "Z · ChatGPT");
+        assert_eq!(entry.display_name, "Z");
         assert_eq!(entry.model.provider, WorkModelProvider::OpenAi);
         assert!(!entry.supports.vision && !entry.supports.native_search);
         assert!(entry.price.is_none());

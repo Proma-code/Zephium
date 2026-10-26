@@ -4,6 +4,10 @@
 
 use super::*;
 
+#[cfg(target_os = "windows")]
+#[path = "../windows_startup_identity.rs"]
+mod windows_startup_identity;
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, specta::Type, PartialEq, Eq)]
 pub(crate) struct LoginItemStatus {
     /// False where this build cannot register, such as an unbundled binary.
@@ -97,7 +101,9 @@ mod windows {
         RRF_RT_REG_BINARY, RRF_RT_REG_SZ,
     };
 
-    const NAME: &str = "Zephium";
+    const NAME: &str = super::windows_startup_identity::login_item_name(cfg!(
+        feature = "windows-subscription-trial"
+    ));
     const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
     const APPROVED: &str =
         r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";

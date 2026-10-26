@@ -23,3 +23,22 @@ test("the chosen row opens over the trigger, its label on the trigger's", async 
   expect(Math.abs(on.top + on.height / 2 - (at.top + at.height / 2))).toBeLessThan(2);
   await page.screenshot({ path: "../../../../../../target/look/select/popup.png" });
 });
+
+test("connection details identify equal model names without changing the chosen label", async () => {
+  const screen = await render(Select, {
+    label: "Model",
+    value: "account/model",
+    options: [
+      { value: "api/model", label: "Example model", detail: "API key" },
+      { value: "account/model", label: "Example model", detail: "ChatGPT" },
+    ],
+  });
+  const trigger = screen.getByLabelText("Model", { exact: true });
+  await expect.element(trigger).toHaveTextContent("Example model");
+  await expect.element(trigger).not.toHaveTextContent("ChatGPT");
+  await trigger.click();
+  const rows = page.getByRole("option", { name: "Example model", exact: true }).all();
+  expect(rows).toHaveLength(2);
+  await expect.element(rows[0]!).toHaveAccessibleDescription("API key");
+  await expect.element(rows[1]!).toHaveAccessibleDescription("ChatGPT");
+});

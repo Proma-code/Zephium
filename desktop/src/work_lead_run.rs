@@ -269,6 +269,10 @@ impl WorkProviders {
         if binding.profile() != profile {
             return Err(WorkError::ProfileUnavailable);
         }
+        // One explicit Work run owns one gate per protected source, shared
+        // across roles/models and every page/decision adapter cloned below.
+        // Resolving helpers separately must not reopen a failed source.
+        let models = zephium_app::work_lead::guard_run_sources(profile, models);
         let search = search_backend(profile, &models).await?;
         record_diagnostic(format_args!(
             "work: phase=lead state=models lead={} page={} light={}",

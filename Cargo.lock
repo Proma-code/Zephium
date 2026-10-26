@@ -7619,6 +7619,7 @@ dependencies = [
  "zephium-core",
  "zephium-credentials",
  "zephium-engine",
+ "zephium-gateway",
  "zephium-import",
  "zephium-ipc",
  "zephium-notes",
@@ -7669,6 +7670,20 @@ dependencies = [
  "zephium-core",
  "zephium-webext",
  "zephium-webext-macos",
+ "zeroize",
+]
+
+[[package]]
+name = "zephium-gateway"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "serde",
+ "serde_json",
+ "tokio",
+ "zephium-agentic",
+ "zephium-core",
+ "zephium-credentials",
  "zeroize",
 ]
 

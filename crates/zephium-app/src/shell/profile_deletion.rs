@@ -729,7 +729,7 @@ impl Shell {
         // Keep the existing durable deletion journal until the separately owned
         // native subscription record is erased. Failure is not a completed delete.
         #[cfg(feature = "work-runtime")]
-        if !crate::work_models::erase_chatgpt_profile(profile, deadline) {
+        if !crate::work_models::erase_local_account_profiles(profile, deadline) {
             self.schedule_profile_deletion_retry(profile);
             return;
         }

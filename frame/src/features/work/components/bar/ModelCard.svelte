@@ -11,7 +11,14 @@
 </script>
 
 <script lang="ts">
-  import { contextSize, dollars, effortName, modelName } from "$domain/ai";
+  import {
+    contextSize,
+    dollars,
+    effortName,
+    modelName,
+    modelConnection,
+    connectionName,
+  } from "$domain/ai";
   import Icon from "$shared/ui/Icon";
   import ProviderMark from "$shared/ui/ProviderMark";
   import * as m from "$shared/i18n/messages";
@@ -54,6 +61,13 @@
   const character = $derived.by(() => {
     const { entry, tier } = subject;
     const words: string[] = [];
+    const connection = modelConnection(entry);
+    if (connection)
+      words.push(
+        m.model_connection_info({
+          source: connectionName(connection),
+        }),
+      );
     if (tier) words.push(CHARACTERS[tier]());
     else if (entry.model.provider === "compatible") words.push(m.model_character_own());
     if (entry.context_window < 500_000)
@@ -91,7 +105,13 @@
 </script>
 
 <!-- One card, two faces: the model, or how long it thinks. They never show together. -->
-<section class="card" aria-label={name} data-face={expanded ? "effort" : "model"}>
+<section
+  class="card"
+  aria-label={name}
+  aria-describedby={character ? `${region}-description` : undefined}
+  data-face={expanded ? "effort" : "model"}
+>
+  {#if character}<span class="sr-only" id={`${region}-description`}>{character}</span>{/if}
   <div class="face model" inert={expanded}>
     {#key subject.entry.id}<div class="identity" aria-hidden="true">
         <span class="tile ui-shine"
@@ -117,7 +137,7 @@
         <span class="pill-label" data-level={subject.effort}>{effortName(subject.effort)}</span>
         <span class="pill-chevron"><Icon icon={ArrowDown01Icon} size={12} strokeWidth={2.2} /></span
         >
-      </button>{:else}<span class="fixed">{m.model_effort_fixed()}</span>{/if}
+      </button>{:else}<span class="fixed-effort">{m.model_effort_fixed()}</span>{/if}
   </div>
   <div
     class="face effort"
@@ -262,8 +282,9 @@
     opacity: 0.7;
   }
 
-  .fixed {
+  .fixed-effort {
     flex: none;
+    white-space: nowrap;
     padding-inline: 4px;
     color: var(--color-faint);
     font-size: var(--text-caption);

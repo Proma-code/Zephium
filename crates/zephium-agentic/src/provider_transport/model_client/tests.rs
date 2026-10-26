@@ -615,3 +615,23 @@ async fn malformed_actions_have_one_repair_and_keep_failure_counts_when_terminal
     settlement.settle(&mut policy).unwrap();
     assert_eq!(policy.pending_model_calls(), 0);
 }
+
+#[test]
+fn gateway_failures_never_become_retriable_transport_classes() {
+    for fault in [
+        GatewayModelFault::RateLimited,
+        GatewayModelFault::Unavailable,
+        GatewayModelFault::Protocol,
+        GatewayModelFault::Incomplete,
+        GatewayModelFault::UsageUnavailable,
+    ] {
+        assert_eq!(
+            failure_for(WorkModelError::Gateway {
+                fault,
+                usage_unknown: true
+            })
+            .class(),
+            AgentProviderFailureClass::Provider
+        );
+    }
+}

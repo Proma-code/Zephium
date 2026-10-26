@@ -16,3 +16,6 @@ project.inlang/README.md
 
 # Generated build measurements; enforced by the bundle guard.
 reports/
+
+# Deterministic native generator owns this module.
+src/shared/ipc/gateway-bindings.ts

@@ -86,6 +86,8 @@ pub struct View {
 struct State {
     loaded: bool,
     stopped: bool,
+    // An admitted but uncommitted disconnect fences use without deleting a grant.
+    pending_signout: Option<u64>,
     foreground: bool,
     session: u64,
     identity: Option<Identity>,
@@ -173,6 +175,14 @@ impl Drop for Ticket {
             .active -= 1;
         self.0.changed.notify_waiters();
     }
+}
+
+/// Opaque profile admission captured under the native registry's scope lock.
+/// Not an IPC value; an away/back transition or account mutation retires it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Scope {
+    generation: u64,
+    profile: zephium_core::ids::ProfileId,
 }
 
 /// Native-only authorization lease. A queued Work client cannot cross sign-out
@@ -330,6 +340,7 @@ impl Service {
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         View {
             connected: !state.stopped
+                && state.pending_signout.is_none()
                 && state.foreground
                 && state.pending_rotation.is_none()
                 && state.tokens.is_some(),
@@ -351,6 +362,7 @@ impl Service {
     pub fn models(&self) -> Vec<Model> {
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         if !state.stopped
+            && state.pending_signout.is_none()
             && state.foreground
             && state.pending_rotation.is_none()
             && state.tokens.is_some()
@@ -366,12 +378,45 @@ impl Service {
         (self.changed)();
     }
 
+    /// Capture native profile scope without I/O. The host captures this while
+    /// verifying its authoritative profile epoch under the same read lock.
+    pub fn scope(&self) -> Result<Scope, Fault> {
+        let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+        if !state.foreground {
+            return Err(Fault::Cancelled);
+        }
+        Ok(Scope {
+            generation: state.generation,
+            profile: zephium_core::ids::ProfileId::parse(&self.profile).ok_or(Fault::Invalid)?,
+        })
+    }
+    fn matches_scope(&self, state: &State, scope: Scope) -> bool {
+        state.foreground
+            && state.generation == scope.generation
+            && scope.profile.to_string() == self.profile
+    }
+    fn require_scope(&self, scope: Scope) -> Result<(), Fault> {
+        if self.matches_scope(&self.state.read().unwrap_or_else(|e| e.into_inner()), scope) {
+            Ok(())
+        } else {
+            Err(Fault::Cancelled)
+        }
+    }
+    /// Load only for the atomically captured native scope; never project a stale result.
+    pub async fn load_scoped(self: &Arc<Self>, scope: Scope) -> Result<(), Fault> {
+        let service = self.clone();
+        self.spawn(async move {
+            service.require_scope(scope)?;
+            service.load_owned().await?;
+            service.require_scope(scope)
+        })?
+        .await
+        .map_err(|_| Fault::Vault)?
+    }
+
     /// Load the profile's exact vault record on explicit account observation.
     pub async fn load(self: &Arc<Self>) -> Result<(), Fault> {
-        let service = self.clone();
-        self.spawn(async move { service.load_owned().await })?
-            .await
-            .map_err(|_| Fault::Vault)?
+        self.load_scoped(self.scope()?).await
     }
 
     async fn load_owned(&self) -> Result<(), Fault> {
@@ -486,12 +531,30 @@ impl Service {
         F: FnOnce(Zeroizing<String>) -> Fut + Send + 'static,
         Fut: Future<Output = bool> + Send + 'static,
     {
+        let scope = self.scope()?;
+        self.sign_in_scoped(scope, attempt_id, open_browser).await
+    }
+
+    /// Start only for the native scope captured before the IPC/service handoff.
+    pub async fn sign_in_scoped<F, Fut>(
+        self: &Arc<Self>,
+        scope: Scope,
+        attempt_id: String,
+        open_browser: F,
+    ) -> Result<(), Fault>
+    where
+        F: FnOnce(Zeroizing<String>) -> Fut + Send + 'static,
+        Fut: Future<Output = bool> + Send + 'static,
+    {
         let admitted = {
             let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+            if !self.matches_scope(&state, scope) {
+                return Err(Fault::Cancelled);
+            }
             if state.signing_in {
                 return Err(Fault::Busy);
             }
-            state.generation
+            scope.generation
         };
         let service = self.clone();
         self.spawn(async move {
@@ -734,11 +797,21 @@ impl Service {
 
     /// Cancel only pending authorization. A previously connected account stays intact.
     pub async fn cancel(&self, attempt: &str) {
+        let _ = self.cancel_for(None, attempt).await;
+    }
+    /// Cancel only the exact attempt within a captured native profile scope.
+    pub async fn cancel_scoped(&self, scope: Scope, attempt: &str) -> Result<(), Fault> {
+        self.cancel_for(Some(scope), attempt).await
+    }
+    async fn cancel_for(&self, scope: Option<Scope>, attempt: &str) -> Result<(), Fault> {
         if !valid_attempt(attempt) {
-            return;
+            return Ok(());
         }
         {
             let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+            if scope.is_some_and(|scope| !self.matches_scope(&state, scope)) {
+                return Err(Fault::Cancelled);
+            }
             if !state.cancelled_attempts.iter().any(|id| id == attempt) {
                 if state.cancelled_attempts.len() >= 32 {
                     state.cancelled_attempts.pop_front();
@@ -746,7 +819,7 @@ impl Service {
                 state.cancelled_attempts.push_back(attempt.into());
             }
             if !state.signing_in || state.attempt.as_deref() != Some(attempt) {
-                return;
+                return Ok(());
             }
             state.attempt = None;
             state.generation = state.generation.saturating_add(1);
@@ -759,6 +832,7 @@ impl Service {
         // Any in-progress vault commit must finish its stale-generation rollback
         // before the caller sees this cancellation as complete.
         let _guard = self.mutation.lock().await;
+        Ok(())
     }
 
     /// Follow the authoritative native profile projection. Backgrounding a
@@ -781,6 +855,7 @@ impl Service {
         }
         state.foreground = foreground;
         if !foreground {
+            state.pending_signout = None;
             state.generation = state.generation.saturating_add(1);
             state.session = state.session.saturating_add(1);
             state.signing_in = false;
@@ -799,30 +874,51 @@ impl Service {
     /// Immediately retire network output and pending authorization during app
     /// shutdown. This does not revoke or delete the persisted account.
     pub fn stop(&self) {
+        let _ = self.stop_for(None, true);
+    }
+    fn stop_for(&self, scope: Option<Scope>, stop_account: bool) -> Result<u64, Fault> {
         let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
-        state.stopped = true;
+        if scope.is_some_and(|scope| !self.matches_scope(&state, scope)) {
+            return Err(Fault::Cancelled);
+        }
+        if stop_account {
+            state.stopped = true;
+        }
         state.session = state.session.saturating_add(1);
         state.generation = state.generation.saturating_add(1);
+        state.pending_signout = (!stop_account).then_some(state.generation);
         state.signing_in = false;
         state.attempt = None;
         state.models.clear();
         self.cancellation
             .send_modify(|epoch| *epoch = epoch.saturating_add(1));
+        let generation = state.generation;
         drop(state);
         (self.changed)();
+        Ok(generation)
     }
 
     /// Obtain a current credential, committing a complete refresh before use.
+    #[cfg(test)]
     async fn credential(self: &Arc<Self>) -> Result<Arc<Tokens>, Fault> {
+        self.credential_for(None).await
+    }
+    async fn credential_for(self: &Arc<Self>, scope: Option<Scope>) -> Result<Arc<Tokens>, Fault> {
         let service = self.clone();
-        self.spawn(async move { service.credential_owned().await })?
+        self.spawn(async move { service.credential_owned(scope).await })?
             .await
             .map_err(|_| Fault::Vault)?
     }
 
-    async fn credential_owned(&self) -> Result<Arc<Tokens>, Fault> {
+    async fn credential_owned(&self, scope: Option<Scope>) -> Result<Arc<Tokens>, Fault> {
+        if let Some(scope) = scope {
+            self.require_scope(scope)?;
+        }
         self.load_owned().await?;
         let _guard = self.mutation.lock().await;
+        if let Some(scope) = scope {
+            self.require_scope(scope)?;
+        }
         let pending = self
             .state
             .read()
@@ -835,7 +931,10 @@ impl Service {
         }
         let tokens = {
             let state = self.state.read().unwrap_or_else(|e| e.into_inner());
-            if state.stopped || !state.foreground {
+            if scope.is_some_and(|scope| !self.matches_scope(&state, scope)) {
+                return Err(Fault::Cancelled);
+            }
+            if state.stopped || state.pending_signout.is_some() || !state.foreground {
                 return Err(Fault::SessionExpired);
             }
             state.tokens.clone().ok_or(Fault::SessionExpired)?
@@ -880,7 +979,10 @@ impl Service {
         self.persist_rotation(fresh.clone()).await?;
         let stopped = {
             let state = self.state.read().unwrap_or_else(|e| e.into_inner());
-            state.stopped || !state.foreground
+            state.stopped
+                || state.pending_signout.is_some()
+                || !state.foreground
+                || scope.is_some_and(|scope| !self.matches_scope(&state, scope))
         };
         if stopped {
             Err(Fault::Cancelled)
@@ -911,8 +1013,18 @@ impl Service {
 
     /// Fetch this account's catalog, not proof of inference entitlement.
     pub async fn refresh_models(self: &Arc<Self>) -> Result<(), Fault> {
+        self.refresh_models_scoped(self.scope()?).await
+    }
+    /// Observe the catalog only within the atomically admitted native profile scope.
+    pub async fn refresh_models_scoped(self: &Arc<Self>, scope: Scope) -> Result<(), Fault> {
+        self.refresh_models_for(Some(scope)).await
+    }
+    async fn refresh_models_for(self: &Arc<Self>, scope: Option<Scope>) -> Result<(), Fault> {
+        if let Some(scope) = scope {
+            self.require_scope(scope)?;
+        }
         let mut cancellation = self.cancellation.subscribe();
-        let tokens = self.credential().await?;
+        let tokens = self.credential_for(scope).await?;
         if cancellation.has_changed().unwrap_or(true) {
             return Err(Fault::Cancelled);
         }
@@ -924,6 +1036,7 @@ impl Service {
         {
             let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
             if state.stopped
+                || state.pending_signout.is_some()
                 || !state.foreground
                 || cancellation.has_changed().unwrap_or(true)
                 || !state
@@ -949,6 +1062,7 @@ impl Service {
     pub fn lease(&self) -> Option<Lease> {
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         (!state.stopped
+            && state.pending_signout.is_none()
             && state.foreground
             && state.pending_rotation.is_none()
             && state.tokens.is_some())
@@ -958,6 +1072,7 @@ impl Service {
     fn accepts(&self, lease: Lease, model: &str) -> bool {
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         !state.stopped
+            && state.pending_signout.is_none()
             && state.foreground
             && state.pending_rotation.is_none()
             && state.tokens.is_some()
@@ -973,10 +1088,28 @@ impl Service {
         events: &(dyn Fn(WorkModelEvent) + Send + Sync),
     ) -> Result<WorkModelOutcome, WorkModelError> {
         let mut cancellation = self.cancellation.subscribe();
-        if !self.accepts(lease, &request.model.model) {
-            return Err(work_fault(Fault::SessionExpired));
-        }
-        let tokens = self.credential().await.map_err(work_fault)?;
+        let scope = {
+            let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+            if state.stopped
+                || state.pending_signout.is_some()
+                || !state.foreground
+                || state.pending_rotation.is_some()
+                || state.tokens.is_none()
+                || state.session != lease.0
+                || !state
+                    .models
+                    .iter()
+                    .any(|entry| entry.slug == request.model.model)
+            {
+                return Err(work_fault(Fault::SessionExpired));
+            }
+            Scope {
+                generation: state.generation,
+                profile: zephium_core::ids::ProfileId::parse(&self.profile)
+                    .ok_or_else(|| work_fault(Fault::Invalid))?,
+            }
+        };
+        let tokens = self.credential_for(Some(scope)).await.map_err(work_fault)?;
         if !self.accepts(lease, &request.model.model) {
             return Err(work_fault(Fault::SessionExpired));
         }
@@ -1003,20 +1136,53 @@ impl Service {
 
     /// Stop requests, attempt revocation, then clear local tokens but retain mapping.
     pub async fn sign_out(self: &Arc<Self>) -> Result<(), Fault> {
-        // Publish before waiting on a refresh/vault lock: even a simultaneous
-        // ready stream terminal cannot deliver after this operation is observed.
-        self.stop();
-        let service = self.clone();
-        self.spawn(async move { service.sign_out_owned().await })?
-            .await
-            .map_err(|_| Fault::Vault)?
+        self.sign_out_scoped(self.scope()?).await
     }
 
-    async fn sign_out_owned(&self) -> Result<(), Fault> {
+    /// Stop and disconnect only within an atomically captured native profile scope.
+    pub async fn sign_out_scoped(self: &Arc<Self>, scope: Scope) -> Result<(), Fault> {
+        let generation = self.stop_for(Some(scope), false)?;
+        let scope = Scope {
+            generation,
+            ..scope
+        };
+        let service = self.clone();
+        let task = self.spawn(async move {
+            let result = service.sign_out_owned(scope).await;
+            if let Err(fault) = result {
+                service.abandon_pending_signout(scope.generation, fault);
+            }
+            result
+        });
+        match task {
+            Ok(task) => task.await.map_err(|_| Fault::Vault)?,
+            Err(fault) => {
+                self.abandon_pending_signout(scope.generation, fault);
+                Err(fault)
+            }
+        }
+    }
+    fn abandon_pending_signout(&self, generation: u64, fault: Fault) {
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        if state.pending_signout != Some(generation) {
+            return;
+        }
+        state.pending_signout = None;
+        state.fault = Some(fault);
+        drop(state);
+        (self.changed)();
+    }
+    async fn sign_out_owned(&self, scope: Scope) -> Result<(), Fault> {
+        self.require_scope(scope)?;
         self.load_owned().await?;
         let _guard = self.mutation.lock().await;
         let (identity, pending, revocations) = {
             let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+            if !self.matches_scope(&state, scope) {
+                return Err(Fault::Cancelled);
+            }
+            state.stopped = true;
+            state.pending_signout = None;
             state.fault = None;
             let current = state
                 .pending_rotation
@@ -1827,5 +1993,129 @@ mod tests {
         assert!(service.state.read().unwrap().identity.is_none());
         assert!(service.state.read().unwrap().pending_rotation.is_none());
         assert!(service.lease().is_none());
+    }
+    #[tokio::test]
+    async fn captured_native_scope_rejects_every_stale_command_without_side_effects() {
+        let (service, vault, transport) = fixture(Some(token("active", u64::MAX)));
+        let scope = service.scope().unwrap();
+        service.set_foreground(false);
+        service.set_foreground(true);
+        let generation = service.state.read().unwrap().generation;
+        assert_eq!(service.load_scoped(scope).await, Err(Fault::Cancelled));
+        assert_eq!(
+            service
+                .sign_in_scoped(scope, ATTEMPT.into(), |_| async {
+                    panic!("stale admission must not open browser")
+                })
+                .await,
+            Err(Fault::Cancelled)
+        );
+        assert_eq!(
+            service.refresh_models_scoped(scope).await,
+            Err(Fault::Cancelled)
+        );
+        assert_eq!(
+            service.cancel_scoped(scope, ATTEMPT).await,
+            Err(Fault::Cancelled)
+        );
+        assert_eq!(service.sign_out_scoped(scope).await, Err(Fault::Cancelled));
+        assert_eq!(service.state.read().unwrap().generation, generation);
+        assert!(service.view().connected);
+        assert!(vault.record.lock().unwrap().is_none());
+        assert!(transport.revoked.lock().unwrap().is_empty());
+        assert_eq!(transport.refreshes.load(Ordering::SeqCst), 0);
+        let foreign = Scope {
+            profile: zephium_core::ids::ProfileId::from(2_u128),
+            ..service.scope().unwrap()
+        };
+        assert_eq!(
+            service.sign_out_scoped(foreign).await,
+            Err(Fault::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_scoped_disconnect_retires_output_but_does_not_erase_after_profile_bounce() {
+        let (service, vault, transport) = fixture(Some(token("active", u64::MAX)));
+        let scope = service.scope().unwrap();
+        let held = service.mutation.lock().await;
+        let disconnect = tokio::spawn({
+            let service = service.clone();
+            async move { service.sign_out_scoped(scope).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while service.tasks.state.lock().unwrap().active == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        service.set_foreground(false);
+        service.set_foreground(true);
+        drop(held);
+        assert_eq!(disconnect.await.unwrap(), Err(Fault::Cancelled));
+        assert!(service.view().connected);
+        assert!(vault.record.lock().unwrap().is_none());
+        assert!(transport.revoked.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retired_queued_work_lease_does_not_rotate_credentials() {
+        let (service, _, transport) = fixture(Some(token("expired", 1)));
+        service.state.write().unwrap().models = vec![Model {
+            slug: "gpt-fixture".into(),
+            display_name: "Fixture".into(),
+        }];
+        let lease = service.lease().unwrap();
+        let held = service.mutation.lock().await;
+        use zephium_core::work::model::*;
+        let request = WorkModelRequest {
+            image_fence: None,
+            model: WorkModelRef {
+                provider: WorkModelProvider::OpenAi,
+                wire: WorkModelWire::OpenAiResponses,
+                model: "gpt-fixture".into(),
+            },
+            system: vec![],
+            tools: vec![],
+            messages: vec![],
+            max_output_tokens: 100,
+            reasoning: None,
+            native_search: false,
+            parallel_tools: false,
+            tool_choice: WorkModelToolChoice::Auto,
+            volatile_tail: 0,
+            cache_key: None,
+        };
+        let call = tokio::spawn({
+            let service = service.clone();
+            async move { service.call(lease, request, &|_| {}).await.err() }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while service.tasks.state.lock().unwrap().active == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        service.set_foreground(false);
+        service.set_foreground(true);
+        drop(held);
+        assert_eq!(call.await.unwrap(), Some(work_fault(Fault::Cancelled)));
+        assert_eq!(transport.refreshes.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn rejected_disconnect_task_does_not_leave_a_false_signed_out_projection() {
+        let (service, _, transport) = fixture(Some(token("active", u64::MAX)));
+        service.tasks.state.lock().unwrap().active = 64;
+        assert_eq!(
+            service.sign_out_scoped(service.scope().unwrap()).await,
+            Err(Fault::Busy)
+        );
+        assert!(service.view().connected);
+        assert_eq!(service.view().fault, Some(Fault::Busy));
+        assert!(service.state.read().unwrap().pending_signout.is_none());
+        assert!(transport.revoked.lock().unwrap().is_empty());
+        service.tasks.state.lock().unwrap().active = 0;
     }
 }
