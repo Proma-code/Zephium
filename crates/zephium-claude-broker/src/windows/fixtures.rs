@@ -13,8 +13,13 @@ use std::{
 
 struct Root(std::path::PathBuf, bool);
 impl Root {
-    fn new(path: std::path::PathBuf) -> Self {
-        Self(path, true)
+    fn create(path: std::path::PathBuf, profile: &Profile) -> Result<Self, &'static str> {
+        profile.create_directory(&path, false)?;
+        Ok(Self(path, true))
+    }
+    fn create_sentinel(path: std::path::PathBuf) -> Result<Self, &'static str> {
+        std::fs::create_dir(&path).map_err(|_| "fresh sentinel creation failed")?;
+        Ok(Self(path, true))
     }
     fn cleanup(mut self) -> Result<(), &'static str> {
         std::fs::remove_dir_all(&self.0).map_err(|_| "private fixture cleanup failed")?;
@@ -51,19 +56,33 @@ pub(crate) fn qualify() -> Result<(), &'static str> {
             .map_err(|_| "clock unavailable")?
             .as_nanos()
     );
-    let root = Root::new(std::env::temp_dir().join(format!("Zephium.ClaudeFixture.{suffix}")));
-    std::fs::create_dir(&root.0).map_err(|_| "fixture root creation failed")?;
     let profile = Profile::create(&format!("Zephium.ClaudeFixture.{suffix}"))?;
+    let root = Root::create(
+        std::env::temp_dir().join(format!("Zephium.ClaudeFixture.{suffix}")),
+        &profile,
+    )?;
     let layout = Layout::create(&root.0, &profile)?;
     let image_path = root.0.join("fixture.exe");
-    std::fs::copy(
-        std::env::current_exe().map_err(|_| "fixture identity unavailable")?,
+    profile.copy_image(
+        &std::env::current_exe().map_err(|_| "fixture identity unavailable")?,
         &image_path,
-    )
-    .map_err(|_| "fixture image staging failed")?;
-    profile.seal(&image_path, false)?;
+    )?;
     let hash =
         security::hash(&mut File::open(&image_path).map_err(|_| "fixture image unavailable")?)?;
+    // An existing target cannot be adopted, overwritten, re-owned or cleaned up
+    // by a failed fresh-create attempt.
+    if Root::create(root.0.clone(), &profile).is_ok() || !root.0.is_dir() {
+        return Err("existing root creation collision was not preserved");
+    }
+    if profile.copy_image(&image_path, &image_path).is_ok() || !image_path.is_file() {
+        return Err("existing image creation collision was not preserved");
+    }
+    let after_collision = security::hash(
+        &mut File::open(&image_path).map_err(|_| "collision removed existing image")?,
+    )?;
+    if after_collision != hash {
+        return Err("collision changed existing image bytes");
+    }
     let image = HeldImage::open(&image_path, hash)?;
     let cancelled = AtomicBool::new(false);
     let input = "synthetic stdin • split UTF-8\n".as_bytes().to_vec();
@@ -102,8 +121,9 @@ pub(crate) fn qualify() -> Result<(), &'static str> {
     }
     // Sentinel belongs to the fixture, not the user. Ordinary parent can access it;
     // the LPAC receives no grant outside its own sealed root.
-    let sentinel = Root::new(std::env::temp_dir().join(format!("Zephium.ClaudeSentinel.{suffix}")));
-    std::fs::create_dir(&sentinel.0).map_err(|_| "sentinel creation failed")?;
+    let sentinel = Root::create_sentinel(
+        std::env::temp_dir().join(format!("Zephium.ClaudeSentinel.{suffix}")),
+    )?;
     let sentinel_file = sentinel.0.join("private.txt");
     std::fs::write(&sentinel_file, b"synthetic private sentinel")
         .map_err(|_| "sentinel write failed")?;
@@ -251,13 +271,14 @@ pub(crate) fn vendor_probe(source: &std::path::Path) -> Result<(), &'static str>
             .map_err(|_| "clock unavailable")?
             .as_nanos()
     );
-    let root = Root::new(std::env::temp_dir().join(format!("Zephium.ClaudeFixture.{suffix}")));
-    std::fs::create_dir(&root.0).map_err(|_| "vendor fixture root unavailable")?;
     let profile = Profile::create(&format!("Zephium.ClaudeFixture.{suffix}"))?;
+    let root = Root::create(
+        std::env::temp_dir().join(format!("Zephium.ClaudeFixture.{suffix}")),
+        &profile,
+    )?;
     let layout = Layout::create(&root.0, &profile)?;
     let target = root.0.join("claude.exe");
-    std::fs::copy(&original.path, &target).map_err(|_| "vendor fixture staging failed")?;
-    profile.seal(&target, false)?;
+    profile.copy_image(&original.path, &target)?;
     let image = HeldImage::open(&target, signature::CANDIDATE_SHA256)?;
     signature::verify(&image)?;
     let cancelled = AtomicBool::new(false);

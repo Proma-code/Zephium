@@ -15,7 +15,7 @@ use std::{
 use windows::{
     core::{BOOL, PCWSTR, PWSTR},
     Win32::{
-        Foundation::{LocalFree, HANDLE, HLOCAL},
+        Foundation::{LocalFree, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL},
         Security::{
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -24,14 +24,15 @@ use windows::{
             CopySid, CreateWellKnownSid, FreeSid, GetLengthSid, GetSecurityDescriptorDacl,
             GetSecurityDescriptorSacl, GetTokenInformation,
             Isolation::{CreateAppContainerProfile, DeleteAppContainerProfile},
-            TokenUser, WinCapabilityInternetClientSid, DACL_SECURITY_INFORMATION,
+            TokenOwner, TokenUser, WinCapabilityInternetClientSid, DACL_SECURITY_INFORMATION,
             LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-            PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES,
-            SID_AND_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+            PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+            SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
         },
         Storage::FileSystem::{
-            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_READ_ATTRIBUTES,
-            READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+            CreateDirectoryW, CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_MODE, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
         },
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     },
@@ -73,6 +74,35 @@ fn owner_sid() -> Result<String, &'static str> {
     sid_string(unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid })
 }
 
+struct Descriptor(PSECURITY_DESCRIPTOR);
+impl Drop for Descriptor {
+    fn drop(&mut self) {
+        unsafe { LocalFree(Some(HLOCAL(self.0 .0))) };
+    }
+}
+fn default_owner_matches_user() -> Result<bool, &'static str> {
+    let mut raw = HANDLE::default();
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) }
+        .map_err(|_| "default owner token unavailable")?;
+    let token = unsafe { OwnedHandle::from_raw_handle(raw.0) };
+    let mut buffer = [0usize; 128];
+    let mut length = 0;
+    unsafe {
+        GetTokenInformation(
+            handle(&token),
+            TokenOwner,
+            Some(buffer.as_mut_ptr().cast()),
+            size_of_val(&buffer) as u32,
+            &mut length,
+        )
+    }
+    .map_err(|_| "default owner unavailable")?;
+    if length < size_of::<TOKEN_OWNER>() as u32 || length as usize > size_of_val(&buffer) {
+        return Err("default owner invalid");
+    }
+    let owner = sid_string(unsafe { (*buffer.as_ptr().cast::<TOKEN_OWNER>()).Owner })?;
+    Ok(owner == owner_sid()?)
+}
 pub(super) struct Profile {
     delete_on_drop: bool,
     name: Vec<u16>,
@@ -88,6 +118,10 @@ impl Profile {
         {
             return Err("invalid private identity");
         }
+        super::diagnostic(
+            "default-owner-equals-token-user",
+            i32::from(default_owner_matches_user()?),
+        );
         let name = wide(OsStr::new(name))?;
         // SAFETY: all UTF-16 strings are live, NUL-terminated; no capabilities yet.
         let sid = unsafe {
@@ -161,12 +195,80 @@ impl Profile {
         };
         operation(&capabilities)
     }
-    pub(super) fn seal(&self, path: &Path, writable: bool) -> Result<(), &'static str> {
+    fn descriptor(&self, writable: bool) -> Result<Descriptor, &'static str> {
         let owner = owner_sid()?;
         let package = sid_string(PSID(self.sid.as_ptr().cast_mut().cast()))?;
         let access = if writable { "FA" } else { "GRGX" };
-        // Host and SYSTEM own the directory. No ALL APPLICATION PACKAGES grant.
-        let sddl = wide(OsStr::new(&format!("D:P(A;OICI;FA;;;{owner})(A;OICI;FA;;;SY)(A;OICI;{access};;;{package})S:(ML;OICI;NW;;;LW)")))?;
+        let sddl = wide(OsStr::new(&format!("O:{owner}D:P(A;OICI;FA;;;{owner})(A;OICI;FA;;;SY)(A;OICI;{access};;;{package})S:(ML;OICI;NW;;;LW)")))?;
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(sddl.as_ptr()),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                None,
+            )
+        }
+        .map_err(|_| "private descriptor invalid")?;
+        Ok(Descriptor(descriptor))
+    }
+    /// Fresh creation only: an existing path is never adopted or re-owned.
+    pub(super) fn create_directory(&self, path: &Path, writable: bool) -> Result<(), &'static str> {
+        let descriptor = self.descriptor(writable)?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0 .0,
+            bInheritHandle: false.into(),
+        };
+        let path = wide(path.as_os_str())?;
+        // SAFETY: descriptor/path live through creation; owner is the caller's
+        // TokenUser, not an arbitrary SID or an elevated token's default group.
+        unsafe { CreateDirectoryW(PCWSTR(path.as_ptr()), Some(&attributes)) }.map_err(|error| {
+            super::diagnostic("private-directory-create", error.code().0);
+            "fresh private directory creation failed"
+        })
+    }
+    /// Stage unchanged bytes into a CREATE_NEW file with explicit caller owner.
+    pub(super) fn copy_image(&self, source: &Path, target: &Path) -> Result<(), &'static str> {
+        let input = File::open(source).map_err(|_| "image source unavailable")?;
+        let length = input
+            .metadata()
+            .map_err(|_| "image source metadata unavailable")?
+            .len();
+        if length > 512 * 1024 * 1024 {
+            return Err("image source too large");
+        }
+        let descriptor = self.descriptor(false)?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0 .0,
+            bInheritHandle: false.into(),
+        };
+        let path = wide(target.as_os_str())?;
+        let raw = unsafe {
+            CreateFileW(
+                PCWSTR(path.as_ptr()),
+                (GENERIC_READ | GENERIC_WRITE).0,
+                FILE_SHARE_MODE(0),
+                Some(&attributes),
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        }
+        .map_err(|_| "fresh private image creation failed")?;
+        let mut output = File::from(unsafe { OwnedHandle::from_raw_handle(raw.0) });
+        let copied = std::io::copy(&mut input.take(512 * 1024 * 1024 + 1), &mut output)
+            .map_err(|_| "private image copy failed")?;
+        if copied != length {
+            return Err("private image copy length mismatch");
+        }
+        output.sync_all().map_err(|_| "private image sync failed")?;
+        drop(output);
+        self.seal(target, false)
+    }
+    pub(super) fn seal(&self, path: &Path, writable: bool) -> Result<(), &'static str> {
+        let owner = owner_sid()?;
         let file = OpenOptions::new()
             .access_mode((READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES).0)
             .share_mode(0)
@@ -209,19 +311,8 @@ impl Profile {
         if actual? != owner {
             return Err("private target owner mismatch");
         }
-        let mut descriptor = PSECURITY_DESCRIPTOR::default();
-        unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                PCWSTR(sddl.as_ptr()),
-                SDDL_REVISION_1,
-                &mut descriptor,
-                None,
-            )
-        }
-        .map_err(|_| "private descriptor invalid")?;
-        let result = assign(&file, descriptor);
-        unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
-        result
+        let descriptor = self.descriptor(writable)?;
+        assign(&file, descriptor.0)
     }
 }
 impl Drop for Profile {

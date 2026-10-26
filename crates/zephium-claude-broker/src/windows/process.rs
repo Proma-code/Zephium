@@ -134,7 +134,7 @@ impl Layout {
             &result.appdata,
             &result.localappdata,
         ] {
-            std::fs::create_dir(path).map_err(|_| "private directory creation failed")?;
+            profile.create_directory(path, path != &result.work)?;
             profile.seal(path, path != &result.work)?;
         }
         Ok(result)
