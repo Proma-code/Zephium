@@ -29,7 +29,10 @@ use windows::{
             PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES,
             SID_AND_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
         },
-        Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION},
+        Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_READ_ATTRIBUTES,
+            READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+        },
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     },
 };
@@ -165,7 +168,7 @@ impl Profile {
         // Host and SYSTEM own the directory. No ALL APPLICATION PACKAGES grant.
         let sddl = wide(OsStr::new(&format!("D:P(A;OICI;FA;;;{owner})(A;OICI;FA;;;SY)(A;OICI;{access};;;{package})S:(ML;OICI;NW;;;LW)")))?;
         let file = OpenOptions::new()
-            .access_mode(0x000c_0080)
+            .access_mode((READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES).0)
             .share_mode(0)
             .custom_flags(OPEN_NOFOLLOW_DIRECTORY)
             .open(path)
@@ -197,7 +200,10 @@ impl Profile {
             )
         }
         .ok()
-        .map_err(|_| "private owner unavailable")?;
+        .map_err(|error| {
+            super::diagnostic("private-owner-query", error.code().0);
+            "private owner unavailable"
+        })?;
         let actual = sid_string(actual_owner);
         unsafe { LocalFree(Some(HLOCAL(current.0))) };
         if actual? != owner {

@@ -923,14 +923,17 @@ test("one custom provider seat offers independent endpoint and local gateway sou
   await expect
     .element(screen.getByRole("button", { name: "Local gateway", exact: true }))
     .toHaveAttribute("aria-pressed", "true");
-  await expect.element(screen.getByRole("option", { name: "Example", exact: true })).toBeVisible();
+  await expect.element(screen.getByRole("option", { name: /^Example(?:\s|$)/u })).toBeVisible();
+  await expect
+    .element(screen.getByRole("option", { name: /^Example(?:\s|$)/u }))
+    .toHaveAttribute("data-id", id);
   await expect
     .element(screen.getByText("Gateway quota and pricing are not reported."))
     .toBeVisible();
   const calls = native.choose.mock.calls.length;
   await screen.getByRole("button", { name: "Custom endpoint", exact: true }).click();
   await expect
-    .element(screen.getByRole("option", { name: "Example", exact: true }))
+    .element(screen.getByRole("option", { name: /^Example(?:\s|$)/u }))
     .not.toBeInTheDocument();
   expect(native.choose).toHaveBeenCalledTimes(calls);
   expect(gateway.check).not.toHaveBeenCalled();

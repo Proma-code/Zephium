@@ -249,7 +249,7 @@ test("ChatGPT models can be chosen without enabling OpenAI API-key rows", async 
   );
   native.read.mockResolvedValue(view);
   const screen = await render(AiPage);
-  await screen.getByRole("combobox", { name: "Work", exact: true }).click();
+  await screen.getByRole("button", { name: "Work", exact: true }).click();
   await expect
     .element(page.getByRole("option", { name: /GPT Account/u }))
     .toHaveAccessibleDescription("ChatGPT");
@@ -326,7 +326,7 @@ test("native gateway models are selectable without a custom endpoint and source 
   );
   native.read.mockResolvedValue(view);
   const screen = await render(AiPage);
-  await screen.getByRole("combobox", { name: "Work", exact: true }).click();
+  await screen.getByRole("button", { name: "Work", exact: true }).click();
   await expect
     .element(page.getByRole("option", { name: "Example model", exact: true }))
     .toHaveAccessibleDescription("Local gateway");
