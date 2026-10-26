@@ -240,7 +240,92 @@ impl FixtureStoreOwner {
     }
 }
 
+/// A ready image and its exact native lease are inseparable. The image remains
+/// open without write/delete sharing from full hash/signature admission until
+/// this bundle is dropped; request admission only rechecks held identity/policy.
+pub(super) struct PreparedStore {
+    image: super::signature::VerifiedImage,
+    lease: StoreLease,
+}
+impl PreparedStore {
+    pub(super) fn profile_key(&self) -> crate::registration::ProfileKey {
+        self.lease.profile_key()
+    }
+    pub(super) fn verify(&self) -> Result<(), Error> {
+        self.lease.verify()?;
+        self.lease.inner.require_clean()?;
+        self.verify_image()
+    }
+    fn verify_image(&self) -> Result<(), Error> {
+        let receipt = &self.lease.inner.receipt.0;
+        let root = &self.lease.inner.chain.last().ok_or(Error::Invalid)?.file;
+        let held = self.image.held();
+        if held.path != native::canonical_parent(root)?.join("claude.exe") {
+            return Err(Error::Invalid);
+        }
+        let expected = native::identity(&held.file, false)?;
+        native::verify_file(
+            root,
+            "claude.exe",
+            &held.file,
+            expected,
+            &Policy::image_file(&receipt.owner_sid, &receipt.package_sid),
+        )
+    }
+    pub(super) fn begin_operation(&self) -> Result<ActiveStore, Error> {
+        let active = self.lease.begin_operation()?;
+        // This can only inspect the image paired with this exact lease. Failure
+        // drops the owned ActiveStore into quarantine before any child exists.
+        self.verify_image()?;
+        Ok(active)
+    }
+    pub(super) fn image(&self) -> &super::signature::VerifiedImage {
+        &self.image
+    }
+}
+
 impl StoreLease {
+    /// No child can be created by this finite preparation path. Pending lifecycle
+    /// custody precedes this call and lasts through any blocking WinTrust call;
+    /// cancellation/deadline checks never claim that the OS call was interrupted.
+    pub(super) fn prepare_verified_image(
+        self,
+        source: &super::signature::VerifiedImage,
+        control: &crate::lifecycle::PreparationControl,
+    ) -> Result<PreparedStore, Error> {
+        use std::time::Instant;
+        if control.scope().profile() != self.profile_key().profile
+            || control.cancelled(Instant::now())
+        {
+            return Err(Error::Invalid);
+        }
+        let active = self.begin_operation()?;
+        let started = Instant::now();
+        let image = active.stage_verified_image(source)?;
+        let returned = Instant::now();
+        super::diagnostic(
+            "durable-image-preparation-elapsed-ms",
+            returned
+                .duration_since(started)
+                .as_millis()
+                .min(i32::MAX as u128) as i32,
+        );
+        if control.cancelled(returned) {
+            return Err(Error::Invalid);
+        }
+        let prepared = PreparedStore { image, lease: self };
+        // Complete every fallible image/identity check while ActiveStore still
+        // owns DIRTY. A failed final check cannot leave an unvalidated CLEAN slot.
+        prepared.lease.verify()?;
+        prepared.verify_image()?;
+        if control.cancelled(Instant::now()) {
+            return Err(Error::Invalid);
+        }
+        // Private no-child completion: all fixed copy/hash/trust work actually
+        // returned under the same active lease. No transferable CLEAN token.
+        active.settle(WorkerSettled { _private: () })?;
+        Ok(prepared)
+    }
     /// Read-only failed-operation observation; never grants cleanup authority.
     pub(super) fn fixture_failed_dirty(&self) -> Result<(), Error> {
         if !self.inner.quarantined.load(Ordering::Acquire)

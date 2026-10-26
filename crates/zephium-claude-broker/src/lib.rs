@@ -11,6 +11,8 @@ mod account;
 #[allow(dead_code)]
 mod auth;
 pub mod custody;
+#[allow(dead_code)]
+pub mod lifecycle;
 #[cfg(any(test, all(windows, feature = "native-fixtures")))]
 mod fresh_status;
 #[cfg(any(test, all(windows, feature = "native-fixtures")))]

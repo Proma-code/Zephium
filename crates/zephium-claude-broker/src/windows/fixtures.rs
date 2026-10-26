@@ -592,8 +592,7 @@ fn fresh_empty_status(original: &HeldImage) -> Result<(), &'static str> {
 /// from the on-disk registration. Only a fresh opaque synthetic anchor survives.
 /// This does not open the native trial namespace or prove credential durability.
 fn durable_empty_status(original: &HeldImage) -> Result<(), &'static str> {
-    use super::account_store::registration::FixtureAnchor;
-    use crate::registration::PolicyVersion;
+    use super::{account_store::registration::FixtureAnchor, port::RegisteredStatusFactory};
     let anchor = FixtureAnchor::fresh().map_err(|_| "durable status anchor failed")?;
     let profile = anchor
         .new_profile()
@@ -602,66 +601,68 @@ fn durable_empty_status(original: &HeldImage) -> Result<(), &'static str> {
         let factory = anchor
             .create_factory()
             .map_err(|_| "durable status new factory failed")?;
-        let lease = factory
-            .create(profile, PolicyVersion::DataV1)
-            .map_err(|_| "durable status fresh registration failed")?;
-        let key = lease.profile_key();
         let image = super::signature::VerifiedImage::open(&original.path)?;
-        let (owner, port) = super::port::RegisteredStatusPort::create(lease, image)?;
-        registered_signed_out(owner, port)?;
+        let mut adapter = RegisteredStatusFactory::fresh_fixture(&factory, image);
+        let key = registered_signed_out(profile, &mut adapter)?;
         super::diagnostic("durable-status-created", 0);
         key
     };
-    // No retained first factory, Profile, StoreLease, Receipt, Port or AccountOwner
-    // crosses this boundary. The ProfileKey below is expected public identity,
-    // not a clean/authentication proof or authority to bypass on-disk validation.
+    // No first Profile, StoreLease, Receipt, Port, lifecycle registry or account
+    // owner survives. Only native profile/key values and the synthetic parent
+    // anchor remain; the second factory validates the full registration on disk.
     {
         let factory = anchor
             .reopen_factory()
             .map_err(|_| "durable status disk factory failed")?;
-        let lease = factory
-            .reopen(profile, PolicyVersion::DataV1)
-            .map_err(|_| "durable status disk registration failed")?;
-        if lease.profile_key() != key {
+        let image = super::signature::VerifiedImage::open(&original.path)?;
+        let mut adapter = RegisteredStatusFactory::reopened_fixture(&factory, image, key);
+        if registered_signed_out(profile, &mut adapter)? != key {
             return Err("durable status incarnation changed");
         }
-        let image = super::signature::VerifiedImage::open(&original.path)?;
-        let (owner, port) = super::port::RegisteredStatusPort::create(lease, image)?;
-        registered_signed_out(owner, port)?;
         super::diagnostic("durable-status-reopened", 0);
     }
-    // Fresh synthetic residue is deliberately retained, never recursively
-    // adopted/deleted. The disposable runner owns its eventual teardown.
+    // Fresh synthetic residue is deliberately retained; never adopted/deleted.
     super::diagnostic("durable-status-owner-settled", 0);
     Ok(())
 }
 
 fn registered_signed_out(
-    owner: crate::account::AccountOwner,
-    mut port: super::port::RegisteredStatusPort,
-) -> Result<(), &'static str> {
-    use crate::account::{Reply, Request};
-    use crate::protocol::AuthStatus;
+    profile: [u8; 16],
+    factory: &mut super::port::RegisteredStatusFactory<'_>,
+) -> Result<crate::registration::ProfileKey, &'static str> {
+    use crate::{
+        account::{Reply, Request},
+        lifecycle::TrialAccounts,
+        protocol::AuthStatus,
+    };
     use std::time::Instant;
-    if owner.view().status.is_some() {
-        return Err("durable status projected authentication from disk");
-    }
-    let work = owner
-        .begin(
-            owner.scope().map_err(|_| "durable status scope failed")?,
-            Request::ReadStatus,
-            Instant::now(),
-        )
+    let accounts = TrialAccounts::new();
+    accounts.profiles_changed(&[profile], Some(profile));
+    let scope = accounts
+        .current_scope()
+        .map_err(|_| "durable preparation scope failed")?;
+    accounts
+        .prepare(scope)
+        .map_err(|_| "durable preparation reservation failed")?
+        .run(factory)
+        .map_err(|_| "durable image preparation failed")?;
+    let key = factory
+        .observed_key()
+        .ok_or("durable prepared identity missing")?;
+    // Factory construction checks a newly created AccountOwner has no projected
+    // authentication. Only this separately admitted original readback sets it.
+    let work = accounts
+        .begin(scope, Request::ReadStatus, Instant::now())
         .map_err(|_| "durable status admission failed")?;
-    if work.run(&mut port, Instant::now) != Ok(Reply::Status(AuthStatus::SignedOut))
-        || !owner.drained()
-        || owner.view().status != Some(AuthStatus::SignedOut)
-    {
+    if work.run() != Ok(Reply::Status(AuthStatus::SignedOut)) {
         return Err("durable status owner did not settle signed out");
     }
-    owner.close();
-    drop(owner);
-    port.close()
+    accounts.close();
+    if !accounts.closed_and_drained() {
+        return Err("durable lifecycle did not drain");
+    }
+    drop(accounts); // Drops the retained resource/Port/image/lease after actual return.
+    Ok(key)
 }
 
 pub(super) fn receipt(stage: &'static str, output: &process::Output) {

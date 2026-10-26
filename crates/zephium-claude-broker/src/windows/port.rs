@@ -108,20 +108,18 @@ mod native {
     /// production constructor/UI or original login operation calls it yet.
     pub(in crate::windows) struct RegisteredStatusPort {
         policy: RetainedStatusOnly,
-        original: signature::VerifiedImage,
-        lease: crate::windows::account_store::StoreLease,
+        prepared: crate::windows::account_store::PreparedStore,
     }
     impl RegisteredStatusPort {
-        pub(in crate::windows) fn create(
-            lease: crate::windows::account_store::StoreLease,
-            original: signature::VerifiedImage,
+        fn from_prepared(
+            prepared: crate::windows::account_store::PreparedStore,
         ) -> Result<(AccountOwner, Self), &'static str> {
             use std::sync::atomic::{AtomicU64, Ordering};
             static NEXT_LIFETIME: AtomicU64 = AtomicU64::new(1);
-            lease
+            prepared
                 .verify()
                 .map_err(|_| "registered status lease rejected")?;
-            let key = lease.profile_key();
+            let key = prepared.profile_key();
             let generation = NEXT_LIFETIME
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                     value.checked_add(1)
@@ -141,13 +139,12 @@ mod native {
                         owner: identity,
                         key,
                     },
-                    original,
-                    lease,
+                    prepared,
                 },
             ))
         }
         pub(in crate::windows) fn close(self) -> Result<(), &'static str> {
-            self.lease
+            self.prepared
                 .verify()
                 .map_err(|_| "registered status close unconfirmed")?;
             // No persistent directory, OS profile or cached image is deleted.
@@ -159,48 +156,32 @@ mod native {
     impl Port for RegisteredStatusPort {
         fn run(&mut self, request: Request, control: &Control) -> Result<Reply, Error> {
             use crate::windows::{account_store::ActiveStore, process};
-            self.policy
-                .admit(&request, control, self.lease.profile_key(), Instant::now())?;
-            let active = self.lease.begin_operation().map_err(|_| Error::Process)?;
-            crate::windows::diagnostic("durable-status-dirty-admitted", 0);
-            // Image preparation and the actual spawn both retain this same
-            // operation. The process seam derives all paths from ActiveStore.
-            let image_started = Instant::now();
-            crate::windows::diagnostic(
-                "durable-status-before-image-budget-ms",
-                control
-                    .deadline()
-                    .saturating_duration_since(image_started)
-                    .as_millis()
-                    .min(i32::MAX as u128) as i32,
-            );
-            let image = active
-                .stage_verified_image(&self.original)
+            self.policy.admit(
+                &request,
+                control,
+                self.prepared.profile_key(),
+                Instant::now(),
+            )?;
+            let active = self
+                .prepared
+                .begin_operation()
                 .map_err(|_| Error::Process)?;
-            let image_finished = Instant::now();
+            crate::windows::diagnostic("durable-status-dirty-admitted", 0);
+            // Full hash/trust preparation finished before this AccountOwner
+            // existed. The exact image is still held nonwrite/nondelete; this
+            // admission rechecked its fixed cache identity/policy under DIRTY.
             crate::windows::diagnostic("durable-status-image-held", 0);
             crate::windows::diagnostic(
-                "durable-status-image-elapsed-ms",
-                image_finished
-                    .duration_since(image_started)
-                    .as_millis()
-                    .min(i32::MAX as u128) as i32,
-            );
-            crate::windows::diagnostic(
-                "durable-status-after-image-budget-ms",
+                "durable-status-before-run-budget-ms",
                 control
                     .deadline()
-                    .saturating_duration_since(image_finished)
+                    .saturating_duration_since(Instant::now())
                     .as_millis()
                     .min(i32::MAX as u128) as i32,
-            );
-            crate::windows::diagnostic(
-                "durable-status-after-image-expired",
-                i32::from(image_finished >= control.deadline()),
             );
             let call = process::run_store_status(
                 active,
-                &image,
+                self.prepared.image(),
                 self.policy.key,
                 self.policy.owner,
                 control,
@@ -221,6 +202,92 @@ mod native {
             // CLEAN concerns native operation settlement only. Status comes only
             // from the bounded original-client readback, not the registration.
             Ok(Reply::Status(status))
+        }
+    }
+
+    enum RegistrationMode {
+        Fresh,
+        Reopen(crate::registration::ProfileKey),
+    }
+    /// Synthetic anchor authority is prepared by test setup only. All profile
+    /// create/reopen, image work and AccountOwner creation run inside the actual
+    /// lifecycle reservation, under its native scope/shared admission/deadline.
+    pub(in crate::windows) struct RegisteredStatusFactory<'a> {
+        factory: &'a crate::windows::account_store::registration::TrialStoreFactory,
+        mode: RegistrationMode,
+        source: Option<signature::VerifiedImage>,
+        observed_key: Option<crate::registration::ProfileKey>,
+    }
+    impl<'a> RegisteredStatusFactory<'a> {
+        pub(in crate::windows) fn fresh_fixture(
+            factory: &'a crate::windows::account_store::registration::TrialStoreFactory,
+            image: signature::VerifiedImage,
+        ) -> Self {
+            Self {
+                factory,
+                mode: RegistrationMode::Fresh,
+                source: Some(image),
+                observed_key: None,
+            }
+        }
+        pub(in crate::windows) fn reopened_fixture(
+            factory: &'a crate::windows::account_store::registration::TrialStoreFactory,
+            image: signature::VerifiedImage,
+            key: crate::registration::ProfileKey,
+        ) -> Self {
+            Self {
+                factory,
+                mode: RegistrationMode::Reopen(key),
+                source: Some(image),
+                observed_key: None,
+            }
+        }
+        pub(in crate::windows) fn observed_key(&self) -> Option<crate::registration::ProfileKey> {
+            self.observed_key
+        }
+    }
+    impl crate::lifecycle::Factory for RegisteredStatusFactory<'_> {
+        fn prepare(
+            &mut self,
+            control: &crate::lifecycle::PreparationControl,
+        ) -> Result<crate::lifecycle::Resource, crate::lifecycle::Error> {
+            use crate::{
+                lifecycle::{Error, Resource},
+                registration::PolicyVersion,
+            };
+            let source = self.source.take().ok_or(Error::Preparation)?;
+            if control.cancelled(Instant::now()) {
+                return Err(Error::Stale);
+            }
+            let profile = control.scope().profile();
+            let lease = match self.mode {
+                RegistrationMode::Fresh => self.factory.create(profile, PolicyVersion::DataV1),
+                RegistrationMode::Reopen(expected) => {
+                    if expected.profile != profile {
+                        return Err(Error::Stale);
+                    }
+                    self.factory.reopen(profile, PolicyVersion::DataV1)
+                }
+            }
+            .map_err(|_| Error::Preparation)?;
+            let key = lease.profile_key();
+            if matches!(self.mode, RegistrationMode::Reopen(expected) if expected != key) {
+                return Err(Error::Stale);
+            }
+            let prepared = lease
+                .prepare_verified_image(&source, control)
+                .map_err(|_| Error::Preparation)?;
+            if control.cancelled(Instant::now()) {
+                return Err(Error::Stale);
+            }
+            let (owner, port) =
+                RegisteredStatusPort::from_prepared(prepared).map_err(|_| Error::Preparation)?;
+            if owner.view().status.is_some() {
+                return Err(Error::Preparation);
+            }
+            let resource = Resource::new(control.scope(), owner, port)?;
+            self.observed_key = Some(key);
+            Ok(resource)
         }
     }
 
@@ -336,7 +403,7 @@ mod native {
     }
 }
 #[cfg(all(windows, feature = "native-fixtures"))]
-pub(super) use native::{FreshStatusPort, RegisteredStatusPort};
+pub(super) use native::{FreshStatusPort, RegisteredStatusFactory};
 
 #[cfg(test)]
 mod tests {

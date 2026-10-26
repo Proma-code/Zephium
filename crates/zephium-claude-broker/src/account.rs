@@ -1,4 +1,5 @@
-//! Candidate all-operation owner. Only synthetic ports implement this boundary.
+//! Candidate all-operation owner. Native ports remain separately qualified and
+//! unavailable through the production account gate.
 //! A returned port result means the owning process and every pipe have settled;
 //! cancellation, a deadline and a dropped view never provide that evidence.
 use crate::{
@@ -210,6 +211,10 @@ pub(super) struct AccountOwner {
     inner: Arc<Inner>,
 }
 impl AccountOwner {
+    pub(super) fn native_owner(&self) -> Owner {
+        self.inner.owner
+    }
+
     pub fn new(owner: Owner) -> Result<Self, Error> {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let instance = NEXT
