@@ -6,6 +6,8 @@
 #![deny(missing_docs)]
 #![deny(clippy::dbg_macro, clippy::print_stderr, clippy::print_stdout)]
 
+#[allow(dead_code)]
+mod auth;
 pub mod custody;
 pub mod plan;
 pub mod protocol;
@@ -48,6 +50,13 @@ pub const NETWORK_POLICY: &str =
 #[cfg(all(windows, feature = "native-fixtures"))]
 pub fn qualify_synthetic_fixture() -> Result<(), &'static str> {
     windows::fixtures::qualify()
+}
+
+/// Debug-only actual suspended AC/LPAC token ACL controls. Neither control is
+/// resumed; these measurements do not enable vendor or production execution.
+#[cfg(all(windows, feature = "native-fixtures"))]
+pub fn qualify_token_controls() -> Result<(), &'static str> {
+    windows::fixtures::token_controls()
 }
 
 /// Debug-only startup probe of one exact hash-pinned, Authenticode-verified vendor

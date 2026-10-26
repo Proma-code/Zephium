@@ -257,6 +257,65 @@ pub(crate) fn qualify() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Actual suspended-token discrimination only. This scenario never resumes a
+/// child, reads an account, or admits a vendor image. It is separate from the
+/// strict synthetic runtime qualification, which still requires class 46.
+pub(crate) fn token_controls() -> Result<(), &'static str> {
+    let suffix = format!(
+        "{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "clock unavailable")?
+            .as_nanos()
+    );
+    let profile = Profile::create(&format!("Zephium.ClaudeFixture.{suffix}"))?;
+    let root = Root::create(
+        std::env::temp_dir().join(format!("Zephium.ClaudeTokenControl.{suffix}")),
+        &profile,
+    )?;
+    let layout = Layout::create(&root.0, &profile)?;
+    let image_path = root.0.join("fixture.exe");
+    profile.copy_image(
+        &std::env::current_exe().map_err(|_| "fixture identity unavailable")?,
+        &image_path,
+    )?;
+    let hash =
+        security::hash(&mut File::open(&image_path).map_err(|_| "fixture image unavailable")?)?;
+    let image = HeldImage::open(&image_path, hash)?;
+    let cancelled = AtomicBool::new(false);
+    for (stage, mode) in [
+        (
+            "ordinary-ac-token-control",
+            Fixture::TokenAppContainerControl,
+        ),
+        ("lpac-token-control", Fixture::TokenLpacControl),
+    ] {
+        let output = process::run(
+            &profile,
+            &image,
+            &layout,
+            Command::Fixture(mode),
+            Vec::new(),
+            &cancelled,
+        )?;
+        receipt(stage, &output);
+        if output.code != 1
+            || output.stopped != Some("suspended token control completed")
+            || !output.stdout.is_empty()
+            || !output.stderr.is_empty()
+        {
+            return Err("suspended token control did not settle");
+        }
+    }
+    drop(image);
+    drop(layout);
+    root.cleanup()?;
+    profile.close()?;
+    super::diagnostic("actual-token-controls-settled", 0);
+    Ok(())
+}
+
 /// Read-only local startup of the exact signed vendor image, without an install,
 /// account status/login or inference. Fixed argv; fresh empty private directories.
 pub(crate) fn vendor_probe(source: &std::path::Path) -> Result<(), &'static str> {

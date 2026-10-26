@@ -7,6 +7,7 @@ compile_error!("Synthetic Claude broker helper is debug-only");
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let result = match args.as_slice() {
+        [mode] if mode == "token-controls" => zephium_claude_broker::qualify_token_controls(),
         [mode] if mode == "qualify" => zephium_claude_broker::qualify_synthetic_fixture(),
         [flag, mode, values @ ..] if flag == "--child" && mode == "argv" => {
             if values == ["", "end\\", "a\"b"] {

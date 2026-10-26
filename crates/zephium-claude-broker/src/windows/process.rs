@@ -149,6 +149,8 @@ pub(super) enum Command {
 #[cfg(feature = "native-fixtures")]
 #[derive(Clone, Copy)]
 pub(super) enum Fixture {
+    TokenAppContainerControl,
+    TokenLpacControl,
     VendorVersion,
     VendorHelp,
     Echo,
@@ -160,11 +162,22 @@ pub(super) enum Fixture {
     Stall,
 }
 impl Command {
+    #[cfg(feature = "native-fixtures")]
+    fn token_probe(self) -> Option<bool> {
+        match self {
+            Self::Fixture(Fixture::TokenAppContainerControl) => Some(false),
+            Self::Fixture(Fixture::TokenLpacControl) => Some(true),
+            _ => None,
+        }
+    }
     fn arguments(self) -> &'static [&'static str] {
         match self {
             Self::Vendor(operation) => CommandPlan::for_operation(operation).arguments(),
             #[cfg(feature = "native-fixtures")]
             Self::Fixture(mode) => match mode {
+                Fixture::TokenAppContainerControl | Fixture::TokenLpacControl => {
+                    &["--child", "stall"]
+                }
                 Fixture::VendorVersion => &["--version"],
                 Fixture::VendorHelp => &["--restricted", "--safe-mode", "--help"],
                 Fixture::Echo => &["--child", "echo"],
@@ -314,6 +327,12 @@ pub(super) fn run(
     ];
     let assigned = [raw_job];
     let opt_out: u32 = 1;
+    // Research-only ordinary AC control omits the LPAC policy attribute. It is
+    // never resumed; all vendor commands retain opt-out=1.
+    #[cfg(feature = "native-fixtures")]
+    let ordinary_ac_control = command.token_probe() == Some(false);
+    #[cfg(not(feature = "native-fixtures"))]
+    let ordinary_ac_control = false;
     unsafe {
         UpdateProcThreadAttribute(
             attributes.list,
@@ -335,16 +354,21 @@ pub(super) fn run(
             None,
         )
         .map_err(|_| "atomic job assignment failed")?;
-        UpdateProcThreadAttribute(
-            attributes.list,
-            0,
-            PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY as usize,
-            Some((&raw const opt_out).cast()),
-            size_of::<u32>(),
-            None,
-            None,
-        )
-        .map_err(|_| "LPAC policy unavailable")?;
+        if !ordinary_ac_control {
+            UpdateProcThreadAttribute(
+                attributes.list,
+                0,
+                PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY as usize,
+                Some((&raw const opt_out).cast()),
+                size_of::<u32>(),
+                None,
+                None,
+            )
+            .map_err(|error| {
+                super::diagnostic("lpac-policy-attribute", error.code().0);
+                "LPAC policy unavailable"
+            })?;
+        }
     }
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
@@ -395,6 +419,17 @@ pub(super) fn run(
             })?;
             let process = unsafe { OwnedHandle::from_raw_handle(info.hProcess.0) };
             let thread = unsafe { OwnedHandle::from_raw_handle(info.hThread.0) };
+            #[cfg(feature = "native-fixtures")]
+            if let Some(expect_lpac) = command.token_probe() {
+                let result = inspect_identity(handle(&process), capabilities).and_then(|_| {
+                    super::token_probe::verify(handle(&process), capabilities, expect_lpac)
+                });
+                if let Err(error) = result {
+                    terminate_and_reap(&job, &process);
+                    return Err(error);
+                }
+                return Ok((process, thread));
+            }
             if let Err(error) = verify_token(handle(&process), capabilities) {
                 terminate_and_reap(&job, &process);
                 return Err(error);
@@ -403,6 +438,22 @@ pub(super) fn run(
         },
     )?;
     let (process, thread) = created;
+    #[cfg(feature = "native-fixtures")]
+    if command.token_probe().is_some() {
+        // Both actual-token controls die suspended. No vendor or synthetic child
+        // instruction runs with the ordinary-AC control's weaker authority.
+        terminate_and_reap(&job, &process);
+        let mut code = 0;
+        unsafe { GetExitCodeProcess(handle(&process), &mut code) }
+            .map_err(|_| "token control exit unavailable")?;
+        return Ok(Output {
+            turn: None,
+            code: code as i32,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            stopped: Some("suspended token control completed"),
+        });
+    }
     // Parent must close every child-side pipe before any join or EOF observation.
     drop(stdin_read);
     drop(stdout_write);
@@ -575,36 +626,48 @@ fn read_available(
     Ok(())
 }
 fn verify_token(process: HANDLE, capabilities: &SECURITY_CAPABILITIES) -> Result<(), &'static str> {
+    let token = inspect_identity(process, capabilities)?;
+    inspect_boolean(&token, TokenIsLessPrivilegedAppContainer)
+}
+fn inspect_boolean(
+    token: &OwnedHandle,
+    class: windows::Win32::Security::TOKEN_INFORMATION_CLASS,
+) -> Result<(), &'static str> {
+    let mut value = 0u32;
+    let mut length = 0;
+    unsafe {
+        GetTokenInformation(
+            handle(token),
+            class,
+            Some((&raw mut value).cast()),
+            size_of::<u32>() as u32,
+            &mut length,
+        )
+    }
+    .map_err(|error| {
+        super::diagnostic("token-information-class", class.0);
+        super::diagnostic("token-information-query", error.code().0);
+        "LPAC token inspection failed"
+    })?;
+    if length != size_of::<u32>() as u32 || value != 1 {
+        super::diagnostic("token-information-class", class.0);
+        super::diagnostic("token-information-length", length as i32);
+        super::diagnostic("token-information-value", value as i32);
+        return Err("LPAC token was not applied");
+    }
+    Ok(())
+}
+fn inspect_identity(
+    process: HANDLE,
+    capabilities: &SECURITY_CAPABILITIES,
+) -> Result<OwnedHandle, &'static str> {
     let mut raw = HANDLE::default();
     unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut raw) }.map_err(|error| {
         super::diagnostic("open-process-token", error.code().0);
         "token inspection failed"
     })?;
     let token = unsafe { OwnedHandle::from_raw_handle(raw.0) };
-    for class in [TokenIsAppContainer, TokenIsLessPrivilegedAppContainer] {
-        let mut value = 0u32;
-        let mut length = 0;
-        unsafe {
-            GetTokenInformation(
-                handle(&token),
-                class,
-                Some((&raw mut value).cast()),
-                size_of::<u32>() as u32,
-                &mut length,
-            )
-        }
-        .map_err(|error| {
-            super::diagnostic("token-information-class", class.0);
-            super::diagnostic("token-information-query", error.code().0);
-            "LPAC token inspection failed"
-        })?;
-        if length != size_of::<u32>() as u32 || value != 1 {
-            super::diagnostic("token-information-class", class.0);
-            super::diagnostic("token-information-length", length as i32);
-            super::diagnostic("token-information-value", value as i32);
-            return Err("LPAC token was not applied");
-        }
-    }
+    inspect_boolean(&token, TokenIsAppContainer)?;
     let mut buffer = [0usize; 128];
     let mut length = 0;
     unsafe {
@@ -652,5 +715,9 @@ fn verify_token(process: HANDLE, capabilities: &SECURITY_CAPABILITIES) -> Result
         return Err("unexpected LPAC capability count");
     }
     unsafe { EqualSid(groups.Groups[0].Sid, (*capabilities.Capabilities).Sid) }
-        .map_err(|_| "unexpected LPAC capability")
+        .map_err(|_| "unexpected LPAC capability")?;
+    if groups.Groups[0].Attributes != 4 || unsafe { (*capabilities.Capabilities).Attributes } != 4 {
+        return Err("unexpected LPAC capability attributes");
+    }
+    Ok(token)
 }

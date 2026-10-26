@@ -14,6 +14,8 @@ New-Item -ItemType Directory -Path $Root | Out-Null
 try {
   cargo test -p zephium-claude-broker --locked
   if ($LASTEXITCODE -ne 0) { throw 'Portable broker tests failed' }
+  cargo run -p zephium-claude-broker --locked --features native-fixtures --bin claude-broker-fixture -- token-controls
+  if ($LASTEXITCODE -ne 0) { throw 'Actual suspended token ACL controls failed; runtime probe not admitted' }
   cargo run -p zephium-claude-broker --locked --features native-fixtures --bin claude-broker-fixture -- qualify
   if ($LASTEXITCODE -ne 0) { throw 'Synthetic native confinement failed; vendor probe not admitted' }
   $Image = Join-Path $Root 'claude.exe'
