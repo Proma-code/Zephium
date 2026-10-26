@@ -1,0 +1,43 @@
+name: Windows Codex original runtime qualification
+
+on:
+  push:
+    branches: [windows/subscription-accounts]
+    paths:
+      - 'crates/zephium-codex-broker/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/windows-codex-broker.yml'
+permissions:
+  contents: read
+concurrency:
+  group: windows-codex-broker-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+jobs:
+  codex_broker:
+    name: Exact original Codex CLI and app-server (no account or turn)
+    if: github.repository == 'Proma-code/Zephium'
+    runs-on: windows-2025
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.95.0 --profile minimal --component clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: windows-codex-credential-free
+          cache-on-failure: true
+      - name: Pure pinned contract and framing tests
+        run: |
+          cargo test -p zephium-codex-broker --locked --features native-fixtures
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy -p zephium-codex-broker --locked --features native-fixtures --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build debug-only credential-free qualifier
+        run: cargo build -p zephium-codex-broker --locked --features native-fixtures --bin codex-broker-fixture
+      - name: Original CLI and standalone startup/config/close (no login or model request)
+        run: pwsh -NoProfile -File crates/zephium-codex-broker/qualify-windows.ps1
