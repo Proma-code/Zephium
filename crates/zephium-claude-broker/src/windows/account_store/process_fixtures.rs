@@ -555,6 +555,17 @@ impl Drop for Running {
 }
 
 // Failure-only classification of this fixed synthetic helper's closed errors.
+// Only the existing fixed native-open diagnostic may project a signed numeric
+// status. This is failure metadata, never receipt admission or raw output.
+fn child_open_status(bytes: &[u8]) -> Option<i32> {
+    let value = bytes
+        .strip_prefix(b"fixture-stage=store-nt-open; native-code=")?
+        .strip_suffix(b"\n")?;
+    let value = std::str::from_utf8(value).ok()?;
+    let number: i32 = value.parse().ok()?;
+    (number < 0 && number.to_string() == value).then_some(number)
+}
+
 // Unknown output is never displayed; classification does not admit a receipt.
 fn child_error_category(bytes: &[u8]) -> i32 {
     let Some(error) = bytes
@@ -803,6 +814,9 @@ fn run_child(
                     "store-child-error-category",
                     child_error_category(&handles.stderr.bytes),
                 );
+                if let Some(status) = child_open_status(&handles.stdout.bytes) {
+                    super::super::diagnostic("store-child-open-status", status);
+                }
                 return Err("store child fixed receipt mismatch");
             }
             if let Some(error) =
@@ -828,6 +842,24 @@ fn run_child(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn child_native_status_accepts_only_one_fixed_negative_numeric_line() {
+        assert_eq!(
+            child_open_status(b"fixture-stage=store-nt-open; native-code=-1073741790\n"),
+            Some(-1073741790)
+        );
+        for bytes in [
+            b"fixture-stage=store-nt-open; native-code=0\n".as_slice(),
+            b"fixture-stage=store-nt-open; native-code=-01\n",
+            b"fixture-stage=store-nt-open; native-code=-2147483649\n",
+            b"fixture-stage=store-nt-open; native-code=-1\r\n",
+            b"fixture-stage=store-nt-open; native-code=-1\nextra",
+            b"fixture-stage=other; native-code=-1\n",
+            b"private path or identity",
+        ] {
+            assert_eq!(child_open_status(bytes), None);
+        }
+    }
     #[test]
     fn child_error_diagnostics_are_closed_and_do_not_change_receipt_acceptance() {
         assert_eq!(
