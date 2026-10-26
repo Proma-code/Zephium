@@ -45,8 +45,12 @@ Do not disable Windows protection to run an unsigned experimental installer.
 
 ## Remaining test limits
 
-- The full Windows Work suites are separate from focused regressions and remain
-  pending until their workflow completes. Skipped steps are not passes.
+- The separate full Windows Work run at the source above completed with
+  **914 application tests passed, 47 failed and 14 skipped**. Its provider suite
+  passed 1,231 tests and durable composition passed 186 tests. The overall run
+  therefore failed despite the successful installer job. Fixture repairs and
+  additional diagnostics are awaiting a new exact-source Windows run; the
+  intentionally gated positive cases are not counted as passes.
 - An expanded Linux app subset passed 951 tests with 11 ignored. The unfiltered
   run failed ten unchanged temporary-directory-layout fixtures and two consequent
   shared-lock checks. This is not an unfiltered full-suite pass.

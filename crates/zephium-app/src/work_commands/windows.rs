@@ -584,6 +584,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ::windows::Win32::System::JobObjects::{
+        IsProcessInJob, JobObjectBasicAccountingInformation, QueryInformationJobObject,
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    };
     use std::sync::atomic::AtomicU32;
 
     #[test]
@@ -632,6 +636,29 @@ mod tests {
         assert!(result.evidence.text.contains("error"));
     }
 
+    fn owned_tree_receipt(line: &str) -> Option<(u32, u32)> {
+        let (root, child) = line.strip_prefix("owned-tree:")?.split_once(':')?;
+        let root: u32 = root.parse().ok()?;
+        let child: u32 = child.parse().ok()?;
+        (root != 0 && child != 0 && root != child && line == format!("owned-tree:{root}:{child}"))
+            .then_some((root, child))
+    }
+
+    #[test]
+    fn owned_tree_receipt_is_fixed_and_unambiguous() {
+        assert_eq!(owned_tree_receipt("owned-tree:123:456"), Some((123, 456)));
+        for value in [
+            "123",
+            "owned-tree:0:1",
+            "owned-tree:1:1",
+            "owned-tree:01:2",
+            "owned-tree:1:2:3",
+            "owned-tree:1:2 ",
+        ] {
+            assert_eq!(owned_tree_receipt(value), None);
+        }
+    }
+
     #[tokio::test]
     async fn windows_command_timeout_and_stop_end_the_owned_tree() {
         let dir = tempfile::tempdir().unwrap();
@@ -647,26 +674,117 @@ mod tests {
         assert_eq!(result.note, "Stopped after 1 s");
         assert!(result.evidence.elapsed_ms < 5000);
         let pid = AtomicU32::new(0);
-        let result = run_unconfined(dir.path(), "$p=Start-Process -FilePath ($PSHOME+'\\powershell.exe') -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30' -WindowStyle Hidden -PassThru; [Console]::WriteLine($p.Id); Start-Sleep -Seconds 30", 10,
+        let owned_tree = Mutex::new(None::<(OwnedHandle, OwnedHandle, Arc<Job>)>);
+        // A fixed no-shell child writes and flushes readiness before its parent
+        // advertises the PID. Start-Process can use shell/window behavior which
+        // does not establish this redirected, owned-child fixture contract.
+        let command = r#"
+$ErrorActionPreference='Stop'
+$info=New-Object System.Diagnostics.ProcessStartInfo
+$info.FileName=Join-Path $PSHOME 'powershell.exe'
+$info.UseShellExecute=$false
+$info.CreateNoWindow=$true
+$info.RedirectStandardOutput=$true
+$info.Arguments='-NoProfile -NonInteractive -Command "[Console]::WriteLine(''owned-ready''); [Console]::Out.Flush(); Start-Sleep -Seconds 30"'
+$child=[System.Diagnostics.Process]::Start($info)
+if ($null -eq $child -or $child.StandardOutput.ReadLine() -ne 'owned-ready') { throw 'owned fixture child did not become ready' }
+[Console]::WriteLine('owned-tree:'+$PID+':'+$child.Id)
+[Console]::Out.Flush()
+Start-Sleep -Seconds 30
+"#;
+        let result = run_unconfined(
+            dir.path(),
+            command,
+            10,
             || async { pid.load(Ordering::Acquire) != 0 },
-            |view| { if let Some(value) = view.text.lines().find_map(|line| line.trim().parse::<u32>().ok()) { pid.store(value, Ordering::Release); } async {} }
-        ).await.unwrap();
+            |view| {
+                if owned_tree.lock().unwrap().is_some() {
+                    return std::future::ready(());
+                }
+                let Some((root_pid, child_pid)) = view.text.lines().find_map(owned_tree_receipt)
+                else {
+                    return std::future::ready(());
+                };
+                // Both PIDs originate in the fixed no-shell factory. Bind
+                // their held handles to the same unique owned Job before
+                // this fixture requests cancellation.
+                let open = |value| {
+                    let raw = unsafe {
+                        OpenProcess(
+                            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                            false,
+                            value,
+                        )
+                    }
+                    .unwrap();
+                    unsafe { OwnedHandle::from_raw_handle(raw.0) }
+                };
+                let root = open(root_pid);
+                let child = open(child_pid);
+                let matching: Vec<_> = jobs()
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .filter(|job| {
+                        [&root, &child].into_iter().all(|process| {
+                            let mut member = ::windows::core::BOOL::default();
+                            unsafe {
+                                IsProcessInJob(
+                                    handle(process),
+                                    Some(handle(&job.handle)),
+                                    &mut member,
+                                )
+                            }
+                            .is_ok()
+                                && member.as_bool()
+                        })
+                    })
+                    .collect();
+                assert_eq!(
+                    matching.len(),
+                    1,
+                    "fixed parent and child must share exactly one owned Job"
+                );
+                *owned_tree.lock().unwrap() =
+                    Some((root, child, matching.into_iter().next().unwrap()));
+                pid.store(child_pid, Ordering::Release);
+                std::future::ready(())
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(
             result.note, "Stopped",
             "fixture output: {}",
             result.evidence.text
         );
         assert_ne!(pid.load(Ordering::Acquire), 0);
-        // The PID comes only from our own child; it is inspected, never killed by PID.
-        if let Ok(child) =
-            unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid.load(Ordering::Acquire)) }
-        {
-            let child = unsafe { OwnedHandle::from_raw_handle(child.0) };
+        let (root, child, job) = owned_tree
+            .into_inner()
+            .unwrap()
+            .expect("owned tree handles");
+        // Inspect only retained handles; never signal or kill by PID. A timeout
+        // or a best-effort stop return alone does not prove physical settlement.
+        assert!(result.evidence.exit.is_some(), "root exit must be observed");
+        for process in [&root, &child] {
             assert_eq!(
-                unsafe { WaitForSingleObject(handle(&child), 2000) },
+                unsafe { WaitForSingleObject(handle(process), 2000) },
                 WAIT_OBJECT_0
             );
         }
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        unsafe {
+            QueryInformationJobObject(
+                Some(handle(&job.handle)),
+                JobObjectBasicAccountingInformation,
+                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                size_of_val(&accounting) as u32,
+                None,
+            )
+        }
+        .unwrap();
+        assert_eq!(accounting.ActiveProcesses, 0, "owned Job must be empty");
     }
 
     #[tokio::test]

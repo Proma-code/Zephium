@@ -230,11 +230,34 @@ mod tests {
     use super::super::Receipt;
     use super::*;
     fn root() -> tempfile::TempDir {
-        tempfile::Builder::new()
-            .prefix("zephium-retention-inert-")
-            .tempdir()
-            .unwrap()
+        crate::work_files::test_scratch()
     }
+    #[cfg(windows)]
+    #[test]
+    fn default_windows_namespace_gate_refuses_without_creating_recovery_storage() {
+        use zephium_private_fs::LockedPrivateNamespace;
+        let root = root();
+        let root_path = root.path().canonicalize().unwrap();
+        let namespace = root_path.join(".zephium-work-recovery");
+        assert!(!namespace.exists());
+        assert!(matches!(
+            LockedPrivateNamespace::open_existing(&namespace),
+            Err(PrivateFsError::PrimitiveUnavailable)
+        ));
+        assert!(matches!(
+            LockedPrivateNamespace::open_or_create(&namespace),
+            Err(PrivateFsError::PrimitiveUnavailable)
+        ));
+        for create in [false, true] {
+            assert!(matches!(
+                Journal::open(&root_path, "profile", create),
+                Err(Failure::Storage)
+            ));
+        }
+        assert!(!namespace.exists());
+        assert_eq!(std::fs::read_dir(&root_path).unwrap().count(), 0);
+    }
+
     fn receipt(root: &std::path::Path, id: usize) -> Receipt {
         Receipt {
             version: 1,
@@ -253,6 +276,10 @@ mod tests {
         record
     }
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Requires explicit debug zephium-private-fs/windows-namespace-validation adapter qualification; the default adapter is closed"
+    )]
     fn only_oldest_completed_rows_beyond_256_expire_and_missing_ids_stay_missing() {
         let root = root();
         let root_path = root.path().canonicalize().unwrap();
@@ -308,6 +335,10 @@ mod tests {
             .exists());
     }
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Requires explicit debug zephium-private-fs/windows-namespace-validation adapter qualification; the default adapter is closed"
+    )]
     fn restored_or_completed_markers_never_retire_an_active_original_or_unacknowledged_move() {
         let root = root();
         let root_path = root.path().canonicalize().unwrap();
@@ -336,6 +367,10 @@ mod tests {
         assert!(!pending.marked(EXPIRING).unwrap());
     }
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Requires explicit debug zephium-private-fs/windows-namespace-validation adapter qualification; the default adapter is closed"
+    )]
     fn committed_expiry_resumes_after_payload_receipt_or_marker_removal_without_file_replay() {
         for removed in [
             vec!["saved"],
@@ -368,6 +403,10 @@ mod tests {
         }
     }
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Requires explicit debug zephium-private-fs/windows-namespace-validation adapter qualification; the default adapter is closed"
+    )]
     fn unknown_content_and_incomplete_payloads_are_preserved() {
         let root = root();
         let root_path = root.path().canonicalize().unwrap();

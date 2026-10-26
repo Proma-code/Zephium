@@ -900,6 +900,57 @@ pub(crate) fn read_directory(path: &Path) -> Result<DirectoryEntries, WorkFileEr
     })
 }
 
+/// Fresh synthetic file fixtures, never an exception to the protected-path policy.
+/// Windows ambient temp normally lives under protected AppData. Use the test
+/// checkout instead; a protected checkout fails explicitly rather than falling
+/// back to another location or altering HOME/TEMP or native known-folder policy.
+#[cfg(test)]
+pub(crate) fn test_scratch() -> tempfile::TempDir {
+    #[cfg(windows)]
+    {
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .canonicalize()
+            .expect("fixture checkout must exist");
+        assert!(
+            !protected_path(&parent),
+            "fixture checkout must be outside protected paths"
+        );
+        // Check native roots independently of synthetic HOME used by grant
+        // tests. A redirected AppData folder need not contain that name.
+        use windows::Win32::UI::Shell::{
+            FOLDERID_LocalAppData, FOLDERID_LocalAppDataLow, FOLDERID_RoamingAppData,
+        };
+        for id in [
+            FOLDERID_LocalAppData,
+            FOLDERID_LocalAppDataLow,
+            FOLDERID_RoamingAppData,
+        ] {
+            let protected = known_folder(&id).expect("native protected folder must be known");
+            assert!(
+                !path_contains(&protected, &parent),
+                "fixture checkout is protected"
+            );
+            if let Ok(protected) = protected.canonicalize() {
+                assert!(
+                    !path_contains(&protected, &parent),
+                    "fixture checkout resolves under protected storage"
+                );
+            }
+        }
+        let scratch = tempfile::Builder::new()
+            .prefix("zephium-work-fixture-")
+            .tempdir_in(&parent)
+            .expect("fresh fixture root must be created in the test checkout");
+        assert!(
+            !protected_path(&scratch.path().canonicalize().unwrap()),
+            "fresh fixture root must remain outside protected paths"
+        );
+        scratch
+    }
+    #[cfg(not(windows))]
+    tempfile::tempdir().unwrap()
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_GRANT_HOME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
@@ -1677,10 +1728,47 @@ fn clip(text: String) -> (String, bool) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn synthetic_scratch_is_fresh_owned_and_keeps_absolute_appdata_denied() {
+        let first = test_scratch();
+        let second = test_scratch();
+        let first_path = first.path().canonicalize().unwrap();
+        let second_path = second.path().canonicalize().unwrap();
+        assert_ne!(first_path, second_path);
+        assert!(!protected_path(&first_path));
+        assert!(!protected_path(&second_path));
+        let public = first_path.join("project");
+        let protected = first_path.join("AppData/Local/inert-fixture");
+        std::fs::create_dir_all(&public).unwrap();
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::write(protected.join("marker.txt"), "inert fixture").unwrap();
+        assert!(admit_root(
+            &public.to_string_lossy(),
+            Some(&first_path),
+            std::slice::from_ref(&first_path),
+            &[]
+        )
+        .is_some());
+        assert!(admit_root(
+            &protected.to_string_lossy(),
+            Some(&first_path),
+            std::slice::from_ref(&first_path),
+            &[]
+        )
+        .is_none());
+        assert_eq!(
+            read_text(&protected.join("marker.txt")),
+            Err(WorkFileError::Denied)
+        );
+        drop(first);
+        assert!(!first_path.exists());
+        assert!(second_path.is_dir());
+    }
+
     fn home_grant() -> (tempfile::TempDir, WorkFileGrant, PathBuf) {
         // The grant policy resolves against $HOME; tests point it at a
         // temporary home so nothing real is touched.
-        let home = tempfile::tempdir().unwrap();
+        let home = test_scratch();
         std::env::set_var("HOME", home.path());
         let project = home.path().join("Documents").join("project");
         std::fs::create_dir_all(project.join("src")).unwrap();
@@ -1870,7 +1958,7 @@ mod tests {
 
     #[test]
     fn unicode_case_aliases_never_open_protected_files() {
-        let scratch = tempfile::tempdir().unwrap();
+        let scratch = test_scratch();
         let root = scratch.path().canonicalize().unwrap();
         for (original, alias) in [
             ("secrets", "ſecrets"),
@@ -2070,8 +2158,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn redirected_known_folders_are_explicit_policy_roots() {
-        let home = tempfile::tempdir().unwrap();
-        let redirected = tempfile::tempdir().unwrap();
+        let home = test_scratch();
+        let redirected = test_scratch();
         let home = home.path().canonicalize().unwrap();
         let redirected = redirected.path().canonicalize().unwrap();
         let path = redirected.to_string_lossy();

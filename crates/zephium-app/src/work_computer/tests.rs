@@ -98,7 +98,7 @@ impl ComputerHost for Recorder {
 }
 
 fn project() -> (tempfile::TempDir, ComputerTools, PathBuf) {
-    let home = tempfile::tempdir().unwrap();
+    let home = crate::work_files::test_scratch();
     std::env::set_var("HOME", home.path());
     let root = home.path().join("code/app");
     std::fs::create_dir_all(root.join("src")).unwrap();

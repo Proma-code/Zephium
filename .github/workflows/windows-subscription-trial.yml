@@ -159,8 +159,7 @@ jobs:
           retention-days: 14
 
   full_work_regressions:
-    name: Full Windows Work regressions after trial build
-    needs: windows
+    name: Independent full Windows Work regressions
     if: github.repository == 'Proma-code/Zephium'
     runs-on: windows-2025
     timeout-minutes: 120

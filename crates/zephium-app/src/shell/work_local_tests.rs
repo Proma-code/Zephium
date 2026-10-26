@@ -30,7 +30,7 @@ struct Home {
 }
 impl Home {
     fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::work_files::test_scratch();
         let previous = std::env::var_os("HOME");
         std::env::set_var("HOME", dir.path());
         std::fs::create_dir(dir.path().join("project")).unwrap();

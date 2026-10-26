@@ -72,9 +72,18 @@ fn owner_sid() -> Result<String, Failure> {
     sid_string(unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid })
 }
 
+// Debug qualification diagnostics are fixed stages and numeric OS codes only.
+// Never expose a directory, SID, descriptor, content, or provider message.
+fn root_diagnostic(stage: &'static str, code: i32) {
+    #[cfg(debug_assertions)]
+    eprintln!("work-snapshot-stage={stage}; native-code={code}");
+    #[cfg(not(debug_assertions))]
+    let _ = (stage, code);
+}
+
 /// Seal an empty fresh root before the broker copies any granted content into it.
 pub(super) fn protect_root(path: &Path) -> Result<(), Failure> {
-    let owner = owner_sid()?;
+    let owner = owner_sid().inspect_err(|_| root_diagnostic("owner-token", 1))?;
     let sddl = wide(OsStr::new(&format!(
         "D:P(A;OICI;FA;;;{owner})(A;OICI;FA;;;SY)"
     )))?;
@@ -85,9 +94,16 @@ pub(super) fn protect_root(path: &Path) -> Result<(), Failure> {
         .share_mode(0)
         .custom_flags(0x0220_0000)
         .open(path)
-        .map_err(|_| Failure::Storage)?;
-    let metadata = file.metadata().map_err(|_| Failure::Storage)?;
+        .map_err(|error| {
+            root_diagnostic("root-open", error.raw_os_error().unwrap_or(-1));
+            Failure::Storage
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        root_diagnostic("root-metadata", error.raw_os_error().unwrap_or(-1));
+        Failure::Storage
+    })?;
     if !metadata.is_dir() || metadata.file_attributes() & 0x400 != 0 {
+        root_diagnostic("root-kind-or-reparse", 1);
         return Err(Failure::Storage);
     }
     let mut actual_owner = PSID::default();
@@ -105,10 +121,14 @@ pub(super) fn protect_root(path: &Path) -> Result<(), Failure> {
         )
     }
     .ok()
-    .map_err(|_| Failure::Storage)?;
+    .map_err(|error| {
+        root_diagnostic("root-owner-query", error.code().0);
+        Failure::Storage
+    })?;
     let actual = sid_string(actual_owner);
     unsafe { LocalFree(Some(HLOCAL(current_descriptor.0))) };
-    if actual? != owner {
+    if actual.inspect_err(|_| root_diagnostic("root-owner-decode", 1))? != owner {
+        root_diagnostic("root-owner-mismatch", 1);
         return Err(Failure::Storage);
     }
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
@@ -120,8 +140,12 @@ pub(super) fn protect_root(path: &Path) -> Result<(), Failure> {
             None,
         )
     }
-    .map_err(|_| Failure::Storage)?;
-    let assigned = assign_security(&file, descriptor, false);
+    .map_err(|error| {
+        root_diagnostic("root-descriptor-build", error.code().0);
+        Failure::Storage
+    })?;
+    let assigned = assign_security(&file, descriptor, false)
+        .inspect_err(|_| root_diagnostic("root-acl-assignment", 1));
     unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
     assigned
 }

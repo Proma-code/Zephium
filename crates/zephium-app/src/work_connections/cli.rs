@@ -678,52 +678,51 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn run_accepts_windows_command_shims() {
+    async fn closed_gate_never_runs_windows_command_shims() {
         let root = tempfile::tempdir().unwrap();
         let shim = root.path().join("tool.cmd");
-        std::fs::write(&shim, "@echo off\r\necho %~1\r\n").unwrap();
-        let (ok, out, _) = run(&shim, &["two words"], None, None, Duration::from_secs(5))
-            .await
-            .unwrap();
-        assert!(ok);
-        assert_eq!(out.trim(), "two words");
+        let marker = root.path().join("spawned.txt");
+        std::fs::write(&shim, "@echo off\r\necho unexpected>spawned.txt\r\n").unwrap();
+        assert!(executable(&shim));
+        assert!(ensure_available().is_err());
+        assert!(run(
+            &shim,
+            &["two words"],
+            Some(root.path()),
+            None,
+            Duration::from_secs(5),
+        )
+        .await
+        .is_none());
+        assert!(!marker.exists());
     }
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn run_is_bounded_and_feeds_stdin() {
+    async fn closed_gate_never_runs_windows_executables_or_feeds_stdin() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("spawned.txt");
         let shell = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
             .join("System32/WindowsPowerShell/v1.0/powershell.exe");
-        let (ok, out, _) = run(
-            &shell,
-            &[
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "[Console]::Out.Write([Console]::In.ReadToEnd())",
-            ],
-            None,
-            Some("hello"),
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap();
-        assert!(ok);
-        assert_eq!(out, "hello");
-        assert!(run(
-            &shell,
-            &[
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Start-Sleep -Seconds 5"
-            ],
-            None,
-            None,
-            Duration::from_millis(200)
-        )
-        .await
-        .is_none());
+        assert!(executable(&shell));
+        assert!(ensure_available().is_err());
+        for timeout in [Duration::from_secs(10), Duration::from_millis(200)] {
+            assert!(run(
+                &shell,
+                &[
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "[IO.File]::WriteAllText('spawned.txt', [Console]::In.ReadToEnd())",
+                ],
+                Some(root.path()),
+                Some("inert fixture input"),
+                timeout,
+            )
+            .await
+            .is_none());
+            assert!(!marker.exists());
+        }
     }
 }
