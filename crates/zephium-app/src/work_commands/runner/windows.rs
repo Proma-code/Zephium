@@ -15,8 +15,9 @@ use ::windows::{
             Isolation::{CreateAppContainerProfile, DeleteAppContainerProfile},
             TokenUser, DACL_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION,
             OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-            PSID, SECURITY_CAPABILITIES, TOKEN_QUERY, TOKEN_USER,
+            PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, TOKEN_QUERY, TOKEN_USER,
         },
+        Storage::FileSystem::CreateDirectoryW,
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     },
 };
@@ -30,7 +31,7 @@ use std::{
         fs::{MetadataExt, OpenOptionsExt},
         io::{AsRawHandle, FromRawHandle, OwnedHandle},
     },
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -79,6 +80,62 @@ fn root_diagnostic(stage: &'static str, code: i32) {
     eprintln!("work-snapshot-stage={stage}; native-code={code}");
     #[cfg(not(debug_assertions))]
     let _ = (stage, code);
+}
+
+fn hold_fresh_parent(parent: &Path) -> Result<fs::File, Failure> {
+    let parent_hold = fs::OpenOptions::new()
+        .access_mode(0x80) // FILE_READ_ATTRIBUTES
+        .share_mode(1) // Deny write opens (including reparse mutation) and deletion.
+        .custom_flags(0x0220_0000)
+        .open(parent)
+        .map_err(|error| {
+            root_diagnostic("fresh-parent-open", error.raw_os_error().unwrap_or(-1));
+            Failure::Storage
+        })?;
+    let metadata = parent_hold.metadata().map_err(|_| Failure::Storage)?;
+    if !metadata.is_dir() || metadata.file_attributes() & 0x400 != 0 {
+        return Err(Failure::Storage);
+    }
+    Ok(parent_hold)
+}
+/// Create an owned private child inside the caller's newly created TempDir.
+/// The elevated Windows default owner can be Administrators rather than TokenUser.
+/// Set the exact owner at CREATE_NEW instead of retaking any existing directory.
+/// The outer TempDir remains only the cleanup container; all content uses this root.
+pub(super) fn create_root(parent: &Path) -> Result<PathBuf, Failure> {
+    let parent_hold = hold_fresh_parent(parent)?;
+    let owner = owner_sid()?;
+    let sddl = wide(OsStr::new(&format!(
+        "O:{owner}D:P(A;OICI;FA;;;{owner})(A;OICI;FA;;;SY)"
+    )))?;
+    let root = parent.join("private");
+    let path = wide(root.as_os_str())?;
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+    }
+    .map_err(|_| Failure::Storage)?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: BOOL::from(false),
+    };
+    // CreateDirectoryW fails on collisions. Never open/adopt/re-own that child.
+    let created = unsafe { CreateDirectoryW(PCWSTR(path.as_ptr()), Some(&attributes)) };
+    unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
+    created.map_err(|error| {
+        root_diagnostic("fresh-root-create", error.code().0);
+        Failure::Storage
+    })?;
+    // Keep the original exact owner and no-reparse validation unchanged.
+    protect_root(&root)?;
+    drop(parent_hold);
+    Ok(root)
 }
 
 /// Seal an empty fresh root before the broker copies any granted content into it.
@@ -571,6 +628,55 @@ mod tests {
         net::{TcpListener, TcpStream},
         time::Instant,
     };
+
+    #[test]
+    fn fresh_snapshot_root_has_exact_owner_and_preserves_collisions() {
+        let container = tempfile::tempdir().unwrap();
+        let parent = container.path().canonicalize().unwrap();
+        let root = create_root(&parent).unwrap();
+        assert_eq!(root, parent.join("private"));
+        protect_root(&root).unwrap();
+        fs::write(root.join("sentinel.txt"), b"owned fixture").unwrap();
+        assert!(matches!(create_root(&parent), Err(Failure::Storage)));
+        assert_eq!(
+            fs::read(root.join("sentinel.txt")).unwrap(),
+            b"owned fixture"
+        );
+        protect_root(&root).unwrap();
+        container.close().unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn fresh_parent_pin_blocks_write_opens_but_allows_child_creation() {
+        let container = tempfile::tempdir().unwrap();
+        let parent = container.path().canonicalize().unwrap();
+        let write_open = || {
+            fs::OpenOptions::new()
+                .write(true)
+                .share_mode(1)
+                .custom_flags(0x0220_0000)
+                .open(&parent)
+        };
+        drop(write_open().unwrap()); // Positive control: permission is available.
+        let held = hold_fresh_parent(&parent).unwrap();
+        assert_eq!(write_open().unwrap_err().raw_os_error(), Some(32));
+        let root = create_root(&parent).unwrap();
+        assert!(root.is_dir());
+        drop(held);
+        drop(write_open().unwrap());
+        container.close().unwrap();
+    }
+
+    #[test]
+    fn fresh_snapshot_root_rejects_file_parent_without_changing_it() {
+        let container = tempfile::tempdir().unwrap();
+        let file = container.path().join("not-a-directory");
+        fs::write(&file, b"unchanged fixture").unwrap();
+        assert!(matches!(create_root(&file), Err(Failure::Storage)));
+        assert_eq!(fs::read(&file).unwrap(), b"unchanged fixture");
+        container.close().unwrap();
+    }
 
     #[test]
     #[ignore = "Fixture child runs only inside the parent LPAC qualification test"]

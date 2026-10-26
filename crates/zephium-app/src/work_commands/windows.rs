@@ -680,17 +680,18 @@ mod tests {
         // does not establish this redirected, owned-child fixture contract.
         let command = r#"
 $ErrorActionPreference='Stop'
-$info=New-Object System.Diagnostics.ProcessStartInfo
-$info.FileName=Join-Path $PSHOME 'powershell.exe'
+[Console]::WriteLine('owned-root-ready'); [Console]::Out.Flush()
+$info=[System.Diagnostics.ProcessStartInfo]::new()
+$info.FileName=$PSHOME+'\powershell.exe'
 $info.UseShellExecute=$false
 $info.CreateNoWindow=$true
 $info.RedirectStandardOutput=$true
-$info.Arguments='-NoProfile -NonInteractive -Command "[Console]::WriteLine(''owned-ready''); [Console]::Out.Flush(); Start-Sleep -Seconds 30"'
+$info.Arguments='-NoProfile -NonInteractive -Command "[Console]::WriteLine(''owned-ready''); [Console]::Out.Flush(); [Threading.Thread]::Sleep(30000)"'
 $child=[System.Diagnostics.Process]::Start($info)
 if ($null -eq $child -or $child.StandardOutput.ReadLine() -ne 'owned-ready') { throw 'owned fixture child did not become ready' }
 [Console]::WriteLine('owned-tree:'+$PID+':'+$child.Id)
 [Console]::Out.Flush()
-Start-Sleep -Seconds 30
+[Threading.Thread]::Sleep(30000)
 "#;
         let result = run_unconfined(
             dir.path(),

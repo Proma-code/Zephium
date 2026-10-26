@@ -154,10 +154,13 @@ impl Snapshot {
             }
         };
         #[cfg(windows)]
-        if let Err(error) = super::windows::protect_root(&private) {
-            directory.close().map_err(|_| Failure::CleanupPending)?;
-            return Err(error);
-        }
+        let private = match super::windows::create_root(&private) {
+            Ok(root) => root,
+            Err(error) => {
+                directory.close().map_err(|_| Failure::CleanupPending)?;
+                return Err(error);
+            }
+        };
         let result = Self {
             _directory: directory,
             work: private.join("work"),

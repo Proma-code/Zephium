@@ -382,6 +382,7 @@ fn cycles_and_depth_are_bounded_before_materialization() {
     fixture.index(&[("note.txt", [1; 20], 0o100644)]);
     assert!(matches!(fixture.capture(&["note.txt"]), Err(Error::Limit)));
 }
+#[cfg(unix)]
 #[test]
 fn index_identity_and_digest_are_revalidated() {
     let fixture = Fixture::new();
@@ -407,6 +408,71 @@ fn index_identity_and_digest_are_revalidated() {
         Err(Error::Changed)
     ));
 }
+#[cfg(windows)]
+#[test]
+fn index_handle_prevents_mutation_until_capture_is_released() {
+    let fixture = Fixture::new();
+    let id = fixture.loose(b"before");
+    fixture.index(&[("note.txt", id, 0o100644)]);
+    fs::write(fixture.root.join("note.txt"), b"after").unwrap();
+    let captured = fixture.capture(&["note.txt"]).unwrap();
+    let path = fixture.root.join(".git/index");
+    let original = fs::read(&path).unwrap();
+    let mut changed = original.clone();
+    changed[12] ^= 1;
+    rechecksum(&mut changed);
+    captured.unchanged(&AtomicBool::new(false)).unwrap();
+    assert_eq!(
+        fs::write(&path, &changed).unwrap_err().raw_os_error(),
+        Some(32)
+    );
+    assert_eq!(
+        fs::rename(&path, path.with_file_name("old-index"))
+            .unwrap_err()
+            .raw_os_error(),
+        Some(32)
+    );
+    assert_eq!(fs::read(&path).unwrap(), original);
+    captured.unchanged(&AtomicBool::new(false)).unwrap();
+    drop(captured);
+    fs::write(&path, &changed).unwrap();
+    let captured = fixture.capture(&["note.txt"]).unwrap();
+    assert_eq!(captured.index.bytes, changed);
+    captured.unchanged(&AtomicBool::new(false)).unwrap();
+    drop(captured);
+    fs::rename(&path, path.with_file_name("old-index")).unwrap();
+    fs::write(&path, changed).unwrap();
+    fixture
+        .capture(&["note.txt"])
+        .unwrap()
+        .unchanged(&AtomicBool::new(false))
+        .unwrap();
+}
+
+#[test]
+fn saved_index_bytes_and_identity_are_compared_without_claiming_a_filesystem_race() {
+    let fixture = Fixture::new();
+    let id = fixture.loose(b"before");
+    fixture.index(&[("note.txt", id, 0o100644)]);
+    fs::write(fixture.root.join("note.txt"), b"after").unwrap();
+    let mut captured = fixture.capture(&["note.txt"]).unwrap();
+    captured.unchanged(&AtomicBool::new(false)).unwrap();
+    captured.index.bytes[12] ^= 1;
+    assert!(matches!(
+        captured.unchanged(&AtomicBool::new(false)),
+        Err(Error::Changed)
+    ));
+    captured.index.bytes[12] ^= 1;
+    captured.unchanged(&AtomicBool::new(false)).unwrap();
+    captured.index.identity.0 ^= 1;
+    assert!(matches!(
+        captured.unchanged(&AtomicBool::new(false)),
+        Err(Error::Changed)
+    ));
+    captured.index.identity.0 ^= 1;
+    captured.unchanged(&AtomicBool::new(false)).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn metadata_links_and_gitfile_pointers_are_refused() {
