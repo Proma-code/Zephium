@@ -1,0 +1,314 @@
+//! Fixed synthetic tests only; never Claude executable/login/account activity.
+use super::{
+    process::{self, Command, Fixture, Layout},
+    security::{self, HeldImage, Profile},
+};
+use std::{
+    fs::File,
+    io::Write,
+    net::{TcpListener, TcpStream},
+    sync::atomic::AtomicBool,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+struct Root(std::path::PathBuf, bool);
+impl Root {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self(path, true)
+    }
+    fn cleanup(mut self) -> Result<(), &'static str> {
+        std::fs::remove_dir_all(&self.0).map_err(|_| "private fixture cleanup failed")?;
+        self.1 = false;
+        Ok(())
+    }
+}
+impl Drop for Root {
+    fn drop(&mut self) {
+        if self.1 {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+pub(crate) fn qualify() -> Result<(), &'static str> {
+    // This dedicated synthetic helper process owns its environment; no real
+    // values are read, copied or restored, and the invoking shell is unchanged.
+    for key in [
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "OPENAI_API_KEY",
+        "NODE_OPTIONS",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "AWS_SECRET_ACCESS_KEY",
+    ] {
+        std::env::set_var(key, "synthetic-must-not-inherit");
+    }
+    let suffix = format!(
+        "{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "clock unavailable")?
+            .as_nanos()
+    );
+    let root = Root::new(std::env::temp_dir().join(format!("Zephium.ClaudeFixture.{suffix}")));
+    std::fs::create_dir(&root.0).map_err(|_| "fixture root creation failed")?;
+    let profile = Profile::create(&format!("Zephium.ClaudeFixture.{suffix}"))?;
+    let layout = Layout::create(&root.0, &profile)?;
+    let image_path = root.0.join("fixture.exe");
+    std::fs::copy(
+        std::env::current_exe().map_err(|_| "fixture identity unavailable")?,
+        &image_path,
+    )
+    .map_err(|_| "fixture image staging failed")?;
+    profile.seal(&image_path, false)?;
+    let hash =
+        security::hash(&mut File::open(&image_path).map_err(|_| "fixture image unavailable")?)?;
+    let image = HeldImage::open(&image_path, hash)?;
+    let cancelled = AtomicBool::new(false);
+    let input = "synthetic stdin • split UTF-8\n".as_bytes().to_vec();
+    let echo = process::run(
+        &profile,
+        &image,
+        &layout,
+        Command::Fixture(Fixture::Echo),
+        input.clone(),
+        &cancelled,
+    )?;
+    receipt("echo", &echo);
+    if echo.code != 0
+        || echo.stopped.is_some()
+        || echo.stdout != input
+        || echo.stderr != b"synthetic stderr only"
+    {
+        return Err("separate bounded pipe fixture failed");
+    }
+
+    let argv = process::run(
+        &profile,
+        &image,
+        &layout,
+        Command::Fixture(Fixture::Argv),
+        Vec::new(),
+        &cancelled,
+    )?;
+    receipt("argv", &argv);
+    if argv.code != 0
+        || argv.stopped.is_some()
+        || argv.stdout != b"argv-ok"
+        || !argv.stderr.is_empty()
+    {
+        return Err("native empty argv round trip failed");
+    }
+    // Sentinel belongs to the fixture, not the user. Ordinary parent can access it;
+    // the LPAC receives no grant outside its own sealed root.
+    let sentinel = Root::new(std::env::temp_dir().join(format!("Zephium.ClaudeSentinel.{suffix}")));
+    std::fs::create_dir(&sentinel.0).map_err(|_| "sentinel creation failed")?;
+    let sentinel_file = sentinel.0.join("private.txt");
+    std::fs::write(&sentinel_file, b"synthetic private sentinel")
+        .map_err(|_| "sentinel write failed")?;
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .map_err(|_| "loopback listener unavailable")?;
+    let address = listener
+        .local_addr()
+        .map_err(|_| "loopback address unavailable")?;
+    let _baseline = TcpStream::connect_timeout(&address, Duration::from_secs(1))
+        .map_err(|_| "loopback baseline unavailable")?;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    let attributes = windows::Win32::Security::SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<windows::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+        bInheritHandle: true.into(),
+        ..Default::default()
+    };
+    let event = unsafe {
+        windows::Win32::System::Threading::CreateEventW(
+            Some(&attributes),
+            true,
+            false,
+            windows::core::PCWSTR::null(),
+        )
+    }
+    .map_err(|_| "inherited-handle fixture unavailable")?;
+    let event = unsafe { OwnedHandle::from_raw_handle(event.0) };
+    let request = serde_json::json!({"sentinel":sentinel_file,"outside":sentinel.0,"loopback":address.to_string(),"image":image_path,"inheritable_handle":event.as_raw_handle() as usize as u64,"config":layout.config,"home":layout.home,"work":layout.work,"appdata":layout.appdata,"localappdata":layout.localappdata});
+    let output = process::run(
+        &profile,
+        &image,
+        &layout,
+        Command::Fixture(Fixture::Isolation),
+        serde_json::to_vec(&request).map_err(|_| "fixture serialization failed")?,
+        &cancelled,
+    )?;
+    receipt("output", &output);
+    if output.code != 0
+        || output.stopped.is_some()
+        || output.stdout != b"isolation-ok"
+        || !output.stderr.is_empty()
+    {
+        return Err("ACL, child or loopback denial fixture failed");
+    }
+    let flood = process::run(
+        &profile,
+        &image,
+        &layout,
+        Command::Fixture(Fixture::Flood),
+        Vec::new(),
+        &cancelled,
+    )?;
+    receipt("flood", &flood);
+    if flood.stopped != Some("output bound exceeded")
+        || flood.stdout.len() > crate::plan::MAX_STDOUT_BYTES
+        || flood.stderr.len() > crate::plan::MAX_STDERR_BYTES
+    {
+        return Err("pipe flood was not bounded");
+    }
+    let stderr_flood = process::run(
+        &profile,
+        &image,
+        &layout,
+        Command::Fixture(Fixture::StderrFlood),
+        Vec::new(),
+        &cancelled,
+    )?;
+    receipt("stderr_flood", &stderr_flood);
+    if stderr_flood.stopped != Some("output bound exceeded")
+        || stderr_flood.stderr.len() > crate::plan::MAX_STDERR_BYTES
+        || !stderr_flood.stdout.is_empty()
+    {
+        return Err("stderr-only flood was not bounded separately");
+    }
+    let cancel = AtomicBool::new(false);
+    let cancelled_run = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_secs(2));
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+        });
+        process::run(
+            &profile,
+            &image,
+            &layout,
+            Command::Fixture(Fixture::CancelWait),
+            Vec::new(),
+            &cancel,
+        )
+    })?;
+    receipt("cancelled_run", &cancelled_run);
+    if cancelled_run.stopped != Some("cancelled or deadline exceeded")
+        || cancelled_run.stdout != b"ready"
+        || cancelled_run.code == 0
+    {
+        return Err("mid-run cancel did not observe exit and settle");
+    }
+    let stall = process::run(
+        &profile,
+        &image,
+        &layout,
+        Command::Fixture(Fixture::Stall),
+        vec![b'x'; crate::plan::MAX_STDIN_BYTES],
+        &cancelled,
+    )?;
+    receipt("stall", &stall);
+    if stall.stopped != Some("cancelled or deadline exceeded") || stall.code == 0 {
+        return Err("deadline, blocked writer or reap fixture failed");
+    }
+    // A wrong hash and hard-link alias are rejected before CreateProcessW.
+    if HeldImage::open(&image_path, [0; 32]).is_ok() {
+        return Err("wrong image hash admitted");
+    }
+    // Held read-only image identity prevents write/rename replacement.
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .open(&image_path)
+        .is_ok()
+    {
+        return Err("held executable allowed replacement");
+    }
+    drop(image); // Release held ancestors before removing the fresh fixture tree.
+    let alias = root.0.join("alias.exe");
+    std::fs::hard_link(&image_path, &alias).map_err(|_| "hard-link fixture unavailable")?;
+    if HeldImage::open(&alias, hash).is_ok() {
+        return Err("hard-linked executable admitted");
+    }
+    profile.close()?;
+    sentinel.cleanup()?;
+    root.cleanup()?;
+    // Success is intentionally narrow: no vendor or LAN/public-egress qualification.
+    std::io::stdout().write_all(b"synthetic LPAC/Job/pipes/ACL/loopback/hash fixtures passed; vendor and LAN/public-egress qualification pending\n").map_err(|_| "fixture receipt unavailable")?;
+    Ok(())
+}
+
+/// Read-only local startup of the exact signed vendor image, without an install,
+/// account status/login or inference. Fixed argv; fresh empty private directories.
+pub(crate) fn vendor_probe(source: &std::path::Path) -> Result<(), &'static str> {
+    use super::signature;
+    let original = HeldImage::open(source, signature::CANDIDATE_SHA256)?;
+    signature::verify(&original)?;
+    let suffix = format!(
+        "{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "clock unavailable")?
+            .as_nanos()
+    );
+    let root = Root::new(std::env::temp_dir().join(format!("Zephium.ClaudeFixture.{suffix}")));
+    std::fs::create_dir(&root.0).map_err(|_| "vendor fixture root unavailable")?;
+    let profile = Profile::create(&format!("Zephium.ClaudeFixture.{suffix}"))?;
+    let layout = Layout::create(&root.0, &profile)?;
+    let target = root.0.join("claude.exe");
+    std::fs::copy(&original.path, &target).map_err(|_| "vendor fixture staging failed")?;
+    profile.seal(&target, false)?;
+    let image = HeldImage::open(&target, signature::CANDIDATE_SHA256)?;
+    signature::verify(&image)?;
+    let cancelled = AtomicBool::new(false);
+    let version = process::run(
+        &profile,
+        &image,
+        &layout,
+        Command::Fixture(Fixture::VendorVersion),
+        Vec::new(),
+        &cancelled,
+    )?;
+    let expected = format!("{} (Claude Code)", signature::CANDIDATE_VERSION);
+    receipt("version", &version);
+    if version.code != 0
+        || version.stopped.is_some()
+        || std::str::from_utf8(&version.stdout).map(str::trim) != Ok(expected.as_str())
+        || !version.stderr.is_empty()
+    {
+        return Err("pinned vendor version did not run under LPAC");
+    }
+    let help = process::run(
+        &profile,
+        &image,
+        &layout,
+        Command::Fixture(Fixture::VendorHelp),
+        Vec::new(),
+        &cancelled,
+    )?;
+    receipt("help", &help);
+    if help.code != 0 || help.stopped.is_some() || help.stdout.is_empty() || !help.stderr.is_empty()
+    {
+        return Err("pinned vendor help did not run under LPAC");
+    }
+    drop(image);
+    profile.close()?;
+    root.cleanup()?;
+    drop(original);
+    std::io::stdout().write_all(b"pinned signed Claude 2.1.310 version/help ran under LPAC; login, account status and inference NOT qualified\n").map_err(|_| "vendor receipt failed")?;
+    Ok(())
+}
+
+fn receipt(stage: &'static str, output: &process::Output) {
+    use std::io::Write;
+    let _ = std::io::stdout().write_all(
+        format!(
+            "fixture-stage={stage}; exit={}; stopped={}; stdout-bytes={}; stderr-bytes={}\n",
+            output.code,
+            output.stopped.unwrap_or("none"),
+            output.stdout.len(),
+            output.stderr.len()
+        )
+        .as_bytes(),
+    );
+}

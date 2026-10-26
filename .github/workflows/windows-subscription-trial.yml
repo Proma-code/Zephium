@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: windows-subscription-trial-${{ github.ref }}
-  cancel-in-progress: true
+  group: windows-subscription-trial-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -98,3 +98,22 @@ jobs:
           path: target/windows-subscription-trial-artifact/
           if-no-files-found: error
           retention-days: 14
+
+  claude_broker:
+    name: Windows Claude broker qualification (no account)
+    if: github.repository == 'Proma-code/Zephium'
+    runs-on: windows-2025
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.95.0 --profile minimal --component clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: windows-claude-broker-qualification
+      - name: Synthetic fixtures then exact original client startup (no login or inference)
+        run: pwsh -NoProfile -File crates/zephium-claude-broker/qualify-windows.ps1
