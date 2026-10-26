@@ -2,3 +2,15 @@
 # the job summary instead of disappearing into a green run.
 [profile.ci.junit]
 path = "junit.xml"
+
+# Isolate the two process-startup/custody measurements from other test load in
+# Windows CI. Their assertions and native command deadlines remain unchanged.
+[[profile.ci.overrides]]
+platform = { host = 'cfg(windows)', target = 'cfg(windows)' }
+filter = '''
+package(=zephium-app) & (
+    test(=work_commands::windows::tests::windows_command_preserves_unicode_output_and_exit_status)
+    | test(=work_commands::windows::tests::windows_command_timeout_and_stop_end_the_owned_tree)
+)
+'''
+threads-required = "num-test-threads"
