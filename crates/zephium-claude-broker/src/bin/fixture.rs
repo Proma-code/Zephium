@@ -39,6 +39,7 @@ fn main() {
     let result = match args.as_slice() {
         [mode] if mode == "token-controls" => zephium_claude_broker::qualify_token_controls(),
         [mode] if mode == "auth-inputs" => zephium_claude_broker::qualify_synthetic_auth_inputs(),
+        [mode] if mode == "network-controls" => zephium_claude_broker::research_network_controls(),
         [mode] if mode == "qualify" => zephium_claude_broker::qualify_synthetic_fixture(),
         [flag, mode, values @ ..] if flag == "--child" && mode == "argv" => {
             if values == ["", "end\\", "a\"b"] {
@@ -71,6 +72,7 @@ fn main() {
 fn child(mode: &str) -> Result<(), &'static str> {
     use std::io::{Read, Write};
     match mode {
+        "network-control" => zephium_claude_broker::research_network_child()?,
         "login-input" | "login-exit" => {
             std::io::stdout()
                 .write_all(b"synthetic-code-request\n")

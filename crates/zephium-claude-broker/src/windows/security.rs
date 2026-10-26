@@ -195,6 +195,63 @@ impl Profile {
         };
         operation(&capabilities)
     }
+    /// Synthetic differential only. Never selected by vendor operations.
+    #[cfg(feature = "native-fixtures")]
+    pub(super) fn with_registry_research_capabilities<T>(
+        &self,
+        operation: impl FnOnce(&SECURITY_CAPABILITIES) -> T,
+    ) -> Result<T, &'static str> {
+        use windows::Win32::Security::{DeriveCapabilitySidsFromName, IsValidSid};
+        struct Sids(*mut PSID, u32);
+        impl Drop for Sids {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    for index in 0..self.1 as usize {
+                        unsafe { LocalFree(Some(HLOCAL((*self.0.add(index)).0))) };
+                    }
+                    unsafe { LocalFree(Some(HLOCAL(self.0.cast()))) };
+                }
+            }
+        }
+        let mut groups = Sids(std::ptr::null_mut(), 0);
+        let mut sids = Sids(std::ptr::null_mut(), 0);
+        // Keep both API-owned arrays alive through creation/token inspection.
+        // Capability SIDs, NOT the distinct NT-authority group SIDs, are used.
+        unsafe {
+            DeriveCapabilitySidsFromName(
+                windows::core::w!("registryRead"),
+                &mut groups.0,
+                &mut groups.1,
+                &mut sids.0,
+                &mut sids.1,
+            )
+        }
+        .map_err(|_| "research registry capability derivation failed")?;
+        if sids.1 != 1 || sids.0.is_null() {
+            return Err("research registry capability shape mismatch");
+        }
+        let registry = unsafe { *sids.0 };
+        if registry.0.is_null() || !unsafe { IsValidSid(registry) }.as_bool() {
+            return Err("research registry capability invalid");
+        }
+        let mut entries = [
+            SID_AND_ATTRIBUTES {
+                Sid: PSID(self.internet.as_ptr().cast_mut().cast()),
+                Attributes: 4,
+            },
+            SID_AND_ATTRIBUTES {
+                Sid: registry,
+                Attributes: 4,
+            },
+        ];
+        let capabilities = SECURITY_CAPABILITIES {
+            AppContainerSid: PSID(self.sid.as_ptr().cast_mut().cast()),
+            Capabilities: entries.as_mut_ptr(),
+            CapabilityCount: 2,
+            Reserved: 0,
+        };
+        Ok(operation(&capabilities))
+    }
     fn descriptor(&self, writable: bool) -> Result<Descriptor, &'static str> {
         let owner = owner_sid()?;
         let package = sid_string(PSID(self.sid.as_ptr().cast_mut().cast()))?;

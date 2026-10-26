@@ -153,6 +153,8 @@ pub(super) enum Command {
 #[cfg(feature = "native-fixtures")]
 #[derive(Clone, Copy)]
 pub(super) enum Fixture {
+    NetworkBaseline,
+    NetworkRegistryRead,
     HandleProbe,
     LoginInput,
     LoginExit,
@@ -170,6 +172,10 @@ pub(super) enum Fixture {
 }
 impl Command {
     #[cfg(feature = "native-fixtures")]
+    fn registry_research(self) -> bool {
+        matches!(self, Self::Fixture(Fixture::NetworkRegistryRead))
+    }
+    #[cfg(feature = "native-fixtures")]
     fn token_probe(self) -> Option<bool> {
         match self {
             Self::Fixture(Fixture::TokenAppContainerControl) => Some(false),
@@ -182,6 +188,9 @@ impl Command {
             Self::Vendor(operation) => CommandPlan::for_operation(operation).arguments(),
             #[cfg(feature = "native-fixtures")]
             Self::Fixture(mode) => match mode {
+                Fixture::NetworkBaseline | Fixture::NetworkRegistryRead => {
+                    &["--child", "network-control"]
+                }
                 Fixture::HandleProbe => &["--child", "handle-probe"],
                 Fixture::LoginInput => &["--child", "login-input"],
                 Fixture::LoginExit => &["--child", "login-exit"],
@@ -472,8 +481,8 @@ fn run_owned(
     startup.lpAttributeList = attributes.list;
     let mut info = PROCESS_INFORMATION::default();
     // Security capability storage is live until process creation and token check.
-    let created = profile.with_capabilities(
-        |capabilities| -> Result<(OwnedHandle, OwnedHandle), &'static str> {
+    let create =
+        |capabilities: &SECURITY_CAPABILITIES| -> Result<(OwnedHandle, OwnedHandle), &'static str> {
             unsafe {
                 UpdateProcThreadAttribute(
                     attributes.list,
@@ -489,7 +498,7 @@ fn run_owned(
             if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
                 return Err("cancelled before creation");
             }
-            unsafe {
+            let created = unsafe {
                 CreateProcessW(
                     PCWSTR(application.as_ptr()),
                     Some(PWSTR(line.as_mut_ptr())),
@@ -505,8 +514,12 @@ fn run_owned(
                     &startup.StartupInfo,
                     &mut info,
                 )
-            }
-            .map_err(|error| {
+            };
+            // Attribute values must outlive the list, not only CreateProcessW.
+            // This FnOnce owns the list, so early returns also destroy it while
+            // the caller's capability SID arrays are still alive.
+            drop(attributes);
+            created.map_err(|error| {
                 super::diagnostic("create-process", error.code().0);
                 "confined process creation failed"
             })?;
@@ -528,8 +541,15 @@ fn run_owned(
                 return Err(error);
             }
             Ok((process, thread))
-        },
-    )?;
+        };
+    #[cfg(feature = "native-fixtures")]
+    let created = if command.registry_research() {
+        profile.with_registry_research_capabilities(create)?
+    } else {
+        profile.with_capabilities(create)
+    }?;
+    #[cfg(not(feature = "native-fixtures"))]
+    let created = profile.with_capabilities(create)?;
     let (process, thread) = created;
     #[cfg(feature = "native-fixtures")]
     if command.token_probe().is_some() {
@@ -832,14 +852,69 @@ fn inspect_identity(
         return Err("LPAC capabilities invalid");
     }
     let groups = unsafe { &*buffer.as_ptr().cast::<TOKEN_GROUPS>() };
-    if groups.GroupCount != 1 || capabilities.CapabilityCount != 1 {
+    let count = capabilities.CapabilityCount as usize;
+    if (count != 1 && !(cfg!(feature = "native-fixtures") && count == 2))
+        || groups.GroupCount as usize != count
+        || std::mem::offset_of!(TOKEN_GROUPS, Groups)
+            + count * size_of::<windows::Win32::Security::SID_AND_ATTRIBUTES>()
+            > length as usize
+    {
         super::diagnostic("capability-count", groups.GroupCount as i32);
         return Err("unexpected LPAC capability count");
     }
-    unsafe { EqualSid(groups.Groups[0].Sid, (*capabilities.Capabilities).Sid) }
-        .map_err(|_| "unexpected LPAC capability")?;
-    if groups.Groups[0].Attributes != 4 || unsafe { (*capabilities.Capabilities).Attributes } != 4 {
+    // Match the exact finite expected set, including attributes and uniqueness;
+    // Windows may reorder capabilities. No unknown or duplicate SID is admitted.
+    let actual = unsafe { std::slice::from_raw_parts(groups.Groups.as_ptr(), count) };
+    let expected = unsafe { std::slice::from_raw_parts(capabilities.Capabilities, count) };
+    if count == 2 && unsafe { EqualSid(expected[0].Sid, expected[1].Sid) }.is_ok() {
+        return Err("duplicate expected LPAC capability");
+    }
+    for wanted in expected {
+        if wanted.Attributes != 4
+            || actual
+                .iter()
+                .filter(|found| unsafe { EqualSid(found.Sid, wanted.Sid) }.is_ok())
+                .count()
+                != 1
+        {
+            return Err("unexpected LPAC capability");
+        }
+    }
+    if actual.iter().any(|entry| entry.Attributes != 4) {
         return Err("unexpected LPAC capability attributes");
     }
     Ok(token)
+}
+
+#[cfg(all(test, feature = "native-fixtures"))]
+mod research_admission_tests {
+    use super::*;
+    #[test]
+    fn registry_capability_is_never_a_vendor_or_default_mode() {
+        for operation in [
+            Operation::ReadStatus,
+            Operation::StartLogin,
+            Operation::Logout,
+            Operation::TextTurn,
+        ] {
+            assert!(!Command::Vendor(operation).registry_research());
+        }
+        for fixture in [
+            Fixture::NetworkBaseline,
+            Fixture::VendorVersion,
+            Fixture::VendorHelp,
+            Fixture::Isolation,
+            Fixture::LoginInput,
+            Fixture::LoginExit,
+            Fixture::TokenLpacControl,
+            Fixture::TokenAppContainerControl,
+        ] {
+            assert!(!Command::Fixture(fixture).registry_research());
+        }
+        assert!(Command::Fixture(Fixture::NetworkRegistryRead).registry_research());
+        assert_eq!(
+            Command::Fixture(Fixture::NetworkRegistryRead).arguments(),
+            &["--child", "network-control"]
+        );
+    }
 }

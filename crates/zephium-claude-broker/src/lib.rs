@@ -66,6 +66,20 @@ pub fn qualify_synthetic_auth_inputs() -> Result<(), &'static str> {
     windows::fixtures::auth_inputs()
 }
 
+/// Debug-only differential Winsock/capability experiment. This does not change
+/// the vendor capability set or production qualification.
+#[cfg(all(windows, feature = "native-fixtures"))]
+pub fn research_network_controls() -> Result<(), &'static str> {
+    windows::network_research::controls()
+}
+
+/// Fixed synthetic child for the differential experiment; reads only the bounded
+/// fixture request on stdin. Not part of the vendor command vocabulary.
+#[cfg(all(windows, feature = "native-fixtures"))]
+pub fn research_network_child() -> Result<(), &'static str> {
+    windows::network_research::child()
+}
+
 /// Debug-only startup probe of one exact hash-pinned, Authenticode-verified vendor
 /// image. Only `--version` and restricted safe `--help`; no account operations.
 #[cfg(all(windows, feature = "native-fixtures"))]

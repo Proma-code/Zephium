@@ -11,17 +11,20 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-struct Root(std::path::PathBuf, bool);
+pub(super) struct Root(pub(super) std::path::PathBuf, bool);
 impl Root {
-    fn create(path: std::path::PathBuf, profile: &Profile) -> Result<Self, &'static str> {
+    pub(super) fn create(
+        path: std::path::PathBuf,
+        profile: &Profile,
+    ) -> Result<Self, &'static str> {
         profile.create_directory(&path, false)?;
         Ok(Self(path, true))
     }
-    fn create_sentinel(path: std::path::PathBuf) -> Result<Self, &'static str> {
+    pub(super) fn create_sentinel(path: std::path::PathBuf) -> Result<Self, &'static str> {
         std::fs::create_dir(&path).map_err(|_| "fresh sentinel creation failed")?;
         Ok(Self(path, true))
     }
-    fn cleanup(mut self) -> Result<(), &'static str> {
+    pub(super) fn cleanup(mut self) -> Result<(), &'static str> {
         std::fs::remove_dir_all(&self.0).map_err(|_| "private fixture cleanup failed")?;
         self.1 = false;
         Ok(())
@@ -447,7 +450,7 @@ pub(crate) fn vendor_probe(source: &std::path::Path) -> Result<(), &'static str>
     Ok(())
 }
 
-fn receipt(stage: &'static str, output: &process::Output) {
+pub(super) fn receipt(stage: &'static str, output: &process::Output) {
     use std::io::Write;
     let _ = std::io::stdout().write_all(
         format!(

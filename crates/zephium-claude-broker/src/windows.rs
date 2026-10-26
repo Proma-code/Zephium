@@ -1,6 +1,8 @@
 //! Native candidate runtime. No production constructor bypasses qualification.
 #[cfg(feature = "native-fixtures")]
 pub(super) mod fixtures;
+#[cfg(feature = "native-fixtures")]
+pub(super) mod network_research;
 mod process;
 mod security;
 mod signature;
