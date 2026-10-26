@@ -5905,6 +5905,7 @@ pub fn run() {
         opencode_go::go_status,
         opencode_go::go_save,
         opencode_go::go_check,
+        opencode_go::go_quota,
         opencode_go::go_disconnect,
         local_gateway::gateway_status,
         local_gateway::gateway_save,

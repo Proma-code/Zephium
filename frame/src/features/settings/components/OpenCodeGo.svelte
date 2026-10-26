@@ -1,6 +1,17 @@
 <script lang="ts">
   import { onDestroy, tick } from "svelte";
-  import { GoSession, goKeyValid, goStatus, goFault, goBilling } from "$domain/opencode-go";
+  import {
+    GoSession,
+    goKeyValid,
+    goStatus,
+    goFault,
+    goBilling,
+    goQuotaFault,
+    goQuotaStatus,
+    goQuotaWindow,
+    goQuotaRemaining,
+    goQuotaTime,
+  } from "$domain/opencode-go";
   import { settle } from "$domain/operations";
   import { commands } from "$shared/ipc/bindings";
   import * as m from "$shared/i18n/messages";
@@ -30,8 +41,13 @@
     };
   });
   const view = $derived(session?.view ?? null);
+  const quota = $derived(view ? session?.quota : undefined);
+  const checked = $derived(goQuotaTime(quota?.checked_at_ms ?? null));
+  const attempted = $derived(goQuotaTime(quota?.attempted_at_ms ?? null));
   const busy = $derived(session?.busy ?? null);
-  const locked = $derived(!!busy || !!view?.checking || !!session?.observationFailed);
+  const locked = $derived(
+    !!busy || !!view?.checking || !!quota?.checking || !!session?.observationFailed,
+  );
   const configured = $derived(view?.state === "configured" || view?.state === "catalogued");
   const changed = $derived(editing && !!view && draftConnection !== view.connection_id);
   const valid = $derived(!changed && acknowledged && goKeyValid(secret.trim()));
@@ -161,7 +177,7 @@
       {/if}
     </div>
   {/if}
-  {#if session?.observationFailed || view?.checking || view?.state === "unavailable"}
+  {#if session?.observationFailed || view?.checking || quota?.checking || view?.state === "unavailable"}
     <div class="actions">
       <Button
         size="compact"
@@ -172,7 +188,45 @@
     </div>
   {/if}
   <p class="note">{m.go_catalog_note()}</p>
-  <p>{m.go_usage_unknown()}</p>
+  <section class="quota" aria-label={m.go_quota_heading()}>
+    <div class="quota-heading">
+      <p class="quota-title">{m.go_quota_heading()}</p>
+      {#if configured}
+        <Button
+          size="compact"
+          pending={busy === "quota" || !!quota?.checking}
+          disabled={locked}
+          onclick={() => void session?.refreshQuota()}>{m.go_quota_refresh()}</Button
+        >
+      {/if}
+    </div>
+    <p aria-live="polite">{goQuotaStatus(quota)}</p>
+    {#if quota?.checking || busy === "quota"}<p>{m.go_quota_checking()}</p>{/if}
+    {#if quota?.windows.length}
+      <dl class="quota-windows">
+        {#each quota.windows as window (window.kind)}
+          <div class="quota-window">
+            <dt>{goQuotaWindow(window.kind)}</dt>
+            <dd>
+              <span>{goQuotaRemaining(window.remaining_percent)}</span>
+              {#if window.limited}<span class="limited">{m.go_quota_limited()}</span>{/if}
+              <span class="reset"
+                >{m.go_quota_reset({ time: goQuotaTime(window.resets_at_ms)! })}</span
+              >
+            </dd>
+          </div>
+        {/each}
+      </dl>
+    {/if}
+    {#if checked}<p>{m.go_quota_checked({ time: checked })}</p>{/if}
+    {#if attempted && quota?.attempted_at_ms !== quota?.checked_at_ms}<p>
+        {m.go_quota_attempted({ time: attempted })}
+      </p>{/if}
+    {#if quota?.error && !quota.checking && busy !== "quota"}
+      <p class="fault" role="alert">{goQuotaFault(quota.error)}</p>
+    {/if}
+    <p>{m.go_quota_note()}</p>
+  </section>
   {#if billing}<p>{billing}</p>
     <p>{m.go_billing_history_note()}</p>{/if}
   {#if !editing}<p>{m.go_billing_note()}</p>{/if}
@@ -233,6 +287,57 @@
 
   .note {
     margin-block-start: 12px;
+  }
+
+  .quota {
+    margin-block-start: 16px;
+  }
+
+  .quota-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-block-end: 6px;
+  }
+
+  .quota-title {
+    color: var(--color-text);
+    font-weight: 550;
+  }
+
+  .quota-windows {
+    display: grid;
+    gap: 8px;
+    margin: 10px 0;
+    font-size: var(--text-label);
+  }
+
+  .quota-window {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  dt {
+    color: var(--color-text);
+  }
+
+  dd {
+    display: grid;
+    justify-items: end;
+    gap: 2px;
+    margin: 0;
+    text-align: end;
+  }
+
+  .limited {
+    color: var(--color-danger);
+  }
+
+  .reset {
+    color: var(--color-muted);
+    font-size: var(--text-caption);
   }
 
   .fault {

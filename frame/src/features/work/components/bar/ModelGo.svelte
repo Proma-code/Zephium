@@ -1,6 +1,16 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
-  import { GoSession, goStatus, goFault, goBilling } from "$domain/opencode-go";
+  import {
+    GoSession,
+    goStatus,
+    goFault,
+    goBilling,
+    goQuotaFault,
+    goQuotaStatus,
+    goQuotaWindow,
+    goQuotaRemaining,
+    goQuotaTime,
+  } from "$domain/opencode-go";
   import { settle } from "$domain/operations";
   import { commands } from "$shared/ipc/bindings";
   import * as m from "$shared/i18n/messages";
@@ -28,9 +38,13 @@
     };
   });
   const view = $derived(session?.view ?? null);
+  const quota = $derived(view ? session?.quota : undefined);
+  const checked = $derived(goQuotaTime(quota?.checked_at_ms ?? null));
   const busy = $derived(session?.busy ?? null);
   const configured = $derived(view?.state === "configured" || view?.state === "catalogued");
-  const locked = $derived(!!busy || !!view?.checking || !!session?.observationFailed);
+  const locked = $derived(
+    !!busy || !!view?.checking || !!quota?.checking || !!session?.observationFailed,
+  );
   const billing = $derived(goBilling(view));
   let linkPending = $state(false);
   let linkUnconfirmed = $state(false);
@@ -83,9 +97,44 @@
         />
       </div>{/if}
   </div>
-  {#if configured}<p>{m.go_coding_only()}</p>
-    <p>{m.go_short_catalog_note()}</p>
-    <p>{m.go_usage_unknown()}</p>{/if}
+  {#if configured}
+    <p title={m.go_coding_only()}>{m.go_short_catalog_note()}</p>
+    <div class="quota-heading">
+      <p aria-live="polite" title={checked ? m.go_quota_checked({ time: checked }) : undefined}>
+        {goQuotaStatus(quota)}
+      </p>
+      <IconButton
+        icon={ArrowReloadHorizontalIcon}
+        label={m.go_quota_refresh()}
+        pending={busy === "quota" || !!quota?.checking}
+        disabled={locked}
+        onclick={() => void session?.refreshQuota()}
+      />
+    </div>
+    {#if quota?.windows.length}
+      <dl class="quota-windows">
+        {#each quota.windows as window (window.kind)}
+          <div
+            class="quota-window"
+            title={m.go_quota_reset({ time: goQuotaTime(window.resets_at_ms)! })}
+          >
+            <dt>{goQuotaWindow(window.kind)}</dt>
+            <dd>
+              {goQuotaRemaining(window.remaining_percent)}
+              {#if window.limited}<span class="limited">{m.go_quota_limited()}</span>{/if}
+              <span class="sr-only"
+                >{m.go_quota_reset({ time: goQuotaTime(window.resets_at_ms)! })}</span
+              >
+            </dd>
+          </div>
+        {/each}
+      </dl>
+    {/if}
+    {#if checked}<p>{m.go_quota_checked({ time: checked })}</p>{/if}
+    {#if quota?.error && !quota.checking && busy !== "quota"}
+      <p class="fault" role="alert">{goQuotaFault(quota.error)}</p>
+    {/if}
+  {/if}
   {#if billing}<p>{billing}</p>
     <p>{m.go_billing_history_note()}</p>{/if}
   {#if view?.state === "unconfigured"}
@@ -93,7 +142,7 @@
     <p>{m.go_settings()}</p>
     <div class="actions"><Button size="compact" onclick={onsettings}>{m.go_setup()}</Button></div>
   {/if}
-  {#if session?.observationFailed || view?.checking || view?.state === "unavailable"}
+  {#if session?.observationFailed || view?.checking || quota?.checking || view?.state === "unavailable"}
     <div class="actions">
       <Button
         size="compact"
@@ -180,6 +229,37 @@
 
   .empty .tools {
     margin-inline-start: 0;
+  }
+
+  .quota-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .quota-windows {
+    display: grid;
+    gap: 2px;
+    margin: 0 0 4px;
+    color: var(--color-text);
+    font-size: var(--text-caption);
+  }
+
+  .quota-window {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  dd {
+    margin: 0;
+    text-align: end;
+  }
+
+  .limited {
+    display: block;
+    color: var(--color-danger);
   }
 
   .fault {

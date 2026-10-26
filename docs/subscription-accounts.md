@@ -51,17 +51,29 @@ setting. Review it before sending requests. The latest completed request's
 provider-reported billing source is shown separately from quota.
 
 Only the currently implemented model/protocol subset is offered. Other listed
-models are not silently routed through a different API. Remaining numeric quota
-is unavailable here; check the provider Console. See the [official Go guide](https://opencode.ai/v2/docs/console/go/)
-for current limits, model availability and privacy settings.
+models are not silently routed through a different API.
+
+Choose **Refresh quota** to request the provider’s current rolling, weekly and
+monthly allowances. The view shows remaining percentage, reset time and when it
+was checked. A separate limit indicator reflects the provider’s reported state;
+rounded percentages do not decide whether requests are allowed. Refreshing does
+not send a model prompt.
+
+Quota is best-effort provider data. A failed refresh may leave the previous
+reading marked stale; an unknown value is never shown as zero or full. A saved
+key or public catalog alone does not verify a paid plan. Consult the Console if
+usage information is unavailable or differs from your account page. See the
+[official Go guide](https://opencode.ai/v2/docs/console/go/) for current limits,
+model availability and privacy settings.
 
 ## Current limits
 
 - Claude account chat remains in development. OpenCode CLI setup guidance is
   separate from the Go access-key connection and does not establish a CLI login.
-- Numeric remaining subscription quota is not available through the current
-  connected routes. Unknown quota is not shown as empty or full. Use the relevant
-  provider's official account page to check usage.
+- OpenCode Go has an explicit quota refresh. Numeric remaining quota for direct
+  ChatGPT, Claude and a generic local gateway is not available here yet. Unknown
+  quota is not shown as empty or full. Use the relevant provider’s official
+  account page when no reading is available.
 - Portable tests have run, but native Windows installation and real-account
   behavior are not yet fully verified. See the [test status](../blueprint/verification.md).
 - No real provider account was signed in or used for paid inference during these tests.

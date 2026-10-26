@@ -89,7 +89,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p zephium-ipc --locked opencode_go::tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p zephium-agentic --features provider-transport --locked opencode_go::tests
+          cargo test -p zephium-agentic --features provider-transport --locked opencode_go::
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p zephium-agentic --features provider-transport --locked local_gateway::tests
       - name: Protected native trial identity test (no user profile)

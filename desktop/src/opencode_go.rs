@@ -10,7 +10,11 @@ mod live {
     use zephium_agentic::lead::opencode_go::{BillingSource, SessionId};
     use zephium_core::ids::ProfileId;
     use zephium_core::work::model::*;
-    use zephium_ipc::opencode_go::{GoBillingSourceV1, GoBillingViewV1, GoFaultV1, GoStateV1};
+    use zephium_ipc::opencode_go::{
+        GoBillingSourceV1, GoBillingViewV1, GoFaultV1, GoQuotaFaultV1, GoQuotaKindV1,
+        GoQuotaStateV1, GoQuotaViewV1, GoQuotaWindowV1, GoStateV1,
+    };
+    use zephium_opencode_go::service::quota::{QuotaFault, QuotaStatus, QuotaView};
     use zephium_opencode_go::service::{Fault, Service};
     use zeroize::Zeroizing;
 
@@ -342,7 +346,66 @@ mod live {
             Fault::UsageUnavailable => GoFaultV1::UsageUnavailable,
         }
     }
-    fn view(profile: String, service: &Service, error: Option<Fault>) -> GoViewV1 {
+    fn quota_fault(fault: QuotaFault) -> GoQuotaFaultV1 {
+        match fault {
+            QuotaFault::Invalid => GoQuotaFaultV1::Invalid,
+            QuotaFault::NotConfigured => GoQuotaFaultV1::NotConfigured,
+            QuotaFault::Changed => GoQuotaFaultV1::Changed,
+            QuotaFault::Vault => GoQuotaFaultV1::Vault,
+            QuotaFault::Busy => GoQuotaFaultV1::Busy,
+            QuotaFault::Cancelled => GoQuotaFaultV1::Cancelled,
+            QuotaFault::Unauthorized => GoQuotaFaultV1::Unauthorized,
+            QuotaFault::NoEntitlement => GoQuotaFaultV1::NoEntitlement,
+            QuotaFault::Forbidden => GoQuotaFaultV1::Forbidden,
+            QuotaFault::EndpointUnavailable => GoQuotaFaultV1::EndpointUnavailable,
+            QuotaFault::RateLimited => GoQuotaFaultV1::RateLimited,
+            QuotaFault::Timeout => GoQuotaFaultV1::Timeout,
+            QuotaFault::Unavailable => GoQuotaFaultV1::Unavailable,
+            QuotaFault::Protocol => GoQuotaFaultV1::Protocol,
+            QuotaFault::TooLarge => GoQuotaFaultV1::TooLarge,
+        }
+    }
+    fn quota_view(current: QuotaView, error: Option<QuotaFault>) -> GoQuotaViewV1 {
+        GoQuotaViewV1 {
+            state: match current.status {
+                QuotaStatus::NotChecked => GoQuotaStateV1::NotChecked,
+                QuotaStatus::Current => GoQuotaStateV1::Current,
+                QuotaStatus::Stale => GoQuotaStateV1::Stale,
+                QuotaStatus::Unavailable => GoQuotaStateV1::Unavailable,
+                QuotaStatus::NoEntitlement => GoQuotaStateV1::NoEntitlement,
+            },
+            checking: current.checking,
+            checked_at_ms: current.checked_at_ms.map(|ms| ms.to_string()),
+            attempted_at_ms: current.attempted_at_ms.map(|ms| ms.to_string()),
+            stale_at_ms: current.stale_at_ms.map(|ms| ms.to_string()),
+            windows: current
+                .reading
+                .map(|reading| {
+                    [
+                        (GoQuotaKindV1::Rolling, reading.rolling),
+                        (GoQuotaKindV1::Weekly, reading.weekly),
+                        (GoQuotaKindV1::Monthly, reading.monthly),
+                    ]
+                    .into_iter()
+                    .map(|(kind, window)| GoQuotaWindowV1 {
+                        kind,
+                        used_percent: window.used_percent,
+                        remaining_percent: window.remaining_percent,
+                        resets_at_ms: window.resets_at_ms.to_string(),
+                        limited: window.limited,
+                    })
+                    .collect()
+                })
+                .unwrap_or_default(),
+            error: error.or(current.fault).map(quota_fault),
+        }
+    }
+    fn view(
+        profile: String,
+        service: &Service,
+        error: Option<Fault>,
+        quota_error: Option<QuotaFault>,
+    ) -> GoViewV1 {
         let current = service.view();
         let error = error.or(current.fault);
         GoViewV1 {
@@ -369,6 +432,7 @@ mod live {
                 },
                 observed_at_ms: billing.observed_at_ms.to_string(),
             }),
+            quota: quota_view(current.quota, quota_error),
             error: error.map(fault),
         }
     }
@@ -431,6 +495,7 @@ mod live {
         let Some(service_scope) = registry.admit_scope(&expected, scope_epoch, &service) else {
             return GoViewV1::unavailable(expected);
         };
+        let mut quota_error = None;
         let result = match (action, save) {
             (GoCommand::Status, None) => service.load_scoped(service_scope).await,
             (GoCommand::Save, Some((key, acknowledged))) => {
@@ -443,6 +508,13 @@ mod live {
                     .check_models_scoped(service_scope, expected_connection_id)
                     .await
             }
+            (GoCommand::Quota, None) => {
+                quota_error = service
+                    .check_quota_scoped(service_scope, expected_connection_id)
+                    .await
+                    .err();
+                Ok(())
+            }
             (GoCommand::Disconnect, None) => {
                 service
                     .disconnect_scoped(service_scope, expected_connection_id)
@@ -453,7 +525,7 @@ mod live {
         if !registry.owns_scope(&expected, scope_epoch) {
             return GoViewV1::unavailable(expected);
         }
-        view(expected, &service, result.err())
+        view(expected, &service, result.err(), quota_error)
     }
 }
 
@@ -532,6 +604,21 @@ pub(crate) async fn go_check(
         caller,
         expected_profile,
         GoCommand::Check,
+        Some(expected_connection_id),
+        None,
+    )
+    .await
+}
+#[tauri::command]
+pub(crate) async fn go_quota(
+    caller: WebviewWindow,
+    expected_profile: String,
+    expected_connection_id: String,
+) -> GoViewV1 {
+    dispatch(
+        caller,
+        expected_profile,
+        GoCommand::Quota,
         Some(expected_connection_id),
         None,
     )

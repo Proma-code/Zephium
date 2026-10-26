@@ -3,6 +3,8 @@
 //! Public catalog availability is not authentication or subscription validation.
 //! Provider Extra Usage may spend balance; this client never enables it or retries.
 
+pub mod quota;
+
 use super::sse::{SseEvent, SseFramer};
 use super::{chat, LeadSecret, LeadTarget};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};

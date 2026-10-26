@@ -3,7 +3,9 @@
 //! Inputs are the result/params of Codex `account/rateLimits/read`/`updated`, or
 //! original Claude Code status-line JSON. A qualified native broker must supply
 //! account provenance, correlate responses, and enforce its own execution gate.
-//! Direct SIWC, OpenCode Go and Antigravity have no implemented quota reader.
+//! Go uses a separate source-owned reader; its first-party quota contract is not
+//! interchangeable with these CLI parsers. Direct SIWC and generic Antigravity
+//! gateways still have no verified quota contract here.
 //! No token stores, private endpoints, paid requests, hooks or clocks are used.
 //!
 //! Contracts: <https://learn.chatgpt.com/docs/app-server> and
@@ -41,6 +43,8 @@ pub enum QuotaSource {
 pub enum QuotaCapability {
     /// This module can parse documented output; native retrieval is not connected.
     DocumentedObservation,
+    /// A first-party contract is verified; its source-owned reader is outside this module.
+    FirstPartyContract,
     /// No supported machine-readable contract has been verified for this source.
     NoVerifiedContract,
     /// Consumer integration is unsupported; no gateway contract is implemented.
@@ -64,7 +68,8 @@ impl QuotaSource {
             Self::CodexAppServer | Self::ClaudeCodeStatusLine => {
                 QuotaCapability::DocumentedObservation
             }
-            Self::DirectChatGpt | Self::OpenCodeGo => QuotaCapability::NoVerifiedContract,
+            Self::DirectChatGpt => QuotaCapability::NoVerifiedContract,
+            Self::OpenCodeGo => QuotaCapability::FirstPartyContract,
             Self::AntigravityGateway => QuotaCapability::Unsupported,
         }
     }
@@ -72,7 +77,9 @@ impl QuotaSource {
     /// Truthful initial presentation, even when the corresponding account is linked.
     pub const fn initial_unavailability(self) -> QuotaUnavailable {
         match self.capability() {
-            QuotaCapability::DocumentedObservation => QuotaUnavailable::ObserverNotConnected,
+            QuotaCapability::DocumentedObservation | QuotaCapability::FirstPartyContract => {
+                QuotaUnavailable::ObserverNotConnected
+            }
             QuotaCapability::NoVerifiedContract => QuotaUnavailable::NoVerifiedContract,
             QuotaCapability::Unsupported => QuotaUnavailable::ProviderUnsupported,
         }

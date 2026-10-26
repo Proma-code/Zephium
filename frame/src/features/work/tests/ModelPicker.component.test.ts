@@ -7,7 +7,7 @@ import { preferences } from "$domain/preferences";
 import ModelPicker from "../components/bar/ModelPicker.svelte";
 import ModelBarStage from "./ModelBarStage.svelte";
 import { PROFILE, entry, models } from "$shared/testing/work-models";
-import { goView } from "$shared/testing/opencode-go";
+import { goView, goQuotaReading } from "$shared/testing/opencode-go";
 import { gatewayView } from "$shared/testing/gateway";
 import { chatgptView } from "$shared/testing/chatgpt";
 import type { ChatGptViewV1 } from "$shared/ipc/chatgpt-bindings";
@@ -67,10 +67,20 @@ vi.mock("$shared/ipc/chatgpt-bindings", async () => {
     chatgptRefreshModels: chatgpt.models,
   });
 });
-const go = vi.hoisted(() => ({ read: vi.fn(), check: vi.fn(), disconnect: vi.fn() }));
+const go = vi.hoisted(() => ({
+  read: vi.fn(),
+  check: vi.fn(),
+  quota: vi.fn(),
+  disconnect: vi.fn(),
+}));
 vi.mock("$shared/ipc/go-bindings", async () => {
   const { mockGoBindings } = await import("$shared/testing/opencode-go");
-  return mockGoBindings({ goStatus: go.read, goCheck: go.check, goDisconnect: go.disconnect });
+  return mockGoBindings({
+    goStatus: go.read,
+    goCheck: go.check,
+    goQuota: go.quota,
+    goDisconnect: go.disconnect,
+  });
 });
 const gateway = vi.hoisted(() => ({ read: vi.fn(), check: vi.fn(), disconnect: vi.fn() }));
 vi.mock("$shared/ipc/gateway-bindings", async () => {
@@ -1022,9 +1032,7 @@ test("OpenCode Go has its own provider seat, clean models, and no automatic cata
       screen.getByText("Last provider-reported billing: Go Plus allowance", { exact: false }),
     )
     .toBeVisible();
-  await expect
-    .element(screen.getByText("Remaining OpenCode Go quota is not provided by this connection."))
-    .toBeVisible();
+  await expect.element(screen.getByText("Remaining quota has not been checked.")).toBeVisible();
   expect(go.check).not.toHaveBeenCalled();
   const choices = native.choose.mock.calls.length;
   await screen.getByRole("tab", { name: "OpenAI", exact: true }).click();
@@ -1064,4 +1072,43 @@ test("Go setup uses its own settings flow, not the generic API-key or Custom for
   await screen.getByRole("button", { name: "Set up OpenCode Go" }).click();
   expect(onsettings).toHaveBeenCalledTimes(1);
   expect(go.check).not.toHaveBeenCalled();
+});
+
+test("Go quota refresh leaves model choice untouched and stale quota remains distinct from billing", async () => {
+  await page.viewport(1000, 800);
+  native.read.mockResolvedValue(models({}));
+  native.ready.mockImplementation(ready(false));
+  const connection = "a".repeat(32);
+  go.read.mockResolvedValue(goView(PROFILE, { state: "configured", connection_id: connection }));
+  const reading = goQuotaReading();
+  go.quota.mockResolvedValue(
+    goView(PROFILE, { state: "configured", connection_id: connection, quota: reading }),
+  );
+  const screen = await render(ModelPicker, { profile: PROFILE, onsettings: vi.fn() });
+  await screen.getByRole("button", { name: "Connect a model" }).click();
+  await screen.getByRole("tab", { name: /^OpenCode Go/u }).click();
+  expect(go.quota).not.toHaveBeenCalled();
+  const choices = native.choose.mock.calls.length;
+  await screen.getByRole("button", { name: "Refresh Go quota" }).click();
+  await expect.element(screen.getByText("80% remaining", { exact: false })).toBeVisible();
+  await expect.element(screen.getByText("Provider-reported remaining quota")).toBeVisible();
+  expect(go.quota).toHaveBeenCalledExactlyOnceWith(PROFILE, connection);
+  expect(native.choose).toHaveBeenCalledTimes(choices);
+  expect(go.check).not.toHaveBeenCalled();
+  go.quota.mockResolvedValue(
+    goView(PROFILE, {
+      state: "configured",
+      connection_id: connection,
+      quota: { ...reading, state: "stale", error: "unavailable" },
+    }),
+  );
+  await screen.getByRole("button", { name: "Refresh Go quota" }).click();
+  await expect
+    .element(screen.getByText("Stale quota — refresh for a current reading."))
+    .toBeVisible();
+  await expect.element(screen.getByText("80% remaining", { exact: false })).toBeVisible();
+  expect(native.choose).toHaveBeenCalledTimes(choices);
+  await screen.getByRole("tab", { name: "OpenAI", exact: true }).click();
+  await expect.element(screen.getByText("80% remaining", { exact: false })).not.toBeInTheDocument();
+  expect(native.choose).toHaveBeenCalledTimes(choices);
 });

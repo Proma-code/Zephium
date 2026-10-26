@@ -12,6 +12,31 @@ export type GoBillingViewV1 = {
 
 export type GoFaultV1 = "invalid" | "not_configured" | "changed" | "vault" | "busy" | "cancelled" | "unauthorized" | "forbidden" | "rate_limited" | "unavailable" | "timeout" | "protocol" | "too_large" | "incomplete" | "usage_unavailable" | "missing_conversation";
 
+export type GoQuotaFaultV1 = "invalid" | "not_configured" | "changed" | "vault" | "busy" | "cancelled" | "unauthorized" | "no_entitlement" | "forbidden" | "endpoint_unavailable" | "rate_limited" | "timeout" | "unavailable" | "protocol" | "too_large";
+
+export type GoQuotaKindV1 = "rolling" | "weekly" | "monthly";
+
+export type GoQuotaStateV1 = "not_checked" | "current" | "stale" | "unavailable" | "no_entitlement";
+
+/**  Explicit provider observation, separate from request billing and local usage. */
+export type GoQuotaViewV1 = {
+	state: GoQuotaStateV1,
+	checking: boolean,
+	checked_at_ms: string | null,
+	attempted_at_ms: string | null,
+	stale_at_ms: string | null,
+	windows: GoQuotaWindowV1[],
+	error: GoQuotaFaultV1 | null,
+};
+
+export type GoQuotaWindowV1 = {
+	kind: GoQuotaKindV1,
+	used_percent: number | null,
+	remaining_percent: number | null,
+	resets_at_ms: string,
+	limited: boolean,
+};
+
 export type GoStateV1 = "unconfigured" | "configured" |
 /**  Public catalog observed; this does not verify a key or paid plan. */
 "catalogued" | "unavailable";
@@ -25,6 +50,7 @@ export type GoViewV1 = {
 	checking: boolean,
 	catalog_checked_at_ms: string | null,
 	last_billing: GoBillingViewV1 | null,
+	quota: GoQuotaViewV1,
 	error: GoFaultV1 | null,
 };
 
@@ -32,5 +58,6 @@ export const commands = {
   goStatus: (expectedProfile: string): Promise<GoViewV1> => invoke("go_status", { expectedProfile }),
   goSave: (expectedProfile: string, expectedConnectionId: string | null, key: string, billingAcknowledged: boolean): Promise<GoViewV1> => invoke("go_save", { expectedProfile, expectedConnectionId, key, billingAcknowledged }),
   goCheck: (expectedProfile: string, expectedConnectionId: string): Promise<GoViewV1> => invoke("go_check", { expectedProfile, expectedConnectionId }),
+  goQuota: (expectedProfile: string, expectedConnectionId: string): Promise<GoViewV1> => invoke("go_quota", { expectedProfile, expectedConnectionId }),
   goDisconnect: (expectedProfile: string, expectedConnectionId: string): Promise<GoViewV1> => invoke("go_disconnect", { expectedProfile, expectedConnectionId }),
 };

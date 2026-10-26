@@ -90,6 +90,9 @@ impl Default for Fake {
     }
 }
 impl Transport for Fake {
+    fn quota<'a>(&'a self, _: &'a Config) -> PortFuture<'a, Result<GoQuotaSnapshot, GoQuotaFault>> {
+        Box::pin(async { panic!("account/catalog/inference must never query quota automatically") })
+    }
     fn models<'a>(&'a self, _: &'a Config) -> PortFuture<'a, Result<Vec<GoModel>, GoFailure>> {
         Box::pin(async move {
             self.model_calls.fetch_add(1, Ordering::SeqCst);

@@ -1,7 +1,7 @@
 import "$styles/global.css";
 import { beforeEach, expect, test, vi } from "vitest";
 import { render } from "vitest-browser-svelte";
-import { goView } from "$shared/testing/opencode-go";
+import { goView, goQuota, goQuotaReading } from "$shared/testing/opencode-go";
 import type { GoViewV1 } from "$shared/ipc/go-bindings";
 import { emitNativeEvent } from "$shared/testing/native-events";
 import OpenCodeGo from "../components/OpenCodeGo.svelte";
@@ -9,6 +9,7 @@ const native = vi.hoisted(() => ({
   read: vi.fn(),
   save: vi.fn(),
   check: vi.fn(),
+  quota: vi.fn(),
   disconnect: vi.fn(),
   open: vi.fn(),
 }));
@@ -18,6 +19,7 @@ vi.mock("$shared/ipc/go-bindings", async () => {
     goStatus: native.read,
     goSave: native.save,
     goCheck: native.check,
+    goQuota: native.quota,
     goDisconnect: native.disconnect,
   });
 });
@@ -47,10 +49,9 @@ test("opening Go settings observes only and explains coding-agent use, billing, 
   await expect
     .element(screen.getByText("cannot override your provider setting", { exact: false }))
     .toBeVisible();
-  await expect
-    .element(screen.getByText("Remaining OpenCode Go quota is not provided by this connection."))
-    .toBeVisible();
+  await expect.element(screen.getByText("Remaining quota has not been checked.")).toBeVisible();
   expect(native.check).not.toHaveBeenCalled();
+  expect(native.quota).not.toHaveBeenCalled();
   expect(native.save).not.toHaveBeenCalled();
   expect(native.open).not.toHaveBeenCalled();
 });
@@ -74,6 +75,7 @@ test("saving needs deliberate acknowledgement, resets it on key edits, and never
   expect(native.save).toHaveBeenCalledExactlyOnceWith(profile, null, "another-fixture-key", true);
   await expect.element(screen.getByText("Key saved — catalog not checked")).toBeVisible();
   expect(native.check).not.toHaveBeenCalled();
+  expect(native.quota).not.toHaveBeenCalled();
   await screen.getByRole("button", { name: "List supported models" }).click();
   await expect
     .element(screen.getByText("Public catalog listed · 2 supported models"))
@@ -167,9 +169,7 @@ test("last provider billing source is dated and never becomes remaining quota or
   await expect
     .element(screen.getByText("not remaining monthly usage", { exact: false }))
     .toBeVisible();
-  await expect
-    .element(screen.getByText("Remaining OpenCode Go quota is not provided by this connection."))
-    .toBeVisible();
+  await expect.element(screen.getByText("Remaining quota has not been checked.")).toBeVisible();
   await screen.getByRole("button", { name: "Disconnect OpenCode Go" }).click();
   expect(native.disconnect).toHaveBeenCalledExactlyOnceWith(profile, connection);
   await expect
@@ -199,4 +199,121 @@ test("unavailable native support never exposes a save or paid test action", asyn
     .element(screen.getByRole("button", { name: "Set up OpenCode Go" }))
     .not.toBeInTheDocument();
   expect(native.check).not.toHaveBeenCalled();
+  expect(native.quota).not.toHaveBeenCalled();
+});
+
+test("quota is an explicit read-only action, reports all windows and resets, and deduplicates clicks", async () => {
+  native.read.mockResolvedValue(configured());
+  let finish!: (view: GoViewV1) => void;
+  native.quota.mockImplementation(
+    () =>
+      new Promise<GoViewV1>((resolve) => {
+        finish = resolve;
+      }),
+  );
+  const screen = await render(OpenCodeGo, { profile });
+  const refresh = screen.getByRole("button", { name: "Refresh Go quota" });
+  await expect.element(refresh).toBeEnabled();
+  expect(native.quota).not.toHaveBeenCalled();
+  await refresh.click();
+  await expect.element(refresh).toBeDisabled();
+  const button = refresh.element();
+  if (!(button instanceof HTMLButtonElement)) throw new Error("Expected a button");
+  button.click();
+  expect(native.quota).toHaveBeenCalledExactlyOnceWith(profile, connection);
+  const quota = goQuotaReading();
+  quota.windows[0] = {
+    ...quota.windows[0]!,
+    used_percent: 99,
+    remaining_percent: 1,
+    limited: true,
+  };
+  finish(configured({ quota }));
+  await expect.element(screen.getByText("Provider-reported remaining quota")).toBeVisible();
+  await expect.element(screen.getByText("1% remaining", { exact: true })).toBeVisible();
+  await expect.element(screen.getByText("Provider limit reached")).toBeVisible();
+  await expect.element(screen.getByText("70% remaining", { exact: true })).toBeVisible();
+  await expect.element(screen.getByText("60% remaining", { exact: true })).toBeVisible();
+  await expect
+    .element(
+      screen.getByText(`Last checked: ${new Date(Number(quota.checked_at_ms)).toLocaleString()}`),
+    )
+    .toBeVisible();
+  await expect
+    .element(
+      screen.getByText(
+        `Resets: ${new Date(Number(quota.windows[0]!.resets_at_ms)).toLocaleString()}`,
+      ),
+    )
+    .toBeVisible();
+  expect(native.check).not.toHaveBeenCalled();
+  expect(native.save).not.toHaveBeenCalled();
+});
+
+test("quota failure keeps a dated stale native reading separate from request billing and retry is manual", async () => {
+  const reading = goQuotaReading();
+  native.read.mockResolvedValue(
+    configured({
+      quota: reading,
+      last_billing: { source: "balance", observed_at_ms: "1700000000000" },
+    }),
+  );
+  native.quota.mockResolvedValue(
+    configured({
+      quota: { ...reading, state: "stale", error: "timeout" },
+      last_billing: { source: "balance", observed_at_ms: "1700000000000" },
+    }),
+  );
+  const screen = await render(OpenCodeGo, { profile });
+  await screen.getByRole("button", { name: "Refresh Go quota" }).click();
+  await expect
+    .element(screen.getByText("Stale quota — refresh for a current reading."))
+    .toBeVisible();
+  await expect.element(screen.getByText("80% remaining", { exact: true })).toBeVisible();
+  await expect.element(screen.getByRole("alert")).toHaveTextContent("quota request timed out");
+  await expect
+    .element(screen.getByText("Last provider-reported billing: Console balance", { exact: false }))
+    .toBeVisible();
+  expect(native.quota).toHaveBeenCalledTimes(1);
+  native.quota.mockResolvedValue(
+    configured({ quota: goQuota({ state: "no_entitlement", error: "no_entitlement" }) }),
+  );
+  await screen.getByRole("button", { name: "Refresh Go quota" }).click();
+  await expect.element(screen.getByRole("alert")).toHaveTextContent("no Go entitlement");
+  await expect.element(screen.getByText("80% remaining", { exact: true })).not.toBeInTheDocument();
+  await expect.element(screen.getByRole("button", { name: "Replace Go key" })).toBeEnabled();
+});
+
+test("already expired or malformed native quota never looks current or full", async () => {
+  native.read.mockResolvedValue(configured({ quota: goQuotaReading(Date.now() - 300001) }));
+  const screen = await render(OpenCodeGo, { profile });
+  await expect
+    .element(screen.getByText("Stale quota — refresh for a current reading."))
+    .toBeVisible();
+  native.read.mockResolvedValue(configured({ quota: { ...goQuotaReading(), windows: [] } }));
+  emitNativeEvent("workModelsChanged", { version: 1 });
+  await expect.element(screen.getByText("Remaining quota is unavailable.")).toBeVisible();
+  await expect.element(screen.getByText(/\d+% remaining/u)).not.toBeInTheDocument();
+  expect(native.quota).not.toHaveBeenCalled();
+});
+
+test("a late quota response is ignored after closing the profile surface", async () => {
+  native.read.mockResolvedValue(configured());
+  let finish!: (view: GoViewV1) => void;
+  native.quota.mockImplementation(
+    () =>
+      new Promise<GoViewV1>((resolve) => {
+        finish = resolve;
+      }),
+  );
+  const screen = await render(OpenCodeGo, { profile });
+  await screen.getByRole("button", { name: "Refresh Go quota" }).click();
+  await screen.unmount();
+  const nextProfile = "00000000000000000000000002";
+  native.read.mockResolvedValue(goView(nextProfile));
+  const next = await render(OpenCodeGo, { profile: nextProfile });
+  finish(configured({ quota: goQuotaReading() }));
+  await expect.element(next.getByText("No OpenCode Go key saved")).toBeVisible();
+  await expect.element(next.getByText(/\d+% remaining/u)).not.toBeInTheDocument();
+  expect(native.disconnect).not.toHaveBeenCalled();
 });

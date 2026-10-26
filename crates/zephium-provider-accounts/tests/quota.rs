@@ -252,7 +252,7 @@ fn unsupported_sources_never_acquire_a_percentage_from_a_parser() {
     );
     assert_eq!(
         QuotaSource::OpenCodeGo.capability(),
-        QuotaCapability::NoVerifiedContract
+        QuotaCapability::FirstPartyContract
     );
     assert_eq!(
         QuotaSource::AntigravityGateway.capability(),

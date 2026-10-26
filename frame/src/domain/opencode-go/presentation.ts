@@ -3,8 +3,12 @@ import type {
   GoFaultV1,
   GoBillingSourceV1,
   GoBillingViewV1,
+  GoQuotaViewV1,
+  GoQuotaWindowV1,
+  GoQuotaFaultV1,
 } from "$shared/ipc/go-bindings";
 import * as m from "$shared/i18n/messages";
+import { quotaTime } from "./quota";
 
 const faults: Record<GoFaultV1, () => string> = {
   invalid: m.go_fault_invalid,
@@ -51,4 +55,52 @@ export function goBilling(view: GoViewV1 | null): string | null {
     byok: m.go_billing_byok,
   };
   return m.go_last_billing({ source: sources[billing.source](), time: time.toLocaleString() });
+}
+
+const quotaFaults: Record<GoQuotaFaultV1, () => string> = {
+  invalid: m.go_fault_invalid,
+  not_configured: m.go_fault_not_configured,
+  changed: m.go_fault_changed,
+  vault: m.go_fault_vault,
+  busy: m.go_fault_busy,
+  cancelled: m.go_fault_cancelled,
+  unauthorized: m.go_quota_fault_unauthorized,
+  no_entitlement: m.go_quota_no_entitlement,
+  forbidden: m.go_quota_fault_forbidden,
+  endpoint_unavailable: m.go_quota_fault_endpoint,
+  rate_limited: m.go_quota_fault_rate_limited,
+  timeout: m.go_quota_fault_timeout,
+  unavailable: m.go_quota_fault_unavailable,
+  protocol: m.go_quota_fault_protocol,
+  too_large: m.go_quota_fault_too_large,
+};
+export function goQuotaFault(fault: GoQuotaFaultV1): string {
+  return Object.hasOwn(quotaFaults, fault) ? quotaFaults[fault]() : m.go_quota_fault_protocol();
+}
+export function goQuotaStatus(quota: GoQuotaViewV1 | undefined): string {
+  if (!quota) return m.go_quota_not_checked();
+  if (quota.state === "current") return m.go_quota_current();
+  if (quota.state === "stale") return m.go_quota_stale();
+  if (quota.state === "no_entitlement") return m.go_quota_no_entitlement();
+  if (quota.state === "unavailable") return m.go_quota_unavailable();
+  return m.go_quota_not_checked();
+}
+export function goQuotaWindow(kind: GoQuotaWindowV1["kind"]): string {
+  const labels = {
+    rolling: m.go_quota_rolling,
+    weekly: m.go_quota_weekly,
+    monthly: m.go_quota_monthly,
+  };
+  return labels[kind]();
+}
+export function goQuotaRemaining(percent: number | null): string {
+  if (percent === null || !Number.isFinite(percent) || percent < 0 || percent > 100)
+    return m.go_quota_unavailable();
+  return m.go_quota_remaining({
+    percent: new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(percent),
+  });
+}
+export function goQuotaTime(value: string | null): string | null {
+  const milliseconds = quotaTime(value);
+  return milliseconds === null ? null : new Date(milliseconds).toLocaleString();
 }

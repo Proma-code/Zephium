@@ -1,4 +1,6 @@
 //! Owned profile mutations and revocable OpenCode Go clients. No automatic network I/O.
+pub mod quota;
+
 use crate::{new_id, valid_profile, vault::Vault, Config};
 use std::future::Future;
 use std::pin::Pin;
@@ -7,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{watch, Mutex, Notify};
 use zephium_agentic::lead::{
     opencode_go::{
+        quota::{GoQuotaFault, GoQuotaSnapshot},
         BillingSource, GoFailure, GoFault, GoModel, GoOutcome, OpenCodeGoClient, SessionId,
     },
     LeadSecret,
@@ -76,6 +79,8 @@ pub struct View {
     pub fault: Option<Fault>,
     /// Last completed request attribution; never a remaining quota.
     pub last_billing: Option<BillingObservation>,
+    /// Explicit transient provider allowance; separate from billing and catalog.
+    pub quota: quota::QuotaView,
 }
 
 /// Last completed request's provider-reported billing route.
@@ -116,6 +121,7 @@ struct State {
     checked_at_ms: Option<u64>,
     fault: Option<Fault>,
     last_billing: Option<BillingObservation>,
+    quota: quota::QuotaState,
 }
 #[derive(Default)]
 struct TaskState {
@@ -140,6 +146,10 @@ impl Drop for Guard {
 }
 type PortFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 trait Transport: Send + Sync {
+    fn quota<'a>(
+        &'a self,
+        config: &'a Config,
+    ) -> PortFuture<'a, Result<GoQuotaSnapshot, GoQuotaFault>>;
     fn models<'a>(&'a self, config: &'a Config) -> PortFuture<'a, Result<Vec<GoModel>, GoFailure>>;
     fn call<'a>(
         &'a self,
@@ -161,6 +171,17 @@ fn client(config: &Config) -> Result<OpenCodeGoClient, GoFailure> {
     OpenCodeGoClient::new(Arc::new(key), config.id.clone()).map_err(fault)
 }
 impl Transport for Official {
+    fn quota<'a>(
+        &'a self,
+        config: &'a Config,
+    ) -> PortFuture<'a, Result<GoQuotaSnapshot, GoQuotaFault>> {
+        Box::pin(async move {
+            client(config)
+                .map_err(|_| GoQuotaFault::Unavailable)?
+                .quota()
+                .await
+        })
+    }
     fn models<'a>(&'a self, config: &'a Config) -> PortFuture<'a, Result<Vec<GoModel>, GoFailure>> {
         Box::pin(async move {
             client(config)?
@@ -234,6 +255,7 @@ impl Service {
             state.checked_at_ms = None;
         }
         state.checking = false;
+        state.quota.clear();
         self.cancellation.send_replace(state.generation);
         Ok(state.generation)
     }
@@ -475,6 +497,7 @@ impl Service {
             state.models.clear();
             state.checked_at_ms = None;
             state.checking = false;
+            state.quota.clear();
             state.fault = result.err();
             if result.is_ok() {
                 state.config = None;
@@ -506,6 +529,7 @@ impl Service {
             checked_at_ms: s.checked_at_ms,
             fault: s.fault,
             last_billing: s.last_billing.clone(),
+            quota: s.quota.view(now_ms()),
         }
     }
     /// Current source-distinct catalog; never claims a OpenCode Go is free or subscribed.
@@ -647,6 +671,7 @@ impl Service {
         if state.foreground && !foreground {
             state.generation = state.generation.wrapping_add(1);
             state.checking = false;
+            state.quota.retire();
             self.cancellation.send_replace(state.generation);
         }
         state.foreground = foreground;
@@ -663,6 +688,7 @@ impl Service {
             state.closed = true;
             state.foreground = false;
             state.checking = false;
+            state.quota.retire();
             state.generation = state.generation.wrapping_add(1);
             self.cancellation.send_replace(state.generation);
         }

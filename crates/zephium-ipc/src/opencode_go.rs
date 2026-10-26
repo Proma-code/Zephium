@@ -51,7 +51,81 @@ pub struct GoBillingViewV1 {
     pub observed_at_ms: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Type)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum GoQuotaStateV1 {
+    NotChecked,
+    Current,
+    Stale,
+    Unavailable,
+    NoEntitlement,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum GoQuotaFaultV1 {
+    Invalid,
+    NotConfigured,
+    Changed,
+    Vault,
+    Busy,
+    Cancelled,
+    Unauthorized,
+    NoEntitlement,
+    Forbidden,
+    EndpointUnavailable,
+    RateLimited,
+    Timeout,
+    Unavailable,
+    Protocol,
+    TooLarge,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum GoQuotaKindV1 {
+    Rolling,
+    Weekly,
+    Monthly,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
+#[serde(deny_unknown_fields)]
+pub struct GoQuotaWindowV1 {
+    pub kind: GoQuotaKindV1,
+    pub used_percent: f64,
+    pub remaining_percent: f64,
+    pub resets_at_ms: String,
+    pub limited: bool,
+}
+
+/// Explicit provider observation, separate from request billing and local usage.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
+#[serde(deny_unknown_fields)]
+pub struct GoQuotaViewV1 {
+    pub state: GoQuotaStateV1,
+    pub checking: bool,
+    pub checked_at_ms: Option<String>,
+    pub attempted_at_ms: Option<String>,
+    pub stale_at_ms: Option<String>,
+    pub windows: Vec<GoQuotaWindowV1>,
+    pub error: Option<GoQuotaFaultV1>,
+}
+impl Default for GoQuotaViewV1 {
+    fn default() -> Self {
+        Self {
+            state: GoQuotaStateV1::NotChecked,
+            checking: false,
+            checked_at_ms: None,
+            attempted_at_ms: None,
+            stale_at_ms: None,
+            windows: Vec::new(),
+            error: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
 #[serde(deny_unknown_fields)]
 pub struct GoViewV1 {
     pub version: u16,
@@ -62,6 +136,7 @@ pub struct GoViewV1 {
     pub checking: bool,
     pub catalog_checked_at_ms: Option<String>,
     pub last_billing: Option<GoBillingViewV1>,
+    pub quota: GoQuotaViewV1,
     pub error: Option<GoFaultV1>,
 }
 impl GoViewV1 {
@@ -75,6 +150,11 @@ impl GoViewV1 {
             checking: false,
             catalog_checked_at_ms: None,
             last_billing: None,
+            quota: GoQuotaViewV1 {
+                state: GoQuotaStateV1::Unavailable,
+                error: Some(GoQuotaFaultV1::Unavailable),
+                ..Default::default()
+            },
             error: Some(GoFaultV1::Unavailable),
         }
     }
@@ -85,15 +165,23 @@ pub enum GoCommand {
     Status,
     Save,
     Check,
+    Quota,
     Disconnect,
 }
 impl GoCommand {
-    pub const ALL: [Self; 4] = [Self::Status, Self::Save, Self::Check, Self::Disconnect];
+    pub const ALL: [Self; 5] = [
+        Self::Status,
+        Self::Save,
+        Self::Check,
+        Self::Quota,
+        Self::Disconnect,
+    ];
     pub const fn native(self) -> &'static str {
         match self {
             Self::Status => "go_status",
             Self::Save => "go_save",
             Self::Check => "go_check",
+            Self::Quota => "go_quota",
             Self::Disconnect => "go_disconnect",
         }
     }
@@ -102,6 +190,7 @@ impl GoCommand {
             Self::Status => "goStatus",
             Self::Save => "goSave",
             Self::Check => "goCheck",
+            Self::Quota => "goQuota",
             Self::Disconnect => "goDisconnect",
         }
     }
@@ -186,10 +275,10 @@ mod tests {
         assert_eq!(definition(&text), generated_provider());
     }
     #[test]
-    fn projection_has_no_secret_plan_or_remaining_quota_claim() {
+    fn projection_has_no_secret_plan_or_invented_quota_claim() {
         let value = serde_json::to_value(GoViewV1::unavailable("fixture".into())).unwrap();
         let fields = value.as_object().unwrap();
-        assert_eq!(fields.len(), 9);
+        assert_eq!(fields.len(), 10);
         for absent in ["key", "access_token", "plan", "remaining", "email"] {
             assert!(!fields.contains_key(absent));
         }
@@ -235,7 +324,12 @@ mod tests {
         );
         assert!(root.contains("opencode_go::profiles_changed(&view)"));
         assert!(root.contains("GoCommand::owns(invoke.message.command())"));
-        for command in [GoCommand::Save, GoCommand::Check, GoCommand::Disconnect] {
+        for command in [
+            GoCommand::Save,
+            GoCommand::Check,
+            GoCommand::Quota,
+            GoCommand::Disconnect,
+        ] {
             let signature = native
                 .split(&format!("pub(crate) async fn {}(", command.native()))
                 .nth(1)
@@ -257,6 +351,7 @@ mod tests {
             ".configure_scoped(service_scope, expected_connection_id, key, acknowledged)"
         ));
         assert!(native.contains(".check_models_scoped(service_scope, expected_connection_id)"));
+        assert!(native.contains(".check_quota_scoped(service_scope, expected_connection_id)"));
         assert!(native.contains(".disconnect_scoped(service_scope, expected_connection_id)"));
         assert!(!native.contains("Command::new"));
         assert!(!native.contains("ShellExecute"));
