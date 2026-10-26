@@ -110,6 +110,15 @@ pub(super) struct Profile {
     internet: Vec<usize>,
 }
 impl Profile {
+    /// Public identity components for synthetic ACL/store fixtures only; no
+    /// account discovery, token content or existing profile adoption.
+    #[cfg(feature = "native-fixtures")]
+    pub(super) fn fixture_sids(&self) -> Result<(String, String), &'static str> {
+        Ok((
+            owner_sid()?,
+            sid_string(PSID(self.sid.as_ptr().cast_mut().cast()))?,
+        ))
+    }
     /// Only freshly generated identities are admitted by this candidate. Persistent
     /// vendor identity/retirement remains part of the production qualification.
     pub(super) fn create(name: &str) -> Result<Self, &'static str> {

@@ -4,6 +4,8 @@ use super::{
     process::{self, Command, Fixture, Layout},
     security::{self, HeldImage, Profile},
 };
+#[path = "registry_research.rs"]
+mod registry_research;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
@@ -40,6 +42,7 @@ struct Request {
     config: PathBuf,
     loopback: SocketAddr,
     public: SocketAddr,
+    registry: registry_research::Request,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,6 +57,7 @@ struct Observation {
     job_limit: u32,
     job_flags: u32,
     public_connected: bool,
+    registry: registry_research::Observation,
 }
 
 impl Observation {
@@ -65,6 +69,7 @@ impl Observation {
             && !self.loopback_timeout
             && !self.public_connected
             && self.child_quota_denied()
+            && self.registry.denied()
     }
     fn candidate_matches(&self) -> bool {
         self.catalog_read == 0
@@ -74,6 +79,7 @@ impl Observation {
             && ((self.loopback_error == Some(10013) && !self.loopback_timeout)
                 || (matches!(self.loopback_error, None | Some(10060)) && self.loopback_timeout))
             && self.child_quota_denied()
+            && self.registry.denied()
     }
     fn child_quota_denied(&self) -> bool {
         self.child_error == 1816
@@ -202,6 +208,7 @@ pub(crate) fn controls() -> Result<(), &'static str> {
         security::hash(&mut File::open(&image_path).map_err(|_| "research image unavailable")?)?;
     let image = HeldImage::open(&image_path, hash)?;
     let foreign_profile = Profile::create(&format!("Zephium.ClaudeFixture.Foreign.{suffix}"))?;
+    let registry = registry_research::Sentinels::create(&foreign_profile, &suffix)?;
     let foreign = Root::create(
         std::env::temp_dir().join(format!("Zephium.ClaudeForeign.{suffix}")),
         &foreign_profile,
@@ -236,6 +243,7 @@ pub(crate) fn controls() -> Result<(), &'static str> {
         config: layout.config.clone(),
         loopback: address,
         public,
+        registry: registry.request(),
     })
     .map_err(|_| "research request encoding failed")?;
     if request.len() > 8192 {
@@ -288,6 +296,8 @@ pub(crate) fn controls() -> Result<(), &'static str> {
             "network-research-public-tcp",
             i32::from(result.public_connected),
         );
+        result.registry.report();
+        registry.verify()?;
         for path in [&foreign_path, &outside_path] {
             if std::fs::read(path).map_err(|_| "research sentinel disappeared")? != SENTINEL {
                 return Err("research sentinel changed");
@@ -311,6 +321,7 @@ pub(crate) fn controls() -> Result<(), &'static str> {
     root.cleanup()?;
     foreign.cleanup()?;
     outside.cleanup()?;
+    registry.cleanup()?;
     if !matched {
         return Err("research network differential remains unqualified");
     }
@@ -408,6 +419,7 @@ pub(crate) fn child() -> Result<(), &'static str> {
         job_limit: limits.BasicLimitInformation.ActiveProcessLimit,
         job_flags: limits.BasicLimitInformation.LimitFlags.0,
         public_connected: false,
+        registry: registry_research::child(&request.registry)?,
     };
     struct Winsock;
     impl Drop for Winsock {
@@ -460,6 +472,7 @@ mod tests {
             job_limit: 1,
             job_flags: 0x2108,
             public_connected: true,
+            registry: registry_research::Observation::denied_fixture(),
         }
     }
     #[test]
@@ -475,6 +488,7 @@ mod tests {
             job_limit: 1,
             job_flags: 0x2108,
             public_connected: false,
+            registry: registry_research::Observation::denied_fixture(),
         };
         assert!(baseline.baseline_matches());
         assert!(!baseline.candidate_matches());
