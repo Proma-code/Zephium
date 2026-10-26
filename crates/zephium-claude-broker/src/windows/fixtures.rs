@@ -203,7 +203,7 @@ pub(crate) fn qualify() -> Result<(), &'static str> {
         .open(&foreign_file)
         .and_then(|mut file| file.write_all(b"synthetic foreign profile data"))
         .map_err(|_| "fresh foreign profile sentinel creation failed")?;
-    let request = serde_json::json!({"sentinel":sentinel_file,"outside":sentinel.0,"loopback":address.to_string(),"image":image_path,"config":layout.config,"home":layout.home,"work":layout.work,"appdata":layout.appdata,"localappdata":own_folder.path,"temporary":own_temporary,"foreign_data":foreign_file});
+    let request = serde_json::json!({"sentinel":sentinel_file,"outside":sentinel.0,"loopback":address.to_string(),"image":image_path,"config":layout.config,"home":layout.home,"work":layout.work,"appdata":layout.appdata,"localappdata":own_folder.path,"requested_localappdata":layout.localappdata,"temporary":own_temporary,"foreign_data":foreign_file});
     let output = process::run(
         &profile,
         &image,
@@ -234,6 +234,15 @@ pub(crate) fn qualify() -> Result<(), &'static str> {
                     if code.to_string() == text {
                         super::diagnostic("synthetic-winsock-startup", code);
                     }
+                }
+            }
+        }
+    }
+    if let Some(value) = output.stdout.strip_prefix(b"isolation-files\nisolation-network\nisolation-address-parsed\nwinsock-startup=0\nisolation-connect\nisolation-child\nisolation-environment\nisolation-config\nlocalappdata-relation=").and_then(|value| value.strip_suffix(b"\n")) {
+        if value.len() <= 4 {
+            if let Ok(text) = std::str::from_utf8(value) {
+                if let Ok(mask) = text.parse::<u16>() {
+                    if mask <= 2047 && mask.to_string() == text { super::diagnostic("synthetic-localappdata-relation-bits", i32::from(mask)); }
                 }
             }
         }

@@ -8,6 +8,35 @@ fn exact_path(value: &std::ffi::OsStr, expected: &str) -> bool {
     value == std::ffi::OsStr::new(expected)
 }
 
+// Relation bits are diagnostic only. No bit changes path admission.
+#[cfg(any(windows, test))]
+fn path_relations(value: &std::ffi::OsStr, expected: &str, requested: &str, home: &str) -> u16 {
+    let Some(value) = value.to_str() else {
+        return 0;
+    };
+    let actual = std::path::Path::new(value);
+    let expected_path = std::path::Path::new(expected);
+    let tests = [
+        value == expected,
+        value.eq_ignore_ascii_case(expected),
+        value.trim_end_matches('\\') == expected.trim_end_matches('\\'),
+        actual == expected_path,
+        actual.as_os_str() == expected_path.join("AC").as_os_str(),
+        actual.file_name() == expected_path.file_name(),
+        actual.starts_with(requested),
+        actual.starts_with(home),
+        value.contains('~'),
+        expected.contains('~'),
+        expected_path
+            .parent()
+            .is_some_and(|parent| actual.as_os_str() == parent.as_os_str()),
+    ];
+    tests
+        .into_iter()
+        .enumerate()
+        .fold(0, |bits, (index, value)| bits | (u16::from(value) << index))
+}
+
 #[cfg(windows)]
 fn main() {
     // Synthetic helper diagnostics only. Never copy panic payloads, paths, user
@@ -335,6 +364,17 @@ fn child(mode: &str) -> Result<(), &'static str> {
             ] {
                 let value = std::env::var_os(variable).ok_or("private environment path missing")?;
                 if !exact_path(&value, path(field)?) {
+                    if variable == "LOCALAPPDATA" {
+                        let relation = path_relations(
+                            &value,
+                            path(field)?,
+                            path("requested_localappdata")?,
+                            path("home")?,
+                        );
+                        std::io::stdout()
+                            .write_all(format!("localappdata-relation={relation}\n").as_bytes())
+                            .map_err(|_| "profile relation diagnostic failed")?;
+                    }
                     return Err(match variable {
                         "HOME" => "private HOME path mismatch",
                         "USERPROFILE" => "private USERPROFILE path mismatch",
@@ -403,6 +443,26 @@ fn child(mode: &str) -> Result<(), &'static str> {
 
 #[cfg(test)]
 mod path_tests {
+    #[test]
+    fn relation_bits_never_replace_exact_acceptance() {
+        use std::ffi::OsStr;
+        let expected = r"C:\synthetic\profile\AC";
+        let different = r"c:\synthetic\profile\ac";
+        let relation =
+            super::path_relations(OsStr::new(different), expected, "unrelated", "unrelated");
+        assert_eq!(relation & 1, 0);
+        assert_ne!(relation & 2, 0);
+        assert!(!super::exact_path(OsStr::new(different), expected));
+        assert!(relation <= 2047);
+        assert_ne!(
+            super::path_relations(OsStr::new("x~1"), "other", "unrelated", "unrelated") & 256,
+            0
+        );
+        assert_ne!(
+            super::path_relations(OsStr::new("other"), "x~1", "unrelated", "unrelated") & 512,
+            0
+        );
+    }
     #[test]
     fn exact_expected_path_never_accepts_lexical_aliases() {
         use std::ffi::OsStr;
