@@ -206,7 +206,34 @@ fn fresh() -> Result<(FixtureStoreOwner, StoreLease, HeldImage), &'static str> {
     let target = native::canonical_parent(root)
         .map_err(|_| "store fixture image directory proof failed")?
         .join("store-fixture.exe");
-    lease.inner.receipt.0.profile.copy_image(&path, &target)?;
+    // This is an ordinary cooperating broker, not the LPAC vendor. A low-
+    // labelled executable lowers the child's token and cannot write the medium
+    // broker lock. Create only this fresh fixed helper with the existing exact
+    // broker-file policy; never lower the lock or alter vendor image sealing.
+    let policy = Policy::broker_file(&lease.inner.receipt.0.owner_sid);
+    let mut copied_image = native::create_file(root, "store-fixture.exe", &policy)
+        .map_err(|_| "store fixture broker image creation failed")?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| "store fixture source rewind failed")?;
+    let copied = std::io::copy(
+        &mut (&mut source).take(512 * 1024 * 1024 + 1),
+        &mut copied_image,
+    )
+    .map_err(|_| "store fixture broker image copy failed")?;
+    if copied != metadata.len() {
+        return Err("store fixture broker image length mismatch");
+    }
+    copied_image
+        .sync_all()
+        .map_err(|_| "store fixture broker image sync failed")?;
+    if native::fixture_file_integrity(&copied_image)
+        .map_err(|_| "store fixture broker image label unavailable")?
+        != 8192
+    {
+        return Err("store fixture broker image must retain medium integrity");
+    }
+    drop(copied_image);
     // The child still requires the unchanged strict single-link/ancestor/hash
     // admission. Copying never grants an exception to HeldImage::open.
     let image = HeldImage::open(&target, expected)?;
