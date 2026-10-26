@@ -17,7 +17,7 @@ use ::windows::{
             OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
             PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, TOKEN_QUERY, TOKEN_USER,
         },
-        Storage::FileSystem::CreateDirectoryW,
+        Storage::FileSystem::{CreateDirectoryW, FILE_GENERIC_READ},
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     },
 };
@@ -84,8 +84,10 @@ fn root_diagnostic(stage: &'static str, code: i32) {
 
 fn hold_fresh_parent(parent: &Path) -> Result<fs::File, Failure> {
     let parent_hold = fs::OpenOptions::new()
-        .access_mode(0x80) // FILE_READ_ATTRIBUTES
-        .share_mode(1) // Deny write opens (including reparse mutation) and deletion.
+        // Metadata-only FILE_READ_ATTRIBUTES does not participate in normal
+        // data-sharing exclusion. Match the existing work-files directory pin.
+        .access_mode(FILE_GENERIC_READ.0)
+        .share_mode(1) // Deny data-write opens and deletion while this pin is held.
         .custom_flags(0x0220_0000)
         .open(parent)
         .map_err(|error| {
@@ -665,6 +667,79 @@ mod tests {
         assert!(root.is_dir());
         drop(held);
         drop(write_open().unwrap());
+        container.close().unwrap();
+    }
+
+    fn set_junction(directory: &Path, target: &Path) -> ::windows::core::Result<()> {
+        use ::windows::Win32::Foundation::HANDLE;
+        use ::windows::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+        use ::windows::Win32::System::IO::DeviceIoControl;
+        use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle};
+        let directory = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
+            .open(directory)
+            .map_err(|_| ::windows::core::Error::from_win32())?;
+        let target = target.to_string_lossy();
+        let target = target.strip_prefix(r"\\?\").unwrap_or(&target);
+        let substitute: Vec<u8> = std::ffi::OsStr::new(&format!(r"\??\{target}"))
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let print: Vec<u8> = std::ffi::OsStr::new(target)
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let mut data = Vec::new();
+        data.extend(0xa000_0003u32.to_le_bytes());
+        data.extend(((8 + substitute.len() + 2 + print.len() + 2) as u16).to_le_bytes());
+        data.extend(0u16.to_le_bytes());
+        data.extend(0u16.to_le_bytes());
+        data.extend((substitute.len() as u16).to_le_bytes());
+        data.extend(((substitute.len() + 2) as u16).to_le_bytes());
+        data.extend((print.len() as u16).to_le_bytes());
+        data.extend(substitute);
+        data.extend(0u16.to_le_bytes());
+        data.extend(print);
+        data.extend(0u16.to_le_bytes());
+        let mut returned = 0;
+        unsafe {
+            DeviceIoControl(
+                HANDLE(directory.as_raw_handle()),
+                0x0009_00a4,
+                Some(data.as_ptr().cast()),
+                data.len() as u32,
+                None,
+                0,
+                Some(&mut returned),
+                None,
+            )
+        }
+    }
+
+    #[test]
+    fn fresh_parent_pin_refuses_in_place_junction_mutation() {
+        let container = tempfile::tempdir().unwrap();
+        let parent = container.path().join("parent");
+        let outside = container.path().join("outside");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let parent = parent.canonicalize().unwrap();
+        let outside = outside.canonicalize().unwrap();
+        fs::write(outside.join("sentinel.txt"), b"unchanged fixture").unwrap();
+        let held = hold_fresh_parent(&parent).unwrap();
+        assert!(set_junction(&parent, &outside).is_err());
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
+        drop(held);
+        set_junction(&parent, &outside).unwrap(); // Positive control, same target.
+        assert!(hold_fresh_parent(&parent).is_err());
+        fs::remove_dir(&parent).unwrap(); // Remove the junction, not its target.
+        assert_eq!(
+            fs::read(outside.join("sentinel.txt")).unwrap(),
+            b"unchanged fixture"
+        );
         container.close().unwrap();
     }
 

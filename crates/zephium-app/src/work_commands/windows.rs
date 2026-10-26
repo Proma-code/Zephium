@@ -659,6 +659,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn owned_tree_lf_receipt_survives_the_real_output_projection() {
+        let mut output = super::super::Output::new();
+        output.push(b"owned-tree:123:456\n");
+        assert_eq!(
+            output.view().text.lines().find_map(owned_tree_receipt),
+            Some((123, 456))
+        );
+        let mut crlf = super::super::Output::new();
+        crlf.push(b"owned-tree:123:456\r\n");
+        assert_eq!(crlf.view().text, "owned-tree:123:456 \n");
+        assert_eq!(crlf.view().text.lines().find_map(owned_tree_receipt), None);
+    }
+
     #[tokio::test]
     async fn windows_command_timeout_and_stop_end_the_owned_tree() {
         let dir = tempfile::tempdir().unwrap();
@@ -689,7 +703,7 @@ $info.RedirectStandardOutput=$true
 $info.Arguments='-NoProfile -NonInteractive -Command "[Console]::WriteLine(''owned-ready''); [Console]::Out.Flush(); [Threading.Thread]::Sleep(30000)"'
 $child=[System.Diagnostics.Process]::Start($info)
 if ($null -eq $child -or $child.StandardOutput.ReadLine() -ne 'owned-ready') { throw 'owned fixture child did not become ready' }
-[Console]::WriteLine('owned-tree:'+$PID+':'+$child.Id)
+[Console]::Write('owned-tree:'+$PID+':'+$child.Id+"`n")
 [Console]::Out.Flush()
 [Threading.Thread]::Sleep(30000)
 "#;
