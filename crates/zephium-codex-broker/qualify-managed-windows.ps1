@@ -44,7 +44,14 @@ Assert-Receipts $output @(
     'codex-owner-cancel-before-turn',
     'codex-owner-revision-before-write',
     'codex-owner-known-terminal-lost-ack',
-    'codex-owner-early-terminal-lost-ack'
+    'codex-owner-early-terminal-lost-ack',
+    'codex-owner-unsent-before-actor-continuity',
+    'codex-owner-unsent-preparation-continuity',
+    'codex-owner-unsent-writer-continuity',
+    'codex-owner-unsent-bind-ack-unknown',
+    'codex-owner-unsent-begin-ack-unknown',
+    'codex-owner-unsent-skip-ack-unknown',
+    'codex-owner-preparation-ack-unknown'
 )
 $output=@(& $fixture vault); $code=$LASTEXITCODE; $output | Write-Output
 if ($code -ne 0) { throw 'Nonsecret OS credential-store availability check failed.' }

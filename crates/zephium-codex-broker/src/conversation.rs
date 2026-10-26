@@ -371,6 +371,31 @@ impl Conversation {
             choice,
         })
     }
+    /// Native owner only: call after consuming the exact Session NeverStarted
+    /// receipt for this pending RPC. This pure state transition is not proof of
+    /// non-dispatch itself and does not manufacture an original terminal.
+    #[cfg(any(
+        test,
+        all(
+            windows,
+            any(feature = "native-fixtures", feature = "trial-integration")
+        )
+    ))]
+    pub(crate) fn abandon_unstarted(&mut self, scope: &Scope, id: u64) -> Result<(), Fault> {
+        self.scope(scope)?;
+        if self.phase != Phase::StartingTurn
+            || self.active.is_some()
+            || !self.early.is_empty()
+            || !matches!(self.pending.get(&id), Some(Pending::Turn))
+        {
+            return Err(Fault::State);
+        }
+        self.pending.remove(&id);
+        self.phase = Phase::Ready;
+        // consumed stays true: only real unsubscribe/Closed and cold resume may
+        // prepare a subsequent prompt with a different fixed skill policy.
+        Ok(())
+    }
     /// Cancellation while turn/start is pending is latched, not resent. Once
     /// its actual ID is known the reducer asks the actor to interrupt that ID.
     pub fn cancel(&mut self, scope: &Scope) -> Result<Vec<Event>, Fault> {
@@ -506,8 +531,7 @@ impl Conversation {
         }
         let choice = self.choice.as_ref().ok_or(Fault::State)?;
         if result.get("model").and_then(Value::as_str) != Some(choice.model())
-            || result.get("reasoningEffort").and_then(Value::as_str)
-                != Some(choice.effort().as_str())
+            || !crate::effort_policy::readback(choice, result.get("reasoningEffort"))
             || result.get("modelProvider").and_then(Value::as_str) != Some("openai")
             || thread.get("ephemeral").and_then(Value::as_bool) != Some(false)
             || thread.pointer("/status/type").and_then(Value::as_str) != Some("idle")
@@ -900,6 +924,19 @@ fn parse_message(value: &Value) -> Result<Message, Fault> {
         phase,
     })
 }
+/// Validate a late original usage snapshot with the same parser used during a
+/// live turn. This grants no completion/accounting authority and retains no data.
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
+pub(crate) fn validate_usage_snapshot(value: &Value) -> Result<(), Fault> {
+    parse_usage(value).map(|_| ())
+}
+
 fn parse_usage(value: &Value) -> Result<UsageSnapshot, Fault> {
     let total = usage(value.get("total").ok_or(Fault::Protocol)?)?;
     let last = usage(value.get("last").ok_or(Fault::Protocol)?)?;

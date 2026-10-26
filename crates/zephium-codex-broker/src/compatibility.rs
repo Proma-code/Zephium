@@ -270,7 +270,7 @@ pub(crate) fn validate_opened_thread(
         || result.get("cwd").and_then(Value::as_str) != Some(cwd)
         || result.get("model").and_then(Value::as_str) != Some(choice.model())
         || result.get("modelProvider").and_then(Value::as_str) != Some("openai")
-        || result.get("reasoningEffort").and_then(Value::as_str) != Some(choice.effort().as_str())
+        || !crate::effort_policy::readback(choice, result.get("reasoningEffort"))
         || result.get("approvalPolicy").and_then(Value::as_str) != Some("never")
         || !result
             .pointer("/thread/environments")
@@ -448,7 +448,7 @@ fn fingerprint(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{CatalogBuilder, Effort};
+    use crate::catalog::{CatalogBuilder, Effort, EffortSelection};
 
     const OWNED: &str = r"C:\synthetic\owned\config.toml";
     const HOME: &str = r"C:\synthetic\owned";
@@ -606,7 +606,7 @@ mod tests {
         builder
             .finish()
             .unwrap()
-            .select("synthetic", Effort::High)
+            .select("synthetic", EffortSelection::Explicit(Effort::High))
             .unwrap()
     }
 

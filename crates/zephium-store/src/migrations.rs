@@ -341,7 +341,7 @@ fn schema_manifest(conn: &Connection) -> rusqlite::Result<Vec<SchemaObject>> {
             _ => {
                 return Err(invalid_schema(
                     "schema SQL exceeds limit or has invalid type",
-                ))
+                ));
             }
         };
         manifest.push(SchemaObject {
@@ -664,10 +664,18 @@ fn migrate_local_external_native_source(tx: &Transaction) -> rusqlite::Result<()
         1,
     );
     for (existing, local) in [
-        ("x'e3da979db873ec00b4f1b8be4496b5428f961db187b5c4588f3d5b30d60426da',x'4e86c0e24ae61e3cc7078300975eaff4a296bcf1192df0285140e21715fc9239'", "56ffb419362f319ef825913f3727022f7c12c7e69890dc91324a2b7e8cd7b5aa"),
-        ("x'9378c48279f1efef79cd8fb2a8c0227214e13961084dd2c5f64585248c3d1368',x'b8d3da2d3adb78aaa3a4c44ae0402664bd6e9a2600de328b192bd7116076a71e'", "64340b026ee26f834b57ac14d459f241ce92ad2d60a86a6c887288ae98b9a750"),
+        (
+            "x'e3da979db873ec00b4f1b8be4496b5428f961db187b5c4588f3d5b30d60426da',x'4e86c0e24ae61e3cc7078300975eaff4a296bcf1192df0285140e21715fc9239'",
+            "56ffb419362f319ef825913f3727022f7c12c7e69890dc91324a2b7e8cd7b5aa",
+        ),
+        (
+            "x'9378c48279f1efef79cd8fb2a8c0227214e13961084dd2c5f64585248c3d1368',x'b8d3da2d3adb78aaa3a4c44ae0402664bd6e9a2600de328b192bd7116076a71e'",
+            "64340b026ee26f834b57ac14d459f241ce92ad2d60a86a6c887288ae98b9a750",
+        ),
     ] {
-        if create.matches(existing).count() != 2 { return Err(invalid_schema("native v19 domain template changed")); }
+        if create.matches(existing).count() != 2 {
+            return Err(invalid_schema("native v19 domain template changed"));
+        }
         create = create.replace(existing, &format!("{existing},x'{local}'"));
     }
     rebuild_native_source_table(
@@ -2694,6 +2702,10 @@ pub static PROFILE: &[Migration] = &[
         version: 37,
         up: |tx| tx.execute_batch(include_str!("codex_continuity_v37.sql")),
     },
+    Migration {
+        version: 38,
+        up: |tx| tx.execute_batch(include_str!("codex_continuity_v38.sql")),
+    },
 ];
 
 #[cfg(test)]
@@ -2788,6 +2800,7 @@ mod tests {
         (35, 0x3c4c67becd54e02a),
         (36, 0xa35d00504cb31a89),
         (37, 0xa05b97004c839285),
+        (38, 0x2db4a48eb4bd1bf0),
     ];
 
     #[test]
@@ -2863,12 +2876,13 @@ mod tests {
         assert_eq!(conn.query_row("SELECT revision,operation_high_water,native_incarnation_high_water,grant_rebind_count FROM extension_native_ownership_journal_state",[],|r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?))).unwrap(),before);
         assert_eq!(conn.query_row("SELECT catalog_role,expected_native_identity,native_identity FROM extension_native_ownership_journal",[],|r| Ok((r.get::<_,String>(0)?,r.get::<_,Option<Vec<u8>>>(1)?,r.get::<_,Option<Vec<u8>>>(2)?))).unwrap(),("active".into(),Some(native_id.to_vec()),Some(native_id.to_vec())));
         assert_eq!(conn.query_row("SELECT phase,revision,expected_native_identity_kind,native_identity_kind FROM extension_native_ownership_journal",[],|r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?))).unwrap(),("native_owned".into(),3,1,1));
-        assert!(conn
-            .execute(
+        assert!(
+            conn.execute(
                 "UPDATE extension_native_ownership_journal_state SET revision=1 WHERE id=1",
                 []
             )
-            .is_err());
+            .is_err()
+        );
     }
 
     #[test]
@@ -2912,41 +2926,46 @@ mod tests {
         insert_native_ownership_test_row(&conn, 1, 1, 1, "acquire", "native_absent_preparing")
             .unwrap();
         let authority = beta_authority("staging", "macos.wkwebextension.v1");
-        assert!(conn
-            .execute(
+        assert!(
+            conn.execute(
                 "UPDATE extension_native_ownership_journal SET catalog_role='beta'",
                 []
             )
-            .is_err());
-        assert!(conn
-            .execute(
+            .is_err()
+        );
+        assert!(
+            conn.execute(
                 "UPDATE extension_native_ownership_journal SET authority=?1",
                 [&authority[..]]
             )
-            .is_err());
+            .is_err()
+        );
         conn.execute(
             "UPDATE extension_native_ownership_journal SET authority=?1,catalog_role='beta',payload_kind=2,archive_length=17,archive_sha256=zeroblob(32)",
             [&authority[..]],
         )
         .unwrap();
-        assert!(conn
-            .execute(
+        assert!(
+            conn.execute(
                 "UPDATE extension_native_ownership_journal SET runtime_backend='windows_native'",
                 []
             )
-            .is_err());
-        assert!(conn
-            .execute(
+            .is_err()
+        );
+        assert!(
+            conn.execute(
                 "UPDATE extension_native_ownership_journal SET browsing_context='private'",
                 []
             )
-            .is_err());
-        assert!(conn
-            .execute(
+            .is_err()
+        );
+        assert!(
+            conn.execute(
                 "UPDATE extension_native_ownership_journal SET phase='native_may_own',revision=2",
                 []
             )
-            .is_err());
+            .is_err()
+        );
         conn.execute("UPDATE extension_native_ownership_journal SET phase='native_may_own',revision=2,expected_native_identity_kind=1,expected_native_identity=?1",[&b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"[..]]).unwrap();
         assert!(conn.execute("UPDATE extension_native_ownership_journal SET expected_native_identity=NULL,expected_native_identity_kind=NULL",[]).is_err());
     }
@@ -3008,7 +3027,7 @@ mod tests {
             assert_eq!(validate_current(&conn, PROFILE).unwrap(), version as i64);
             apply(&mut conn, PROFILE).unwrap();
             apply(&mut conn, PROFILE).unwrap();
-            assert_eq!(validate_current(&conn, PROFILE).unwrap(), 37);
+            assert_eq!(validate_current(&conn, PROFILE).unwrap(), 38);
             assert_eq!(
                 conn.query_row("SELECT title FROM history", [], |r| r.get::<_, String>(0))
                     .unwrap(),
@@ -3062,18 +3081,20 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert!(conn
-            .execute(
+        assert!(
+            conn.execute(
                 "INSERT INTO time_batch_receipts(batch_id,digest) VALUES(x'00',zeroblob(32))",
                 []
             )
-            .is_err());
-        assert!(conn
-            .execute(
+            .is_err()
+        );
+        assert!(
+            conn.execute(
                 "INSERT INTO time_batch_receipts(batch_id,digest) VALUES(zeroblob(16),x'00')",
                 []
             )
-            .is_err());
+            .is_err()
+        );
     }
 
     #[test]
@@ -3090,7 +3111,7 @@ mod tests {
         .unwrap();
         apply(&mut conn, PROFILE).unwrap();
         apply(&mut conn, PROFILE).unwrap();
-        assert_eq!(validate_current(&conn, PROFILE).unwrap(), 37);
+        assert_eq!(validate_current(&conn, PROFILE).unwrap(), 38);
         assert_eq!(
             conn.query_row("SELECT title FROM history", [], |row| row
                 .get::<_, String>(0))
@@ -3670,21 +3691,23 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         apply(&mut conn, &PROFILE[..11]).unwrap();
         for value in [vec![1_u8; 15], vec![2_u8; 17]] {
-            assert!(conn
-                .execute(
+            assert!(
+                conn.execute(
                     "UPDATE extension_install_catalog
                      SET install_id_high_water = ?1 WHERE id = 1",
                     [value],
                 )
-                .is_err());
+                .is_err()
+            );
         }
-        assert!(conn
-            .execute(
+        assert!(
+            conn.execute(
                 "UPDATE extension_install_catalog
                  SET install_id_high_water = 1 WHERE id = 1",
                 [],
             )
-            .is_err());
+            .is_err()
+        );
     }
 
     #[test]
@@ -3714,13 +3737,14 @@ mod tests {
             )
             .unwrap();
         }
-        assert!(conn
-            .execute(
+        assert!(
+            conn.execute(
                 "INSERT INTO extension_profile_site_denials(policy_id, pattern)
                  VALUES (1, 'https://overflow.example/*')",
                 [],
             )
-            .is_err());
+            .is_err()
+        );
         for statement in [
             "UPDATE extension_profile_policy SET revision = 0 WHERE id = 1",
             "UPDATE extension_profile_policy SET paused = 2 WHERE id = 1",
@@ -3750,8 +3774,8 @@ mod tests {
             ],
         )
         .unwrap();
-        assert!(conn
-            .execute(
+        assert!(
+            conn.execute(
                 "INSERT INTO extension_grants(
                      install_id, revision, authority, package_key, package_revision,
                      archive_sha256, manifest_sha256, tree_sha256, grant_sha256,
@@ -3767,7 +3791,8 @@ mod tests {
                     vec![7_u8; 31],
                 ],
             )
-            .is_err());
+            .is_err()
+        );
         conn.execute(
             "INSERT INTO extension_grants(
                  install_id, revision, authority, package_key, package_revision,
@@ -3786,30 +3811,33 @@ mod tests {
         )
         .unwrap();
         for invalid in [String::new(), "x".repeat(97), "bad\0name".into()] {
-            assert!(conn
-                .execute(
+            assert!(
+                conn.execute(
                     "INSERT INTO extension_grant_api_permissions(install_id, name)
                      VALUES (?1, ?2)",
                     rusqlite::params![&id, invalid],
                 )
-                .is_err());
+                .is_err()
+            );
         }
         for invalid in [String::new(), "x".repeat(2049), "bad\0pattern".into()] {
-            assert!(conn
-                .execute(
+            assert!(
+                conn.execute(
                     "INSERT INTO extension_grant_host_permissions(install_id, pattern)
                      VALUES (?1, ?2)",
                     rusqlite::params![&id, invalid],
                 )
-                .is_err());
+                .is_err()
+            );
         }
-        assert!(conn
-            .execute(
+        assert!(
+            conn.execute(
                 "INSERT INTO extension_grant_api_permissions(install_id, name)
                  VALUES (?1, 'storage')",
                 [vec![9_u8; 16]],
             )
-            .is_err());
+            .is_err()
+        );
     }
 
     #[test]
@@ -4197,12 +4225,13 @@ mod tests {
             [],
         )
         .unwrap();
-        assert!(conn
-            .execute(
+        assert!(
+            conn.execute(
                 "UPDATE extension_native_ownership_journal_state SET revision = 9",
                 [],
             )
-            .is_err());
+            .is_err()
+        );
     }
 
     #[test]
@@ -4279,13 +4308,14 @@ mod tests {
             [&expected],
         )
         .unwrap();
-        assert!(conn
-            .execute(
+        assert!(
+            conn.execute(
                 "UPDATE extension_native_ownership_journal
                  SET revision = 3, phase = 'native_owned'",
                 [],
             )
-            .is_err());
+            .is_err()
+        );
 
         for update in [
             "expected_native_identity_kind = NULL",
@@ -4314,13 +4344,14 @@ mod tests {
             [&observed_mismatch],
         )
         .unwrap();
-        assert!(conn
-            .execute(
+        assert!(
+            conn.execute(
                 "UPDATE extension_native_ownership_journal
                  SET revision = 4, phase = 'native_owned'",
                 [],
             )
-            .is_err());
+            .is_err()
+        );
 
         conn.execute(
             "UPDATE extension_native_ownership_journal
@@ -4414,7 +4445,7 @@ mod tests {
                 .unwrap(),
             14
         );
-        assert_eq!(PROFILE.last().map(|migration| migration.version), Some(37));
+        assert_eq!(PROFILE.last().map(|migration| migration.version), Some(38));
     }
 
     #[test]
@@ -4433,13 +4464,14 @@ mod tests {
 
         apply(&mut conn, &META[..15]).unwrap();
 
-        assert!(conn
-            .execute(
+        assert!(
+            conn.execute(
                 "UPDATE extension_native_ownership_journal_state
                  SET grant_rebind_count = 1",
                 [],
             )
-            .is_err());
+            .is_err()
+        );
         conn.execute(
             "UPDATE extension_native_ownership_journal
              SET store_grant_revision = 2,
@@ -4464,13 +4496,14 @@ mod tests {
             .unwrap(),
             (4, 1)
         );
-        assert!(conn
-            .execute(
+        assert!(
+            conn.execute(
                 "UPDATE extension_native_ownership_journal_state
                  SET revision = 5",
                 [],
             )
-            .is_err());
+            .is_err()
+        );
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
@@ -4532,22 +4565,25 @@ mod tests {
             .unwrap(),
             (1, 1)
         );
-        assert!(conn
-            .execute(
+        assert!(
+            conn.execute(
                 "UPDATE agent_audit_state SET event_count = event_count + 2",
                 [],
             )
-            .is_err());
-        assert!(conn
-            .execute(
+            .is_err()
+        );
+        assert!(
+            conn.execute(
                 "UPDATE agent_audit_events SET recorded_at = ?1",
                 [101_u64.to_be_bytes()],
             )
-            .is_err());
+            .is_err()
+        );
         assert!(conn.execute("DELETE FROM agent_audit_events", []).is_err());
-        assert!(conn
-            .execute("DELETE FROM agent_audit_deliveries", [])
-            .is_err());
+        assert!(
+            conn.execute("DELETE FROM agent_audit_deliveries", [])
+                .is_err()
+        );
 
         let tx = conn.transaction().unwrap();
         let second_delivery = 2_u64.to_be_bytes();
@@ -4562,8 +4598,8 @@ mod tests {
         .unwrap();
         let mut invalid_record = record.clone();
         invalid_record[0] = 2;
-        assert!(tx
-            .execute(
+        assert!(
+            tx.execute(
                 "INSERT INTO agent_audit_events(
                      manifest_id, supervisor_id, event_id, delivery_id,
                      batch_index, recorded_at, record_version, record
@@ -4577,7 +4613,8 @@ mod tests {
                     &invalid_record,
                 ],
             )
-            .is_err());
+            .is_err()
+        );
         tx.rollback().unwrap();
         assert_eq!(
             conn.query_row(
@@ -4642,9 +4679,10 @@ mod tests {
                     .unwrap(),
                 13
             );
-            assert!(conn
-                .prepare("SELECT * FROM extension_native_namespace_obligations")
-                .is_err());
+            assert!(
+                conn.prepare("SELECT * FROM extension_native_namespace_obligations")
+                    .is_err()
+            );
         }
     }
 
@@ -4687,9 +4725,11 @@ mod tests {
                 .unwrap(),
             13
         );
-        assert!(unanchored
-            .prepare("SELECT * FROM extension_native_namespace_obligations")
-            .is_err());
+        assert!(
+            unanchored
+                .prepare("SELECT * FROM extension_native_namespace_obligations")
+                .is_err()
+        );
 
         let mut contradicted = Connection::open_in_memory().unwrap();
         apply(&mut contradicted, &META[..13]).unwrap();
@@ -4753,12 +4793,13 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         apply(&mut conn, META).unwrap();
 
-        assert!(conn
-            .execute(
+        assert!(
+            conn.execute(
                 "UPDATE extension_native_ownership_journal_state SET revision = 0",
                 [],
             )
-            .is_err());
+            .is_err()
+        );
         for update in [
             "revision = 2",
             "revision = 2, operation_high_water = 1",
@@ -4777,15 +4818,10 @@ mod tests {
         assert!(
             insert_native_ownership_test_row(&conn, 1, 1, 1, "acquire", "native_owned",).is_err()
         );
-        assert!(insert_native_ownership_test_row(
-            &conn,
-            1,
-            1,
-            2,
-            "acquire",
-            "native_absent_preparing",
-        )
-        .is_err());
+        assert!(
+            insert_native_ownership_test_row(&conn, 1, 1, 2, "acquire", "native_absent_preparing",)
+                .is_err()
+        );
     }
 
     #[test]
@@ -4795,15 +4831,16 @@ mod tests {
         insert_native_ownership_test_row(&conn, 1, 1, 1, "acquire", "native_absent_preparing")
             .unwrap();
 
-        assert!(conn
-            .execute(
+        assert!(
+            conn.execute(
                 "UPDATE extension_native_ownership_journal_state
                  SET revision = 3,
                      operation_high_water = 1,
                      native_incarnation_high_water = 1",
                 [],
             )
-            .is_err());
+            .is_err()
+        );
         conn.execute(
             "UPDATE extension_native_ownership_journal_state
              SET revision = 2,
@@ -4913,22 +4950,24 @@ mod tests {
             );
         }
 
-        assert!(conn
-            .execute(
+        assert!(
+            conn.execute(
                 "UPDATE userscript_catalog SET revision = 0 WHERE id = 1",
                 []
             )
-            .is_err());
+            .is_err()
+        );
         let oversized = "x".repeat(zephium_core::ports::engine::MAX_USER_SCRIPT_BYTES + 1);
         for source in [oversized.as_str(), "valid prefix\0invalid body"] {
-            assert!(conn
-                .execute(
+            assert!(
+                conn.execute(
                     "INSERT INTO userscripts(
                          id, revision, enabled, metadata_format, source, source_sha256_v1
                      ) VALUES (?1, 1, 0, 1, ?2, ?3)",
                     rusqlite::params!["01J00000000000000000000005", source, vec![0_u8; 32]],
                 )
-                .is_err());
+                .is_err()
+            );
         }
     }
 
@@ -5000,21 +5039,23 @@ mod tests {
             );
         }
         for origin in ["x".repeat(513), "https://example.com\0suffix".into()] {
-            assert!(conn
-                .execute(
+            assert!(
+                conn.execute(
                     "INSERT INTO page_permission_grants(
                          id, revision, origin, kind, decision
                      ) VALUES ('01J00000000000000000000004', 1, ?1, 'camera', 'allow')",
                     [origin],
                 )
-                .is_err());
+                .is_err()
+            );
         }
-        assert!(conn
-            .execute(
+        assert!(
+            conn.execute(
                 "UPDATE page_permission_catalog SET revision = 0 WHERE id = 1",
                 [],
             )
-            .is_err());
+            .is_err()
+        );
     }
 
     #[test]
@@ -5184,8 +5225,8 @@ mod tests {
                 "accepted malformed extension structural identity"
             );
         }
-        assert!(conn
-            .execute(
+        assert!(
+            conn.execute(
                 "INSERT INTO extension_installs(
                      id, revision, authority, package_key, package_revision,
                      archive_sha256, manifest_sha256, tree_sha256, desired_enabled
@@ -5198,13 +5239,15 @@ mod tests {
                     vec![6_u8; 32]
                 ],
             )
-            .is_err());
-        assert!(conn
-            .execute(
+            .is_err()
+        );
+        assert!(
+            conn.execute(
                 "UPDATE extension_install_catalog SET revision = 0 WHERE id = 1",
                 [],
             )
-            .is_err());
+            .is_err()
+        );
     }
 
     #[test]

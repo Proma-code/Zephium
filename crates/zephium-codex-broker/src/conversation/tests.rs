@@ -1,5 +1,5 @@
 use super::*;
-use crate::catalog::{CatalogBuilder, Effort};
+use crate::catalog::{CatalogBuilder, Effort, EffortSelection};
 use serde_json::json;
 
 fn scope() -> Scope {
@@ -13,7 +13,7 @@ fn choice() -> ModelChoice {
     catalog
         .finish()
         .unwrap()
-        .select("picker-id", Effort::High)
+        .select("picker-id", EffortSelection::Explicit(Effort::High))
         .unwrap()
 }
 fn thread_reply() -> Value {
@@ -160,15 +160,13 @@ fn exact_cold_barrier_preserves_thread_id_and_requires_both_actual_close_and_ack
         c.begin_unsubscribe(&scope(), 2).unwrap();
         assert_eq!(c.begin_resume(&scope(), 3, choice()), Err(Fault::State));
         if close_first {
-            assert!(
-                notify(
-                    &mut c,
-                    "thread/closed",
-                    json!({"threadId":"original-thread"})
-                )
-                .unwrap()
-                .is_empty()
-            );
+            assert!(notify(
+                &mut c,
+                "thread/closed",
+                json!({"threadId":"original-thread"})
+            )
+            .unwrap()
+            .is_empty());
             assert_eq!(c.phase(), Phase::Closing);
             assert!(matches!(
                 &c.reply(&scope(), 2, &json!({"status":"unsubscribed"}))
@@ -176,11 +174,10 @@ fn exact_cold_barrier_preserves_thread_id_and_requires_both_actual_close_and_ack
                 Event::Closed { generation: 1, .. }
             ));
         } else {
-            assert!(
-                c.reply(&scope(), 2, &json!({"status":"notLoaded"}))
-                    .unwrap()
-                    .is_empty()
-            );
+            assert!(c
+                .reply(&scope(), 2, &json!({"status":"notLoaded"}))
+                .unwrap()
+                .is_empty());
             assert_eq!(c.phase(), Phase::Closing);
             assert!(matches!(
                 &notify(
@@ -239,15 +236,13 @@ fn same_id_resume_rejects_replacement_model_effort_and_thread() {
 fn before_response_notifications_are_buffered_then_bound_to_actual_returned_turn() {
     let mut c = ready();
     c.begin_turn(&scope(), 2).unwrap();
-    assert!(
-        notify(
-            &mut c,
-            "turn/started",
-            json!({"threadId":"original-thread","turn":turn_reply()["turn"]})
-        )
-        .unwrap()
-        .is_empty()
-    );
+    assert!(notify(
+        &mut c,
+        "turn/started",
+        json!({"threadId":"original-thread","turn":turn_reply()["turn"]})
+    )
+    .unwrap()
+    .is_empty());
     let item = message("message", "Hello", json!("final_answer"));
     assert!(notify(
         &mut c,
@@ -256,15 +251,13 @@ fn before_response_notifications_are_buffered_then_bound_to_actual_returned_turn
     )
     .unwrap()
     .is_empty());
-    assert!(
-        notify(
-            &mut c,
-            "turn/completed",
-            terminal(vec![item], "summary", "completed")
-        )
-        .unwrap()
-        .is_empty()
-    );
+    assert!(notify(
+        &mut c,
+        "turn/completed",
+        terminal(vec![item], "summary", "completed")
+    )
+    .unwrap()
+    .is_empty());
     let result = final_result(c.reply(&scope(), 2, &turn_reply()).unwrap());
     assert_eq!(result.final_response(), Some("Hello"));
 }
@@ -398,15 +391,13 @@ fn every_tool_item_server_request_and_action_notification_is_closed() {
             c.begin_interrupt(&scope(), 3).unwrap(),
             Command::Interrupt { .. }
         ));
-        assert!(
-            notify(
-                &mut c,
-                "turn/completed",
-                terminal(vec![], "notLoaded", "completed")
-            )
-            .unwrap()
-            .is_empty()
-        );
+        assert!(notify(
+            &mut c,
+            "turn/completed",
+            terminal(vec![], "notLoaded", "completed")
+        )
+        .unwrap()
+        .is_empty());
     }
     let mut c = running();
     assert_eq!(c.server_request(&scope()), Err(Fault::UnsupportedAction));
@@ -688,15 +679,13 @@ fn prepared_text_and_fresh_deny_configuration_keep_same_original_conversation() 
     next_turn["turn"]["id"] = json!("second-original-turn");
     c.reply(&scope(), 5, &next_turn).unwrap();
     // An old completion cannot finish the next generation's turn.
-    assert!(
-        notify(
-            &mut c,
-            "turn/completed",
-            terminal(vec![], "notLoaded", "completed")
-        )
-        .unwrap()
-        .is_empty()
-    );
+    assert!(notify(
+        &mut c,
+        "turn/completed",
+        terminal(vec![], "notLoaded", "completed")
+    )
+    .unwrap()
+    .is_empty());
     assert_eq!(c.phase(), Phase::Running);
     assert_eq!(c.thread_id(), Some("original-thread"));
 }
@@ -773,4 +762,135 @@ fn native_cold_restore_never_accepts_a_replacement_provider_thread() {
     c.begin_resume(&scope(), 1, choice()).unwrap();
     assert_eq!(c.reply(&scope(), 1, &thread_reply()), Err(Fault::Protocol));
     assert_eq!(c.phase(), Phase::Failed);
+}
+
+#[test]
+fn never_started_transition_requires_exact_pending_rpc_and_real_cold_close() {
+    let mut c = ready();
+    c.begin_turn(&scope(), 2).unwrap();
+    assert_eq!(c.abandon_unstarted(&scope(), 3), Err(Fault::State));
+    c.abandon_unstarted(&scope(), 2).unwrap();
+    assert_eq!(c.phase(), Phase::Ready);
+    assert!(c.active_turn_id().is_none());
+    assert_eq!(c.begin_turn(&scope(), 3), Err(Fault::State));
+    c.begin_unsubscribe(&scope(), 3).unwrap();
+    assert!(c
+        .reply(&scope(), 3, &json!({"status":"unsubscribed"}))
+        .unwrap()
+        .is_empty());
+    assert_eq!(c.phase(), Phase::Closing);
+    let events = notify(
+        &mut c,
+        "thread/closed",
+        json!({"threadId":"original-thread"}),
+    )
+    .unwrap();
+    assert!(matches!(events.as_slice(), [Event::Closed { .. }]));
+    assert_eq!(c.phase(), Phase::Closed);
+    assert!(c.begin_resume(&scope(), 4, choice()).is_ok());
+}
+#[test]
+fn never_started_never_erases_observed_or_early_original_turn_evidence() {
+    let mut c = running();
+    assert_eq!(c.abandon_unstarted(&scope(), 2), Err(Fault::State));
+    assert_eq!(c.active_turn_id(), Some("original-turn"));
+    let mut early = ready();
+    early.begin_turn(&scope(), 2).unwrap();
+    notify(
+        &mut early,
+        "turn/started",
+        json!({"threadId":"original-thread","turn":{"id":"original-turn","status":"inProgress"}}),
+    )
+    .unwrap();
+    assert_eq!(early.abandon_unstarted(&scope(), 2), Err(Fault::State));
+    assert!(early.reply(&scope(), 2, &turn_reply()).is_ok());
+    assert_eq!(early.active_turn_id(), Some("original-turn"));
+}
+#[test]
+fn never_started_scope_mismatch_does_not_change_current_obligation() {
+    let mut c = ready();
+    c.begin_turn(&scope(), 2).unwrap();
+    let wrong = Scope::new("other".into(), [9; 16], 1).unwrap();
+    assert_eq!(c.abandon_unstarted(&wrong, 2), Err(Fault::ScopeChanged));
+    assert_eq!(c.phase(), Phase::StartingTurn);
+    assert!(c.reply(&scope(), 2, &turn_reply()).is_ok());
+}
+
+#[test]
+fn default_readback_is_nullable_but_explicit_none_requires_literal() {
+    for selection in [
+        EffortSelection::Default,
+        EffortSelection::Explicit(Effort::None),
+    ] {
+        for (actual, valid) in [
+            (Some(Value::Null), selection == EffortSelection::Default),
+            (
+                Some(json!("none")),
+                selection == EffortSelection::Explicit(Effort::None),
+            ),
+            (Some(json!("high")), selection == EffortSelection::Default),
+            (None, false),
+        ] {
+            let mut reducer = Conversation::new(scope());
+            let selected = crate::effort_policy::tests::choice(selection);
+            reducer.begin_start(&scope(), 1, selected).unwrap();
+            let mut result = thread_reply();
+            result["model"] = json!("original-model");
+            if let Some(actual) = actual {
+                result["reasoningEffort"] = actual;
+            } else {
+                result.as_object_mut().unwrap().remove("reasoningEffort");
+            }
+            assert_eq!(reducer.reply(&scope(), 1, &result).is_ok(), valid);
+        }
+    }
+}
+
+#[test]
+fn explicit_none_then_cold_default_keeps_same_thread_and_requires_fresh_nullable_receipt() {
+    let mut reducer = Conversation::new(scope());
+    let explicit = crate::effort_policy::tests::choice(EffortSelection::Explicit(Effort::None));
+    let default = crate::effort_policy::tests::choice(EffortSelection::Default);
+    reducer.begin_start(&scope(), 1, explicit).unwrap();
+    let mut first = thread_reply();
+    first["model"] = json!("original-model");
+    first["reasoningEffort"] = json!("none");
+    reducer.reply(&scope(), 1, &first).unwrap();
+    reducer.begin_turn(&scope(), 2).unwrap();
+    reducer.reply(&scope(), 2, &turn_reply()).unwrap();
+    notify(
+        &mut reducer,
+        "turn/completed",
+        terminal(
+            vec![message("first", "synthetic", json!("final_answer"))],
+            "full",
+            "completed",
+        ),
+    )
+    .unwrap();
+    reducer.begin_unsubscribe(&scope(), 3).unwrap();
+    reducer
+        .reply(&scope(), 3, &json!({"status":"unsubscribed"}))
+        .unwrap();
+    notify(
+        &mut reducer,
+        "thread/closed",
+        json!({"threadId":"original-thread"}),
+    )
+    .unwrap();
+    let command = reducer.begin_resume(&scope(), 4, default.clone()).unwrap();
+    assert_eq!(
+        command,
+        Command::ResumeThread {
+            request_id: 4,
+            thread_id: "original-thread".into(),
+            choice: default
+        }
+    );
+    let mut fresh = first;
+    fresh["reasoningEffort"] = Value::Null;
+    reducer.reply(&scope(), 4, &fresh).unwrap();
+    assert!(
+        matches!(reducer.begin_turn(&scope(),5).unwrap(), Command::StartTurn {choice,..} if choice.selection() == EffortSelection::Default)
+    );
 }

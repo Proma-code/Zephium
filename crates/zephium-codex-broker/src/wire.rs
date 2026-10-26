@@ -141,7 +141,9 @@ fn open_params(
     projection: crate::compatibility::ConfigProjection,
 ) -> Value {
     let mut config = projection.fixed_config(text);
-    config["model_reasoning_effort"] = json!(choice.effort().as_str());
+    if let Some(effort) = choice.explicit_effort() {
+        config["model_reasoning_effort"] = json!(effort.as_str());
+    }
     json!({"model":choice.model(),"modelProvider":"openai","cwd":cwd,"approvalPolicy":"never","sandbox":"read-only","serviceTier":null,"config":config})
 }
 pub(crate) fn command(
@@ -186,9 +188,11 @@ pub(crate) fn command(
             choice,
         } => {
             let input = prepared.take().ok_or(Fault::Policy)?.into_turn_input();
-            Ok(
-                json!({"id":request_id,"method":"turn/start","params":{"threadId":thread_id,"input":input,"model":choice.model(),"effort":choice.effort().as_str(),"environments":[]}}),
-            )
+            let mut params = json!({"threadId":thread_id,"input":input,"model":choice.model(),"environments":[]});
+            if let Some(effort) = choice.explicit_effort() {
+                params["effort"] = json!(effort.as_str());
+            }
+            Ok(json!({"id":request_id,"method":"turn/start","params":params}))
         }
         Command::Interrupt {
             request_id,
@@ -211,7 +215,7 @@ pub(crate) fn opened(result: &Value, cwd: &str, choice: &ModelChoice) -> Result<
     if result.get("cwd").and_then(Value::as_str) != Some(cwd)
         || result.get("model").and_then(Value::as_str) != Some(choice.model())
         || result.get("modelProvider").and_then(Value::as_str) != Some("openai")
-        || result.get("reasoningEffort").and_then(Value::as_str) != Some(choice.effort().as_str())
+        || !crate::effort_policy::readback(choice, result.get("reasoningEffort"))
         || result.get("approvalPolicy").and_then(Value::as_str) != Some("never")
         || result
             .pointer("/thread/environments")
@@ -276,7 +280,7 @@ mod tests {
 mod policy_tests {
     use super::*;
     use crate::{
-        catalog::{CatalogBuilder, Effort},
+        catalog::{CatalogBuilder, Effort, EffortSelection},
         text_policy::prepare_text,
     };
     pub(super) fn choice() -> ModelChoice {
@@ -285,11 +289,81 @@ mod policy_tests {
         builder
             .finish()
             .unwrap()
-            .select("picker", Effort::High)
+            .select("picker", EffortSelection::Explicit(Effort::High))
             .unwrap()
     }
     fn result() -> Value {
         json!({"cwd":"C:\\owned\\work","model":"original-model","modelProvider":"openai","reasoningEffort":"high","approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":false},"thread":{"environments":[]}})
+    }
+    #[test]
+    fn default_omits_both_effort_controls_and_explicit_none_is_literal() {
+        for selection in [
+            EffortSelection::Default,
+            EffortSelection::Explicit(Effort::None),
+        ] {
+            let choice = crate::effort_policy::tests::choice(selection);
+            let mut text = Some(prepare_text("synthetic".into()).unwrap());
+            for cmd in [
+                Command::StartThread {
+                    request_id: 1,
+                    choice: choice.clone(),
+                },
+                Command::ResumeThread {
+                    request_id: 2,
+                    thread_id: "owned".into(),
+                    choice: choice.clone(),
+                },
+            ] {
+                let value = command(
+                    &cmd,
+                    "C:\\owned\\work",
+                    &mut text,
+                    crate::compatibility::ConfigProjection::V164Plus,
+                )
+                .unwrap();
+                let effort = value["params"]["config"].get("model_reasoning_effort");
+                match selection {
+                    EffortSelection::Default => assert!(effort.is_none()),
+                    _ => assert_eq!(effort, Some(&json!("none"))),
+                }
+            }
+            let turn = command(
+                &Command::StartTurn {
+                    request_id: 3,
+                    thread_id: "owned".into(),
+                    choice: choice.clone(),
+                },
+                "C:\\owned\\work",
+                &mut text,
+                crate::compatibility::ConfigProjection::V164Plus,
+            )
+            .unwrap();
+            let effort = turn["params"].get("effort");
+            match selection {
+                EffortSelection::Default => assert!(effort.is_none()),
+                _ => assert_eq!(effort, Some(&json!("none"))),
+            }
+            let mut effective = result();
+            effective["reasoningEffort"] = match selection {
+                EffortSelection::Default => Value::Null,
+                _ => json!("none"),
+            };
+            assert!(opened(&effective, "C:\\owned\\work", &choice).is_ok());
+            assert!(crate::compatibility::validate_opened_thread(
+                &effective,
+                "C:\\owned\\work",
+                &choice
+            )
+            .is_ok());
+            effective.as_object_mut().unwrap().remove("reasoningEffort");
+            assert!(opened(&effective, "C:\\owned\\work", &choice).is_err());
+            assert!(crate::compatibility::validate_opened_thread(
+                &effective,
+                "C:\\owned\\work",
+                &choice
+            )
+            .is_err());
+        }
     }
     #[test]
     fn exact_text_and_cold_override_are_inseparable_until_turn() {
@@ -385,88 +459,345 @@ mod policy_tests {
     }
 }
 
-/// Closed original advisory vocabulary; discarded values never confer account,
-/// execution, closure, completion or quota authority. Whole frame stays bounded.
-pub(crate) fn advisory(method: &str, params: &Value) -> Result<bool, Fault> {
-    fn id(v: Option<&Value>) -> bool {
-        v.and_then(Value::as_str)
-            .is_some_and(|s| !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control))
+/// Finite notification roles derived from original 0.164.0 protocol/common.rs.
+/// This is routing, NOT authorization: account/conversation payloads still pass
+/// their owned reducers. Server requests are rejected by `decode` before here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NotificationClass<'a> {
+    AccountInvalidation,
+    AccountLoginCompleted,
+    Conversation,
+    ConversationUsage(AdvisoryScope<'a>),
+    RemoteAuthority,
+    Informational(Advisory<'a>),
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Advisory<'a> {
+    pub(crate) kind: AdvisoryKind,
+    pub(crate) scope: AdvisoryScope<'a>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdvisoryScope<'a> {
+    Global,
+    Thread(&'a str),
+    Turn {
+        thread_id: &'a str,
+        turn_id: &'a str,
+    },
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdvisoryKind {
+    RateLimits,
+    ThreadStarted,
+    ThreadStatus,
+    ThreadName,
+    ThreadReadState,
+    ThreadQueue,
+    SkillsChanged,
+    Warning,
+    GuardianWarning,
+    Deprecation,
+    ModelVerification,
+    ModerationMetadata,
+    SafetyBuffering,
+    AuthRecoveryStarted,
+    AuthRecoveryCompleted,
+}
+
+/// Only these proven informational shapes can be discarded. Returned scope must
+/// be joined to the actor's owned thread/turn before discard; values themselves
+/// never certify authentication, model selection, quota, completion or closure.
+/// Unknown methods, action requests and policy changes are not advisories.
+/// Known inert fields may gain bounded additions without becoming authority.
+pub(crate) fn classify_notification<'a>(
+    method: &str,
+    params: &'a Value,
+) -> Result<NotificationClass<'a>, Fault> {
+    use AdvisoryKind as K;
+    use NotificationClass as C;
+    if !params.is_object() {
+        return Err(Fault::Envelope);
     }
     match method {
-        // Exact pinned bespoke_event_handling emits this during TokenCount.
-        "account/rateLimits/updated" => {
-            let object = params.as_object().ok_or(Fault::Envelope)?;
-            if object.len() != 1 || !object.get("rateLimits").is_some_and(Value::is_object) {
-                return Err(Fault::Envelope);
-            }
-            Ok(true)
+        "account/updated" => return Ok(C::AccountInvalidation),
+        "account/login/completed" => return Ok(C::AccountLoginCompleted),
+        "remoteControl/status/changed" => return Ok(C::RemoteAuthority),
+        "thread/tokenUsage/updated" => {
+            bounded_metadata(params)?;
+            let scope = advisory_scope(params)?;
+            require_turn(scope)?;
+            crate::conversation::validate_usage_snapshot(
+                params.get("tokenUsage").ok_or(Fault::Envelope)?,
+            )
+            .map_err(|_| Fault::Envelope)?;
+            return Ok(C::ConversationUsage(scope));
         }
-        "thread/started" => {
-            if !id(params.pointer("/thread/id")) {
-                return Err(Fault::Envelope);
-            }
-            Ok(true)
-        }
-        "thread/status/changed" => {
-            if !id(params.get("threadId"))
-                || !matches!(
-                    params.pointer("/status/type").and_then(Value::as_str),
-                    Some("notLoaded" | "idle" | "systemError" | "active")
-                )
-            {
-                return Err(Fault::Envelope);
-            }
-            Ok(true)
-        }
-        _ => Ok(false),
+        // A reroute contradicts allowProviderModelFallback=false; a warning
+        // about configuration cannot attest that the fixed policy took effect.
+        "configWarning" | "model/rerouted" => return Err(Fault::Policy),
+        "thread/closed"
+        | "turn/started"
+        | "turn/completed"
+        | "item/agentMessage/delta"
+        | "item/started"
+        | "item/completed"
+        | "item/reasoning/summaryTextDelta"
+        | "item/reasoning/summaryPartAdded"
+        | "item/reasoning/textDelta"
+        | "error" => return Ok(C::Conversation),
+        _ => (),
     }
+    let kind = match method {
+        "account/rateLimits/updated" => K::RateLimits,
+        "thread/started" => K::ThreadStarted,
+        "thread/status/changed" => K::ThreadStatus,
+        "thread/name/updated" => K::ThreadName,
+        "thread/readState/changed" => K::ThreadReadState,
+        "thread/queue/changed" => K::ThreadQueue,
+        "skills/changed" => K::SkillsChanged,
+        "warning" => K::Warning,
+        "guardianWarning" => K::GuardianWarning,
+        "deprecationNotice" => K::Deprecation,
+        "model/verification" => K::ModelVerification,
+        "turn/moderationMetadata" => K::ModerationMetadata,
+        "model/safetyBuffering/updated" => K::SafetyBuffering,
+        "modelProvider/authRecoveryStarted" => K::AuthRecoveryStarted,
+        "modelProvider/authRecoveryCompleted" => K::AuthRecoveryCompleted,
+        _ => return Err(Fault::Unsupported),
+    };
+    bounded_metadata(params)?;
+    let mut scope = advisory_scope(params)?;
+    let valid = match kind {
+        K::RateLimits => rate_limits(params.get("rateLimits")),
+        K::ThreadStarted => {
+            let id = identifier(params.pointer("/thread/id"))?;
+            if scope != AdvisoryScope::Global && scope != AdvisoryScope::Thread(id) {
+                return Err(Fault::Envelope);
+            }
+            scope = AdvisoryScope::Thread(id);
+            true
+        }
+        K::ThreadStatus => {
+            require_thread(scope)?;
+            match params.pointer("/status/type").and_then(Value::as_str) {
+                Some("notLoaded" | "idle" | "systemError") => true,
+                Some("active") => strings(params.pointer("/status/activeFlags")),
+                _ => false,
+            }
+        }
+        K::ThreadName => {
+            require_thread(scope)?;
+            optional(params.get("threadName"), text)
+        }
+        K::ThreadReadState => {
+            require_thread(scope)?;
+            read_state(params.get("readState"))
+        }
+        K::ThreadQueue => {
+            require_thread(scope)?;
+            true
+        }
+        // Original watcher emits an empty payload: cache invalidation only.
+        // It does not cause a skill lookup/import, restart or capability grant.
+        K::SkillsChanged => true,
+        K::Warning => text(params.get("message")),
+        K::GuardianWarning => {
+            require_thread(scope)?;
+            text(params.get("message"))
+        }
+        K::Deprecation => text(params.get("summary")) && optional(params.get("details"), text),
+        K::ModelVerification => {
+            require_turn(scope)?;
+            // Verification labels remain uninterpreted metadata. An additive
+            // label can never grant local capability or alter account state.
+            strings(params.get("verifications"))
+        }
+        K::ModerationMetadata => {
+            require_turn(scope)?;
+            // Pinned schema is JsonValue (including null), not an object map.
+            params.get("metadata").is_some()
+        }
+        K::SafetyBuffering => {
+            require_turn(scope)?;
+            text(params.get("model"))
+                && strings(params.get("useCases"))
+                && strings(params.get("reasons"))
+                && params.get("showBufferingUi").is_some_and(Value::is_boolean)
+                && optional(params.get("fasterModel"), text)
+        }
+        K::AuthRecoveryStarted | K::AuthRecoveryCompleted => {
+            require_turn(scope)?;
+            text(params.get("provider")) && text(params.get("message"))
+        }
+    };
+    if !valid {
+        return Err(Fault::Envelope);
+    }
+    Ok(C::Informational(Advisory { kind, scope }))
+}
+fn identifier(value: Option<&Value>) -> Result<&str, Fault> {
+    value
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control))
+        .ok_or(Fault::Envelope)
+}
+fn advisory_scope(params: &Value) -> Result<AdvisoryScope<'_>, Fault> {
+    let thread = params.get("threadId").filter(|v| !v.is_null());
+    let turn = params.get("turnId").filter(|v| !v.is_null());
+    match (thread, turn) {
+        (None, None) => Ok(AdvisoryScope::Global),
+        (Some(thread), None) => Ok(AdvisoryScope::Thread(identifier(Some(thread))?)),
+        (Some(thread), Some(turn)) => Ok(AdvisoryScope::Turn {
+            thread_id: identifier(Some(thread))?,
+            turn_id: identifier(Some(turn))?,
+        }),
+        (None, Some(_)) => Err(Fault::Envelope),
+    }
+}
+fn require_thread(scope: AdvisoryScope<'_>) -> Result<(), Fault> {
+    if matches!(scope, AdvisoryScope::Thread(_) | AdvisoryScope::Turn { .. }) {
+        Ok(())
+    } else {
+        Err(Fault::Envelope)
+    }
+}
+fn require_turn(scope: AdvisoryScope<'_>) -> Result<(), Fault> {
+    if matches!(scope, AdvisoryScope::Turn { .. }) {
+        Ok(())
+    } else {
+        Err(Fault::Envelope)
+    }
+}
+fn text(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.len() <= crate::protocol::MAX_REPLY_BYTES)
+}
+fn strings(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_array)
+        .is_some_and(|values| values.len() <= 4096 && values.iter().all(|v| text(Some(v))))
+}
+fn optional(value: Option<&Value>, valid: fn(Option<&Value>) -> bool) -> bool {
+    value.is_none_or(|v| v.is_null() || valid(Some(v)))
+}
+fn object(value: Option<&Value>) -> bool {
+    value.is_some_and(Value::is_object)
+}
+fn boolean(value: Option<&Value>) -> bool {
+    value.is_some_and(Value::is_boolean)
+}
+fn integer(value: Option<&Value>) -> bool {
+    value.and_then(Value::as_i64).is_some()
+}
+fn integer32(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_i64)
+        .is_some_and(|v| i32::try_from(v).is_ok())
+}
+fn read_state(value: Option<&Value>) -> bool {
+    value.is_some_and(|v| {
+        v.is_object()
+            && identifier(v.get("revision")).is_ok()
+            && v.get("firstUnread").is_none_or(|position| {
+                position.is_null()
+                    || (position.is_object()
+                        && match position.get("type").and_then(Value::as_str) {
+                            Some("threadStart") => true,
+                            Some("turn") => identifier(position.get("turnId")).is_ok(),
+                            _ => false,
+                        })
+            })
+    })
+}
+fn rate_window(value: Option<&Value>) -> bool {
+    value.is_some_and(|v| {
+        v.is_object()
+            && integer32(v.get("usedPercent"))
+            && optional(v.get("windowDurationMins"), integer)
+            && optional(v.get("resetsAt"), integer)
+    })
+}
+fn credits(value: Option<&Value>) -> bool {
+    value.is_some_and(|v| {
+        v.is_object()
+            && boolean(v.get("hasCredits"))
+            && boolean(v.get("unlimited"))
+            && optional(v.get("balance"), text)
+    })
+}
+fn spend_limit(value: Option<&Value>) -> bool {
+    value.is_some_and(|v| {
+        v.is_object()
+            && text(v.get("limit"))
+            && text(v.get("used"))
+            && integer32(v.get("remainingPercent"))
+            && integer(v.get("resetsAt"))
+    })
+}
+fn rate_limits(value: Option<&Value>) -> bool {
+    value.is_some_and(|v| {
+        object(Some(v))
+            && [
+                "limitId",
+                "limitName",
+                "normalModelSlug",
+                "planType",
+                "rateLimitReachedType",
+            ]
+            .iter()
+            .all(|k| optional(v.get(*k), text))
+            && optional(v.get("primary"), rate_window)
+            && optional(v.get("secondary"), rate_window)
+            && optional(v.get("credits"), credits)
+            && optional(v.get("individualLimit"), spend_limit)
+            && optional(v.get("spendControlReached"), boolean)
+    })
+}
+/// Direct callers cannot bypass the frame's allocation/complexity bounds. No
+/// metadata is logged or returned; arbitrary moderation/additive JSON is inert.
+fn bounded_metadata(value: &Value) -> Result<(), Fault> {
+    let mut todo = vec![(value, 0usize)];
+    let mut nodes = 0usize;
+    let mut bytes = 0usize;
+    while let Some((value, depth)) = todo.pop() {
+        nodes += 1;
+        if nodes > 131_072 || depth > 64 {
+            return Err(Fault::Envelope);
+        }
+        bytes = bytes.checked_add(1).ok_or(Fault::Envelope)?;
+        match value {
+            Value::String(s) => bytes = bytes.checked_add(s.len()).ok_or(Fault::Envelope)?,
+            Value::Array(items) => {
+                if items.len() > 131_072 {
+                    return Err(Fault::Envelope);
+                }
+                todo.extend(items.iter().map(|v| (v, depth + 1)));
+            }
+            Value::Object(items) => {
+                if items.len() > 131_072 {
+                    return Err(Fault::Envelope);
+                }
+                for (key, v) in items {
+                    bytes = bytes.checked_add(key.len()).ok_or(Fault::Envelope)?;
+                    todo.push((v, depth + 1));
+                }
+            }
+            _ => (),
+        }
+        if bytes > crate::protocol::MAX_REPLY_BYTES {
+            return Err(Fault::Envelope);
+        }
+    }
+    Ok(())
 }
 #[cfg(test)]
-mod advisory_tests {
-    use super::*;
-    #[test]
-    fn only_closed_telemetry_methods_are_discarded_without_authority() {
-        assert_eq!(
-            advisory(
-                "account/rateLimits/updated",
-                &json!({"rateLimits":{"primary":null}})
-            ),
-            Ok(true)
-        );
-        assert_eq!(
-            advisory("account/rateLimits/updated", &json!({"rateLimits":null})),
-            Err(Fault::Envelope)
-        );
-        assert_eq!(advisory("account/updated", &json!({})), Ok(false));
-        assert_eq!(advisory("tool/call", &json!({})), Ok(false));
-        assert_eq!(
-            advisory(
-                "thread/status/changed",
-                &json!({"threadId":"t","status":{"type":"active","activeFlags":[]}})
-            ),
-            Ok(true)
-        );
-        assert_eq!(
-            advisory("thread/closed", &json!({"threadId":"t"})),
-            Ok(false)
-        );
-        let Incoming::Notification{method,params}=decode(br#"{"method":"account/rateLimits/updated","params":{"rateLimits":{}},"emittedAtMs":1}"#).unwrap() else{panic!("notification")};
-        assert_eq!(advisory(&method, &params), Ok(true));
-        let Incoming::Reply { result, .. } =
-            decode(br#"{"id":4,"result":{"data":[],"nextCursor":null}}"#).unwrap()
-        else {
-            panic!("reply")
-        };
-        assert!(result.unwrap()["data"].is_array());
-        assert_eq!(
-            model_list(7, Some("opaque")),
-            json!({"id":7,"method":"model/list","params":{"limit":100,"includeHidden":false,"cursor":"opaque"}})
-        );
-    }
-}
+#[path = "wire/notification_tests.rs"]
+mod notification_tests;
 
 pub(crate) enum Startup {
     RemoteDisabled,
+    Informational(AdvisoryKind),
     AccountInvalidation(Value),
     Reply(Value),
 }
@@ -486,6 +817,15 @@ pub(crate) fn startup(bytes: &[u8], expected: Option<u64>) -> Result<Startup, Fa
         {
             crate::protocol::accept_startup_status(bytes).map_err(|_| Fault::Policy)?;
             Ok(Startup::RemoteDisabled)
+        }
+        Incoming::Notification { method, params } => {
+            match classify_notification(&method, &params)? {
+                NotificationClass::Informational(Advisory {
+                    kind,
+                    scope: AdvisoryScope::Global,
+                }) => Ok(Startup::Informational(kind)),
+                _ => Err(Fault::Envelope),
+            }
         }
         _ => Err(Fault::Envelope),
     }

@@ -47,6 +47,11 @@ mod framing;
 use framing::{Frames, MAX_FRAME_BYTES};
 mod write_fence;
 pub(crate) use write_fence::WriteFence;
+mod write_receipt;
+pub(crate) use write_receipt::{
+    MatchedUnsent, TurnHistory, TurnIntent, TurnOperation, TurnWrite, UnsentTurn,
+};
+use write_receipt::{OwnedFrame, SessionStamp, TurnBinding, TurnTicket, WriteOutcome};
 
 #[cfg(debug_assertions)]
 pub(crate) mod fixtures;
@@ -235,11 +240,14 @@ fn environment(runtime: &RuntimePaths) -> Result<Vec<u16>, Fault> {
     Ok(output)
 }
 
+pub(crate) struct TurnSendFailure {
+    pub(crate) fault: Fault,
+    pub(crate) never_started: Option<UnsentTurn>,
+}
+
 struct WriteRequest {
-    deadline: Instant,
-    fence: Option<WriteFence>,
-    bytes: Vec<u8>,
-    completed: mpsc::SyncSender<bool>,
+    frame: OwnedFrame,
+    completed: mpsc::SyncSender<WriteOutcome>,
     #[cfg(debug_assertions)]
     started: Arc<AtomicBool>,
 }
@@ -247,6 +255,8 @@ struct WriteRequest {
 /// No native resource can outlive this custodian without the custodian remaining
 /// alive. Drop intentionally blocks after termination until process/writer settle.
 pub(crate) struct Session {
+    write_stamp: SessionStamp,
+    write_sequence: u64,
     _image: Image,
     _runtime: Arc<RuntimePaths>,
     job: Job,
@@ -335,6 +345,8 @@ impl Session {
         // Allocate the complete owner before CreateProcess: guard installation
         // after native success itself cannot allocate or invoke user callbacks.
         let mut session = Self {
+            write_stamp: SessionStamp::new(),
+            write_sequence: 0,
             _image: image,
             _runtime: runtime,
             job,
@@ -413,19 +425,15 @@ impl Session {
                 .name("codex-stdin".into())
                 .spawn(move || {
                     let mut stdin = File::from(stdin_write);
-                    while let Ok(mut request) = receiver.recv() {
+                    while let Ok(request) = receiver.recv() {
                         #[cfg(debug_assertions)]
                         request.started.store(true, Ordering::Release);
-                        let ok = write_fence::write_frame(
-                            &mut stdin,
-                            &request.bytes,
-                            request.fence.as_ref(),
-                            request.deadline,
-                        )
-                        .is_ok();
-                        request.bytes.fill(0);
-                        let _ = request.completed.send(ok);
-                        if !ok {
+                        let outcome = request.frame.write(&mut stdin);
+                        let entered_failure = matches!(outcome, WriteOutcome::EnteredFailure);
+                        let _ = request.completed.send(outcome);
+                        // A pre-write gate rejection does not damage the pipe.
+                        // Keep it alive for owned unsubscribe/close settlement.
+                        if entered_failure {
                             break;
                         }
                     }
@@ -458,16 +466,107 @@ impl Session {
         cancelled: &AtomicBool,
         fence: Option<WriteFence>,
     ) -> Result<(), Fault> {
+        self.send_owned(bytes.to_vec(), None, deadline, cancelled, fence)
+            .map_err(|failure| {
+                self.settle_physical();
+                failure.fault
+            })
+    }
+
+    /// Issued only after the owning Connection validates current scope/grant
+    /// and exact history. Reserving an intent sends no bytes or provider RPC.
+    pub(crate) fn reserve_turn(&mut self, operation: TurnOperation) -> Result<TurnIntent, Fault> {
+        if self.settled {
+            return Err(Fault::UnexpectedExit);
+        }
+        self.write_sequence = self.write_sequence.checked_add(1).ok_or(Fault::Writer)?;
+        Ok(TurnIntent::new(
+            self.write_stamp.clone(),
+            self.write_sequence,
+            operation,
+        ))
+    }
+    /// This proves no turn-frame handoff, not that prior thread preparation or
+    /// original process custody has settled. The caller must retain those gates.
+    pub(crate) fn reject_intent(&self, intent: TurnIntent) -> Option<UnsentTurn> {
+        intent.reject(&self.write_stamp, self.write_sequence)
+    }
+
+    /// Native fixed turn only. A returned unsent receipt is exact pre-write
+    /// evidence; all other failures retain uncertain dispatch in the caller.
+    pub(crate) fn send_turn_frame(
+        &mut self,
+        turn: TurnWrite,
+        deadline: Instant,
+        cancelled: &AtomicBool,
+        fence: WriteFence,
+    ) -> Result<(), TurnSendFailure> {
+        if !fence.is_text() {
+            return Err(TurnSendFailure {
+                fault: Fault::Frame,
+                never_started: None,
+            });
+        }
+        let (ticket, bytes) = turn.into_parts();
+        self.send_owned(bytes, Some(ticket), deadline, cancelled, Some(fence))
+    }
+
+    fn send_owned(
+        &mut self,
+        mut bytes: Vec<u8>,
+        turn: Option<TurnTicket>,
+        deadline: Instant,
+        cancelled: &AtomicBool,
+        fence: Option<WriteFence>,
+    ) -> Result<(), TurnSendFailure> {
         if bytes.is_empty()
             || bytes.len() > MAX_FRAME_BYTES
             || bytes.contains(&b'\n')
             || bytes.contains(&b'\r')
         {
-            return Err(Fault::Frame);
+            bytes.fill(0);
+            return Err(TurnSendFailure {
+                fault: Fault::Frame,
+                never_started: None,
+            });
         }
-        self.check(deadline, cancelled)?;
-        let mut owned = bytes.to_vec();
-        owned.push(b'\n');
+        let (sequence, binding) = if let Some(ticket) = turn {
+            if !ticket.belongs_to(&self.write_stamp)
+                || ticket.sequence == 0
+                || ticket.sequence > self.write_sequence
+                || !ticket.matches_bytes(&bytes)
+            {
+                bytes.fill(0);
+                return Err(TurnSendFailure {
+                    fault: Fault::Frame,
+                    never_started: None,
+                });
+            }
+            (ticket.sequence, Some(ticket.binding))
+        } else {
+            let Some(sequence) = self.write_sequence.checked_add(1) else {
+                bytes.fill(0);
+                return Err(TurnSendFailure {
+                    fault: Fault::Writer,
+                    never_started: None,
+                });
+            };
+            self.write_sequence = sequence;
+            (sequence, None)
+        };
+        bytes.push(b'\n');
+        let frame = OwnedFrame::new(
+            self.write_stamp.clone(),
+            sequence,
+            binding.clone(),
+            bytes,
+            deadline,
+            fence,
+        );
+        if let Err(fault) = self.check(deadline, cancelled) {
+            let receipt = frame.reject_unqueued();
+            return Err(self.unsent_failure(fault, sequence, binding.as_ref(), receipt));
+        }
         let (completed, result) = mpsc::sync_channel(1);
         #[cfg(debug_assertions)]
         let started = Arc::new(AtomicBool::new(false));
@@ -476,28 +575,62 @@ impl Session {
             self.observed_pending_write = false;
         }
         let Some(stdin) = self.stdin.as_ref() else {
-            return self.fail(Fault::Writer);
+            self.settle_physical();
+            return Err(self.unsent_failure(
+                Fault::Writer,
+                sequence,
+                binding.as_ref(),
+                frame.reject_unqueued(),
+            ));
         };
-        if stdin
-            .try_send(WriteRequest {
-                deadline,
-                fence,
-                bytes: owned,
-                completed,
-                #[cfg(debug_assertions)]
-                started: started.clone(),
-            })
-            .is_err()
-        {
-            return self.fail(Fault::Writer);
+        if let Err(rejected) = stdin.try_send(WriteRequest {
+            frame,
+            completed,
+            #[cfg(debug_assertions)]
+            started: started.clone(),
+        }) {
+            // try_send returns ownership of the entire never-enqueued frame.
+            let rejected = match rejected {
+                mpsc::TrySendError::Full(request) | mpsc::TrySendError::Disconnected(request) => {
+                    request
+                }
+            };
+            let receipt = rejected.frame.reject_unqueued();
+            self.settle_physical();
+            return Err(self.unsent_failure(Fault::Writer, sequence, binding.as_ref(), receipt));
         }
         loop {
-            self.check(deadline, cancelled)?;
-            self.drain()?;
+            // A scope stop/deadline may win over the ACK. Physical settlement
+            // joins the writer; only an actual received Rejected result can be
+            // recovered afterward. Join/disconnection cannot create a receipt.
+            if let Err(fault) = self.check(deadline, cancelled).and_then(|()| self.drain()) {
+                self.settle_physical();
+                return Err(match result.try_recv() {
+                    Ok(WriteOutcome::Rejected(receipt)) => {
+                        self.unsent_failure(fault, sequence, binding.as_ref(), receipt)
+                    }
+                    _ => TurnSendFailure {
+                        fault,
+                        never_started: None,
+                    },
+                });
+            }
             match result.try_recv() {
-                Ok(true) => return Ok(()),
-                Ok(false) | Err(mpsc::TryRecvError::Disconnected) => {
-                    return self.fail(Fault::Writer);
+                Ok(WriteOutcome::Written) => return Ok(()),
+                Ok(WriteOutcome::Rejected(receipt)) => {
+                    let fault = if receipt.expired() {
+                        Fault::Timeout
+                    } else {
+                        Fault::Cancelled
+                    };
+                    return Err(self.unsent_failure(fault, sequence, binding.as_ref(), receipt));
+                }
+                Ok(WriteOutcome::EnteredFailure) | Err(mpsc::TryRecvError::Disconnected) => {
+                    self.settle_physical();
+                    return Err(TurnSendFailure {
+                        fault: Fault::Writer,
+                        never_started: None,
+                    });
                 }
                 Err(mpsc::TryRecvError::Empty) =>
                 {
@@ -508,6 +641,19 @@ impl Session {
                 }
             }
             std::thread::sleep(POLL);
+        }
+    }
+    fn unsent_failure(
+        &self,
+        fault: Fault,
+        sequence: u64,
+        binding: Option<&TurnBinding>,
+        receipt: write_receipt::NeverStarted,
+    ) -> TurnSendFailure {
+        TurnSendFailure {
+            fault,
+            never_started: binding
+                .and_then(|binding| receipt.consume(&self.write_stamp, sequence, binding)),
         }
     }
 

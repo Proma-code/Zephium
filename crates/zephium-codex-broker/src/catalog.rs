@@ -47,6 +47,20 @@ impl Effort {
     }
 }
 
+/// A native catalog choice, not a guessed effort or an execution authority.
+/// Default omits the original wire setting; it is never literal `none`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "effort",
+    rename_all = "camelCase",
+    deny_unknown_fields
+)]
+pub enum EffortSelection {
+    Default,
+    Explicit(Effort),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EffortOption {
     pub effort: Effort,
@@ -62,7 +76,10 @@ pub struct Model {
     pub display_name: String,
     pub description: String,
     pub efforts: Vec<EffortOption>,
-    /// None when the original default is unsupported; never silently replace it.
+    /// Exact original default metadata, including an unqualified future mode.
+    pub default_effort_wire: String,
+    /// Parsed original default, independent of explicit preset membership.
+    /// None means unqualified by this adapter, not unsupported by the provider.
     pub default_effort: Option<Effort>,
     pub is_default: bool,
 }
@@ -71,7 +88,9 @@ pub struct Model {
 pub struct ModelChoice {
     id: String,
     model: String,
-    effort: Effort,
+    selection: EffortSelection,
+    default_effort: Option<Effort>,
+    default_effort_wire: String,
 }
 impl ModelChoice {
     pub fn id(&self) -> &str {
@@ -80,8 +99,21 @@ impl ModelChoice {
     pub fn model(&self) -> &str {
         &self.model
     }
-    pub fn effort(&self) -> Effort {
-        self.effort
+    pub fn selection(&self) -> EffortSelection {
+        self.selection
+    }
+    pub fn explicit_effort(&self) -> Option<Effort> {
+        match self.selection {
+            EffortSelection::Default => None,
+            EffortSelection::Explicit(effort) => Some(effort),
+        }
+    }
+    /// Catalog metadata only; null effective readback must remain unspecified.
+    pub fn advertised_default(&self) -> Option<Effort> {
+        self.default_effort
+    }
+    pub fn advertised_default_wire(&self) -> &str {
+        &self.default_effort_wire
     }
 }
 
@@ -103,16 +135,30 @@ impl Catalog {
     pub fn models(&self) -> &[Model] {
         &self.models
     }
-    pub fn select(&self, id: &str, effort: Effort) -> Result<ModelChoice, CatalogFault> {
+    pub fn select(
+        &self,
+        id: &str,
+        selection: EffortSelection,
+    ) -> Result<ModelChoice, CatalogFault> {
         let row = self
             .models
             .iter()
-            .find(|row| row.id == id && row.efforts.iter().any(|e| e.effort == effort))
+            .find(|row| {
+                row.id == id
+                    && match selection {
+                        EffortSelection::Default => row.default_effort.is_some(),
+                        EffortSelection::Explicit(effort) => {
+                            row.efforts.iter().any(|e| e.effort == effort)
+                        }
+                    }
+            })
             .ok_or(CatalogFault::UnsupportedChoice)?;
         Ok(ModelChoice {
             id: row.id.clone(),
             model: row.model.clone(),
-            effort,
+            selection,
+            default_effort: row.default_effort,
+            default_effort_wire: row.default_effort_wire.clone(),
         })
     }
 }
@@ -225,17 +271,22 @@ impl CatalogBuilder {
             if modalities.len() > 16 || modalities.iter().any(|v| !v.is_string()) {
                 return Err(CatalogFault::Shape);
             }
-            if efforts.is_empty() || !modalities.iter().any(|v| v.as_str() == Some("text")) {
+            // The exact original producer maps default and presets independently.
+            // An empty preset list is valid, and is not evidence that the
+            // separately advertised default is an explicit selectable preset.
+            let default_effort = Effort::parse(default);
+            if (efforts.is_empty() && default_effort.is_none())
+                || !modalities.iter().any(|v| v.as_str() == Some("text"))
+            {
                 continue;
             }
-            let default_effort =
-                Effort::parse(default).filter(|e| efforts.iter().any(|o| o.effort == *e));
             admitted.push(Model {
                 id: id.to_owned(),
                 model: model.to_owned(),
                 display_name: display_name.to_owned(),
                 description: description.to_owned(),
                 efforts,
+                default_effort_wire: default.to_owned(),
                 default_effort,
                 is_default,
             });

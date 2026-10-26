@@ -13,6 +13,11 @@ struct Memory {
     revision_on_begin: Option<Arc<AtomicU64>>,
     lose_settle_ack: bool,
     lose_start_ack: bool,
+    cancel_on_begin: Option<Arc<AtomicBool>>,
+    lose_bind_ack: bool,
+    lose_begin_ack: bool,
+    lose_skip_ack: bool,
+    skip_calls: usize,
 }
 impl Associations for MemoryAssociations {
     fn call(&mut self, call: durable::Call) -> durable::Reply {
@@ -28,6 +33,7 @@ impl Associations for MemoryAssociations {
             durable::Call::AdvanceGrant { expected } => Some(*expected),
             durable::Call::Load { scope, .. }
             | durable::Call::Bind { scope, .. }
+            | durable::Call::Skip { scope, .. }
             | durable::Call::Begin { scope, .. }
             | durable::Call::RecordTurn { scope, .. }
             | durable::Call::Settle { scope, .. } => Some(*scope),
@@ -73,20 +79,74 @@ impl Associations for MemoryAssociations {
                 scope,
                 conversation,
                 thread_id,
+                expected_revision,
             } => {
-                if memory.records.contains_key(&conversation) {
-                    return fail;
-                }
+                let prior = memory.records.get(&conversation).cloned();
+                let (revision, dispatch) = match (prior, expected_revision) {
+                    (None, None) => (1, durable::Dispatch::Ready),
+                    (Some(prior), Some(expected))
+                        if prior.revision == expected
+                            && prior.thread_id.is_none()
+                            && matches!(prior.dispatch, durable::Dispatch::Skipped { .. }) =>
+                    {
+                        (expected + 1, prior.dispatch)
+                    }
+                    _ => return fail,
+                };
                 let value = durable::Association {
                     scope,
                     conversation: conversation.clone(),
-                    thread_id,
-                    revision: 1,
-                    dispatch: durable::Dispatch::Ready,
+                    thread_id: Some(thread_id),
+                    revision,
+                    dispatch,
                 };
                 memory.records.insert(conversation, value.clone());
                 if let Some(cancel) = &memory.cancel_on_bind {
                     cancel.store(true, Ordering::Release);
+                }
+                if memory.lose_bind_ack {
+                    return durable::Reply::Failed(durable::Fault::OutcomeUnknown);
+                }
+                durable::Reply::Association(Some(value))
+            }
+            durable::Call::Skip {
+                scope,
+                conversation,
+                expected_revision,
+                reply,
+            } => {
+                memory.skip_calls += 1;
+                let prior = memory.records.get(&conversation).cloned();
+                let (thread_id, revision) = match (prior, expected_revision) {
+                    (None, None) => (None, 1),
+                    (Some(prior), Some(expected)) if prior.revision == expected => {
+                        let allowed = match prior.dispatch {
+                            durable::Dispatch::Pending {
+                                reply: pending,
+                                turn_id: None,
+                            } => pending == reply,
+                            durable::Dispatch::Pending { .. } => false,
+                            durable::Dispatch::Ready => true,
+                            durable::Dispatch::Skipped { reply: old }
+                            | durable::Dispatch::Settled { reply: old, .. } => reply > old,
+                        };
+                        if !allowed {
+                            return fail;
+                        }
+                        (prior.thread_id, expected + 1)
+                    }
+                    _ => return fail,
+                };
+                let value = durable::Association {
+                    scope,
+                    conversation: conversation.clone(),
+                    thread_id,
+                    revision,
+                    dispatch: durable::Dispatch::Skipped { reply },
+                };
+                memory.records.insert(conversation, value.clone());
+                if memory.lose_skip_ack {
+                    return durable::Reply::Failed(durable::Fault::OutcomeUnknown);
                 }
                 durable::Reply::Association(Some(value))
             }
@@ -100,8 +160,9 @@ impl Associations for MemoryAssociations {
                     return fail;
                 };
                 if value.revision != expected_revision
+                    || value.thread_id.is_none()
                     || matches!(value.dispatch, durable::Dispatch::Pending { .. })
-                    || matches!(value.dispatch,durable::Dispatch::Settled{reply:prior,..} if reply<=prior)
+                    || matches!(value.dispatch,durable::Dispatch::Skipped{reply:prior}|durable::Dispatch::Settled{reply:prior,..} if reply<=prior)
                 {
                     return fail;
                 }
@@ -113,6 +174,12 @@ impl Associations for MemoryAssociations {
                 let result = durable::Reply::Association(Some(value.clone()));
                 if let Some(revision) = &memory.revision_on_begin {
                     revision.fetch_add(1, Ordering::AcqRel);
+                }
+                if let Some(cancel) = &memory.cancel_on_begin {
+                    cancel.store(true, Ordering::Release);
+                }
+                if memory.lose_begin_ack {
+                    return durable::Reply::Failed(durable::Fault::OutcomeUnknown);
                 }
                 result
             }
@@ -187,11 +254,11 @@ fn request(reply: u64, new_conversation: bool) -> TextRequest {
         key: ConversationKey::from_native("synthetic-page".into()).unwrap(),
         new_conversation,
         model: "synthetic-picker".into(),
-        effort: Effort::High,
-        text: if reply == 1 {
-            "synthetic first $skill_one"
-        } else {
-            "synthetic second $skill_two"
+        effort: EffortSelection::Explicit(crate::catalog::Effort::High),
+        text: match reply {
+            1 => "synthetic first $skill_one",
+            2 => "synthetic second $skill_two",
+            _ => "synthetic third $skill_three",
         }
         .into(),
     }
@@ -208,6 +275,20 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
             Scenario::RevisionBeforeWrite => state.revision_on_begin = Some(revision.clone()),
             Scenario::LostSettleAck => state.lose_settle_ack = true,
             Scenario::LostStartAck => state.lose_start_ack = true,
+            Scenario::CancelBeforeActor => call_cancel.store(true, Ordering::Release),
+            Scenario::CancelBeforeWrite => state.cancel_on_begin = Some(call_cancel.clone()),
+            Scenario::LostBindAck => {
+                state.lose_bind_ack = true;
+                state.cancel_on_bind = Some(call_cancel.clone());
+            }
+            Scenario::LostBeginAck => {
+                state.lose_begin_ack = true;
+                state.cancel_on_begin = Some(call_cancel.clone());
+            }
+            Scenario::LostSkipAck => {
+                state.lose_skip_ack = true;
+                state.cancel_on_bind = Some(call_cancel.clone());
+            }
             _ => {}
         }
     }
@@ -237,7 +318,7 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
                 durable::Association {
                     scope: association_scope,
                     conversation: "synthetic-page".into(),
-                    thread_id: "synthetic-owned-thread".into(),
+                    thread_id: Some("synthetic-owned-thread".into()),
                     revision: 4,
                     dispatch: durable::Dispatch::Settled {
                         reply: 1,
@@ -265,6 +346,7 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
     let mut catalog = false;
     let mut started = false;
     let mut second = false;
+    let mut third = false;
     let mut cancellation = false;
     let mut retried = false;
     let mut terminals = 0;
@@ -272,6 +354,14 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
     let mut invalidated = false;
     let mut guarded_failure = false;
     let mut history_uncertain = false;
+    let mut skipped = 0;
+    let skips_success = matches!(
+        scenario,
+        Scenario::CancelBeforeActor
+            | Scenario::CancelDuringPreparation
+            | Scenario::CancelBeforeTurn
+            | Scenario::CancelBeforeWrite
+    );
     loop {
         if Instant::now() >= deadline {
             return Err("owner-transcript-timeout");
@@ -284,12 +374,6 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
                     .take_failure_events(&scope)
                     .map_err(|_| "owner-failure-events")?
             }
-            Err(Fault::Cancelled) if matches!(scenario, Scenario::CancelBeforeTurn) => {
-                guarded_failure = true;
-                connection
-                    .take_failure_events(&scope)
-                    .map_err(|_| "owner-failure-events")?
-            }
             Err(Fault::ScopeChanged) if matches!(scenario, Scenario::RevisionBeforeWrite) => {
                 guarded_failure = true;
                 connection
@@ -297,8 +381,21 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
                     .map_err(|_| "owner-failure-events")?
             }
             Err(Fault::PersistenceUnavailable)
-                if matches!(scenario, Scenario::LostSettleAck | Scenario::LostStartAck) =>
+                if matches!(
+                    scenario,
+                    Scenario::LostSettleAck
+                        | Scenario::LostStartAck
+                        | Scenario::LostBindAck
+                        | Scenario::LostBeginAck
+                        | Scenario::LostSkipAck
+                ) =>
             {
+                guarded_failure = true;
+                connection
+                    .take_failure_events(&scope)
+                    .map_err(|_| "owner-failure-events")?
+            }
+            Err(Fault::Transport) if matches!(scenario, Scenario::LostPreparationAck) => {
                 guarded_failure = true;
                 connection
                     .take_failure_events(&scope)
@@ -324,11 +421,48 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
                     } else {
                         request(1, true)
                     };
+                    if matches!(scenario, Scenario::TwoTurns) {
+                        text.effort = EffortSelection::Default;
+                    }
                     text.admission =
                         TextAdmission::from_native(call_cancel.clone(), revision.clone(), 1);
                     connection
                         .start_text(&scope, text, &cancel)
                         .map_err(|_| "owner-first")?;
+                    if matches!(scenario, Scenario::CancelDuringPreparation) {
+                        call_cancel.store(true, Ordering::Release);
+                        connection
+                            .cancel_turn(&scope, &cancel)
+                            .map_err(|_| "owner-preparation-cancel")?;
+                    }
+                }
+                Event::NeverStarted { reply } => {
+                    if !skips_success
+                        || reply != 1
+                        || skipped != 0
+                        || !connection.can_admit_text(&scope)
+                    {
+                        return Err("owner-false-unsent");
+                    }
+                    let row = associations
+                        .0
+                        .lock()
+                        .map_err(|_| "owner-store-lock")?
+                        .records
+                        .get("synthetic-page")
+                        .cloned()
+                        .ok_or("owner-skip-row")?;
+                    if row.dispatch != (durable::Dispatch::Skipped { reply: 1 })
+                        || row.thread_id.is_none()
+                            != matches!(scenario, Scenario::CancelBeforeActor)
+                    {
+                        return Err("owner-skip-proof");
+                    }
+                    skipped += 1;
+                    second = true;
+                    connection
+                        .start_text(&scope, request(2, false), &cancel)
+                        .map_err(|_| "owner-after-unsent")?;
                 }
                 Event::Conversation(conversation::Event::TurnStarted { .. })
                     if matches!(scenario, Scenario::Cancel) && !cancellation =>
@@ -344,15 +478,21 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
                 Event::Conversation(conversation::Event::Terminal(result)) => {
                     terminals += 1;
                     let expected = match scenario {
-                        Scenario::TwoTurns | Scenario::ColdRestore => {
-                            conversation::Outcome::Completed
-                        }
+                        Scenario::TwoTurns
+                        | Scenario::ColdRestore
+                        | Scenario::CancelBeforeActor
+                        | Scenario::CancelDuringPreparation
+                        | Scenario::CancelBeforeTurn
+                        | Scenario::CancelBeforeWrite => conversation::Outcome::Completed,
                         Scenario::Cancel => conversation::Outcome::Interrupted,
                         Scenario::Invalidate => conversation::Outcome::Unknown,
-                        Scenario::CancelBeforeTurn
-                        | Scenario::RevisionBeforeWrite
+                        Scenario::RevisionBeforeWrite
                         | Scenario::LostSettleAck
-                        | Scenario::LostStartAck => return Err("owner-unexpected-terminal"),
+                        | Scenario::LostStartAck
+                        | Scenario::LostBindAck
+                        | Scenario::LostBeginAck
+                        | Scenario::LostSkipAck
+                        | Scenario::LostPreparationAck => return Err("owner-unexpected-terminal"),
                     };
                     if result.outcome != expected || result.thread_id != "synthetic-owned-thread" {
                         return Err("owner-terminal");
@@ -360,17 +500,17 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
                     if matches!(scenario, Scenario::Cancel) && !result.cancel_requested {
                         return Err("owner-cancel-intent");
                     }
-                    if matches!(scenario, Scenario::ColdRestore)
+                    if (matches!(scenario, Scenario::ColdRestore) || skips_success)
                         && result.final_response() != Some("synthetic second answer")
                     {
                         return Err("owner-cold-text");
                     }
                     if matches!(scenario, Scenario::TwoTurns)
                         && result.final_response()
-                            != Some(if terminals == 1 {
-                                "synthetic first answer"
-                            } else {
-                                "synthetic second answer"
+                            != Some(match terminals {
+                                1 => "synthetic first answer",
+                                2 => "synthetic second answer",
+                                _ => "synthetic third answer",
                             })
                     {
                         return Err("owner-terminal-text");
@@ -387,9 +527,19 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
                             return Err("owner-intervening-history");
                         }
                         second = true;
+                        let mut next = request(2, false);
+                        next.effort = EffortSelection::Explicit(crate::catalog::Effort::None);
                         connection
-                            .start_text(&scope, request(2, false), &cancel)
+                            .start_text(&scope, next, &cancel)
                             .map_err(|_| "owner-second")?;
+                    } else if matches!(scenario, Scenario::TwoTurns) && closed == 2 && !third {
+                        third = true;
+                        let mut next = request(3, false);
+                        next.previous_reply = Some(2);
+                        next.effort = EffortSelection::Default;
+                        connection
+                            .start_text(&scope, next, &cancel)
+                            .map_err(|_| "owner-third")?;
                     }
                 }
                 Event::HistoryUncertain(result)
@@ -409,6 +559,7 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
         }
         if guarded_failure {
             if terminals != 0
+                || skipped != 0
                 || (matches!(scenario, Scenario::LostSettleAck | Scenario::LostStartAck)
                     && !history_uncertain)
                 || connection.start_text(&scope, request(2, false), &cancel) != Err(Fault::Closed)
@@ -427,10 +578,19 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
             drop(connection);
             break;
         }
-        if (matches!(scenario, Scenario::TwoTurns) && closed == 2)
+        if (skips_success
+            && skipped == 1
+            && terminals == 1
+            && closed
+                == if matches!(scenario, Scenario::CancelBeforeActor) {
+                    1
+                } else {
+                    2
+                })
+            || (matches!(scenario, Scenario::TwoTurns) && closed == 3)
             || (matches!(scenario, Scenario::Cancel | Scenario::ColdRestore) && closed == 1)
         {
-            if (matches!(scenario, Scenario::TwoTurns) && (terminals != 2 || !retried))
+            if (matches!(scenario, Scenario::TwoTurns) && (terminals != 3 || !retried || !third))
                 || (matches!(scenario, Scenario::Cancel | Scenario::ColdRestore) && terminals != 1)
             {
                 return Err("owner-counts");
@@ -440,31 +600,49 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    let record = associations
-        .0
-        .lock()
-        .map_err(|_| "owner-store-lock")?
-        .records
-        .get("synthetic-page")
-        .cloned()
-        .ok_or("owner-store-record")?;
-    if matches!(scenario, Scenario::CancelBeforeTurn) {
-        if record.dispatch != durable::Dispatch::Ready {
-            return Err("owner-cancel-before-begin");
+    let state = associations.0.lock().map_err(|_| "owner-store-lock")?;
+    let record = state.records.get("synthetic-page");
+    if matches!(scenario, Scenario::LostPreparationAck) {
+        if record.is_some() || state.skip_calls != 0 {
+            return Err("owner-unknown-preparation");
         }
-    } else if matches!(
-        scenario,
-        Scenario::Invalidate
-            | Scenario::RevisionBeforeWrite
-            | Scenario::LostSettleAck
-            | Scenario::LostStartAck
-    ) {
-        if !matches!(record.dispatch, durable::Dispatch::Pending { .. }) {
-            return Err("owner-unknown-journal");
+    } else {
+        let record = record.ok_or("owner-store-record")?;
+        if matches!(scenario, Scenario::TwoTurns)
+            && (!matches!(record.dispatch, durable::Dispatch::Settled { reply: 3, .. })
+                || record.thread_id.as_deref() != Some("synthetic-owned-thread"))
+        {
+            return Err("owner-three-turn-history");
         }
-    } else if !matches!(record.dispatch, durable::Dispatch::Settled { .. }) {
-        return Err("owner-terminal-journal");
+        if matches!(scenario, Scenario::LostBindAck) {
+            if record.dispatch != durable::Dispatch::Ready || state.skip_calls != 0 {
+                return Err("owner-unknown-bind");
+            }
+        } else if matches!(scenario, Scenario::LostSkipAck) {
+            if record.dispatch != (durable::Dispatch::Skipped { reply: 1 }) || state.skip_calls != 1
+            {
+                return Err("owner-unknown-skip");
+            }
+        } else if matches!(
+            scenario,
+            Scenario::Invalidate
+                | Scenario::RevisionBeforeWrite
+                | Scenario::LostSettleAck
+                | Scenario::LostStartAck
+                | Scenario::LostBeginAck
+        ) {
+            if !matches!(record.dispatch, durable::Dispatch::Pending { .. })
+                || state.skip_calls != 0
+            {
+                return Err("owner-unknown-journal");
+            }
+        } else if !matches!(record.dispatch, durable::Dispatch::Settled { .. })
+            || (skips_success && state.skip_calls != 1)
+        {
+            return Err("owner-terminal-journal");
+        }
     }
+    drop(state);
     Arc::try_unwrap(runtime)
         .map_err(|_| "owner-runtime-retained")?
         .close()?;
@@ -472,6 +650,28 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
 }
 pub(crate) fn qualify() -> Result<(), &'static str> {
     for (scenario, marker) in [
+        (
+            Scenario::CancelBeforeActor,
+            "codex-owner-unsent-before-actor-continuity",
+        ),
+        (
+            Scenario::CancelDuringPreparation,
+            "codex-owner-unsent-preparation-continuity",
+        ),
+        (
+            Scenario::CancelBeforeWrite,
+            "codex-owner-unsent-writer-continuity",
+        ),
+        (Scenario::LostBindAck, "codex-owner-unsent-bind-ack-unknown"),
+        (
+            Scenario::LostBeginAck,
+            "codex-owner-unsent-begin-ack-unknown",
+        ),
+        (Scenario::LostSkipAck, "codex-owner-unsent-skip-ack-unknown"),
+        (
+            Scenario::LostPreparationAck,
+            "codex-owner-preparation-ack-unknown",
+        ),
         (Scenario::TwoTurns, "codex-owner-two-turns-cold-resume"),
         (
             Scenario::ColdRestore,

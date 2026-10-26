@@ -227,7 +227,7 @@ fn persistent_profile(image: Arc<PinnedImage>) -> Result<(), &'static str> {
                 key,
                 new_conversation: true,
                 model: "synthetic-model".into(),
-                effort: crate::catalog::Effort::High,
+                effort: crate::catalog::EffortSelection::Explicit(crate::catalog::Effort::High),
                 text: "synthetic never sent".into(),
             },
             &cancel,

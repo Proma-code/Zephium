@@ -1,7 +1,7 @@
 //! Serialized, profile-bound barriers for original Codex thread continuity.
 use super::*;
 use zephium_core::codex_store::{
-    Association, Call, Dispatch, Fault, Reply, Scope, Terminal, MAX_ASSOCIATIONS,
+    Association, Call, Dispatch, Fault, MAX_ASSOCIATIONS, Reply, Scope, Terminal,
 };
 
 impl Hub {
@@ -76,19 +76,20 @@ fn read(conn: &Connection, conversation: &str) -> rusqlite::Result<Option<Associ
     conn.query_row("SELECT incarnation, grant_epoch, thread_id, revision, dispatch, reply, turn_id, outcome FROM codex_conversations WHERE conversation = ?1", [conversation], |row| {
         let incarnation: Vec<u8> = row.get(0)?;
         let epoch: i64 = row.get(1)?;
-        let thread_id: String = row.get(2)?;
+        let thread_id: Option<String> = row.get(2)?;
         let revision: i64 = row.get(3)?;
         let state: i64 = row.get(4)?;
         let reply: i64 = row.get(5)?;
         let turn: Option<String> = row.get(6)?;
         let outcome: Option<i64> = row.get(7)?;
         let scope = Scope {incarnation: incarnation.try_into().map_err(|_|rusqlite::Error::InvalidQuery)?,grant_epoch:u64::try_from(epoch).map_err(|_|rusqlite::Error::InvalidQuery)?};
-        if !scope.valid() || revision < 1 || !zephium_core::codex_store::valid_provider_id(&thread_id)
+        if !scope.valid() || revision < 1 || thread_id.as_ref().is_some_and(|id| !zephium_core::codex_store::valid_provider_id(id))
             || turn.as_ref().is_some_and(|id| !zephium_core::codex_store::valid_provider_id(id)) { return Err(rusqlite::Error::InvalidQuery); }
         let dispatch = match (state, reply, turn, outcome) {
-            (0,0,None,None) => Dispatch::Ready,
-            (1,reply,turn_id,None) if reply > 0 => Dispatch::Pending {reply:reply as u64,turn_id},
-            (2,reply,Some(turn_id),Some(outcome)) if reply > 0 => Dispatch::Settled {reply:reply as u64,turn_id,outcome:match outcome {1=>Terminal::Completed,2=>Terminal::Interrupted,3=>Terminal::Failed,_=>return Err(rusqlite::Error::InvalidQuery)}},
+            (0,0,None,None) if thread_id.is_some() => Dispatch::Ready,
+            (1,reply,turn_id,None) if reply > 0 && thread_id.is_some() => Dispatch::Pending {reply:reply as u64,turn_id},
+            (2,reply,Some(turn_id),Some(outcome)) if reply > 0 && thread_id.is_some() => Dispatch::Settled {reply:reply as u64,turn_id,outcome:match outcome {1=>Terminal::Completed,2=>Terminal::Interrupted,3=>Terminal::Failed,_=>return Err(rusqlite::Error::InvalidQuery)}},
+            (3,reply,None,None) if reply > 0 => Dispatch::Skipped {reply:reply as u64},
             _=>return Err(rusqlite::Error::InvalidQuery),
         };
         Ok(Association {scope,conversation:conversation.into(),thread_id,revision:revision as u64,dispatch})
@@ -97,6 +98,7 @@ fn read(conn: &Connection, conversation: &str) -> rusqlite::Result<Option<Associ
 fn put(conn: &Connection, value: &Association) -> rusqlite::Result<()> {
     let (state, reply, turn, outcome) = match &value.dispatch {
         Dispatch::Ready => (0, 0, None, None),
+        Dispatch::Skipped { reply } => (3, *reply as i64, None, None),
         Dispatch::Pending { reply, turn_id } => (1, *reply as i64, turn_id.as_deref(), None),
         Dispatch::Settled {
             reply,
@@ -113,8 +115,16 @@ fn put(conn: &Connection, value: &Association) -> rusqlite::Result<()> {
             }),
         ),
     };
-    conn.execute("INSERT INTO codex_conversations(conversation,incarnation,grant_epoch,thread_id,revision,dispatch,reply,turn_id,outcome) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(conversation) DO UPDATE SET revision=excluded.revision,dispatch=excluded.dispatch,reply=excluded.reply,turn_id=excluded.turn_id,outcome=excluded.outcome", params![value.conversation,value.scope.incarnation.as_slice(),value.scope.grant_epoch as i64,value.thread_id,value.revision as i64,state,reply,turn,outcome])?;
+    conn.execute("INSERT INTO codex_conversations(conversation,incarnation,grant_epoch,thread_id,revision,dispatch,reply,turn_id,outcome) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(conversation) DO UPDATE SET thread_id=excluded.thread_id,revision=excluded.revision,dispatch=excluded.dispatch,reply=excluded.reply,turn_id=excluded.turn_id,outcome=excluded.outcome", params![value.conversation,value.scope.incarnation.as_slice(),value.scope.grant_epoch as i64,value.thread_id,value.revision as i64,state,reply,turn,outcome])?;
     Ok(())
+}
+fn has_room(conn: &Connection) -> rusqlite::Result<bool> {
+    let count: i64 =
+        conn.query_row("SELECT count(*) FROM codex_conversations", [], |r| r.get(0))?;
+    Ok(count < MAX_ASSOCIATIONS as i64)
+}
+fn next_revision(revision: u64) -> Option<u64> {
+    revision.checked_add(1).filter(|v| *v <= i64::MAX as u64)
 }
 fn execute(conn: &Connection, call: Call) -> rusqlite::Result<Reply> {
     if let Call::History { conversation } = &call {
@@ -154,6 +164,7 @@ fn execute(conn: &Connection, call: Call) -> rusqlite::Result<Reply> {
         Call::AdvanceGrant { expected } => *expected,
         Call::Load { scope, .. }
         | Call::Bind { scope, .. }
+        | Call::Skip { scope, .. }
         | Call::Begin { scope, .. }
         | Call::RecordTurn { scope, .. }
         | Call::Settle { scope, .. } => *scope,
@@ -188,6 +199,7 @@ fn execute(conn: &Connection, call: Call) -> rusqlite::Result<Reply> {
     let conversation = match &call {
         Call::Load { conversation, .. }
         | Call::Bind { conversation, .. }
+        | Call::Skip { conversation, .. }
         | Call::Begin { conversation, .. }
         | Call::RecordTurn { conversation, .. }
         | Call::Settle { conversation, .. } => conversation,
@@ -203,17 +215,10 @@ fn execute(conn: &Connection, call: Call) -> rusqlite::Result<Reply> {
     if let Call::Bind {
         conversation,
         thread_id,
+        expected_revision,
         ..
     } = call
     {
-        if existing.is_some() {
-            return failed(Fault::Conflict);
-        }
-        let count: i64 =
-            conn.query_row("SELECT count(*) FROM codex_conversations", [], |r| r.get(0))?;
-        if count >= MAX_ASSOCIATIONS as i64 {
-            return failed(Fault::Limit);
-        }
         let duplicate: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM codex_conversations WHERE thread_id=?1)",
             [&thread_id],
@@ -222,12 +227,82 @@ fn execute(conn: &Connection, call: Call) -> rusqlite::Result<Reply> {
         if duplicate {
             return failed(Fault::Conflict);
         }
-        let value = Association {
-            scope: current,
-            conversation,
-            thread_id,
-            revision: 1,
-            dispatch: Dispatch::Ready,
+        let value = match (existing, expected_revision) {
+            (None, None) => {
+                if !has_room(conn)? {
+                    return failed(Fault::Limit);
+                }
+                Association {
+                    scope: current,
+                    conversation,
+                    thread_id: Some(thread_id),
+                    revision: 1,
+                    dispatch: Dispatch::Ready,
+                }
+            }
+            (Some(mut value), Some(revision))
+                if value.revision == revision
+                    && value.thread_id.is_none()
+                    && matches!(value.dispatch, Dispatch::Skipped { .. }) =>
+            {
+                let Some(next) = next_revision(revision) else {
+                    return failed(Fault::Limit);
+                };
+                value.thread_id = Some(thread_id);
+                value.revision = next;
+                value
+            }
+            _ => return failed(Fault::Conflict),
+        };
+        put(conn, &value)?;
+        return Ok(Reply::Association(Some(value)));
+    }
+    if let Call::Skip {
+        conversation,
+        expected_revision,
+        reply,
+        ..
+    } = call
+    {
+        let value = match (existing, expected_revision) {
+            (None, None) => {
+                if !has_room(conn)? {
+                    return failed(Fault::Limit);
+                }
+                Association {
+                    scope: current,
+                    conversation,
+                    thread_id: None,
+                    revision: 1,
+                    dispatch: Dispatch::Skipped { reply },
+                }
+            }
+            (Some(mut value), Some(revision)) if value.revision == revision => {
+                let allowed = match value.dispatch {
+                    Dispatch::Ready => true,
+                    Dispatch::Settled {
+                        reply: previous, ..
+                    }
+                    | Dispatch::Skipped { reply: previous } => reply > previous,
+                    Dispatch::Pending {
+                        reply: pending,
+                        turn_id: None,
+                    } => reply == pending,
+                    Dispatch::Pending {
+                        turn_id: Some(_), ..
+                    } => false,
+                };
+                if !allowed {
+                    return failed(Fault::Conflict);
+                }
+                let Some(next) = next_revision(revision) else {
+                    return failed(Fault::Limit);
+                };
+                value.revision = next;
+                value.dispatch = Dispatch::Skipped { reply };
+                value
+            }
+            _ => return failed(Fault::Conflict),
         };
         put(conn, &value)?;
         return Ok(Reply::Association(Some(value)));
@@ -250,21 +325,26 @@ fn execute(conn: &Connection, call: Call) -> rusqlite::Result<Reply> {
     if value.revision != revision {
         return failed(Fault::Conflict);
     }
-    let Some(next_revision) = revision.checked_add(1).filter(|v| *v <= i64::MAX as u64) else {
+    let Some(next_revision) = next_revision(revision) else {
         return failed(Fault::Limit);
     };
     value.dispatch = match call {
         Call::Begin { reply, .. } => match value.dispatch {
-            Dispatch::Ready => Dispatch::Pending {
+            Dispatch::Ready if value.thread_id.is_some() => Dispatch::Pending {
                 reply,
                 turn_id: None,
             },
             Dispatch::Settled {
                 reply: previous, ..
-            } if reply > previous => Dispatch::Pending {
-                reply,
-                turn_id: None,
-            },
+            }
+            | Dispatch::Skipped { reply: previous }
+                if reply > previous && value.thread_id.is_some() =>
+            {
+                Dispatch::Pending {
+                    reply,
+                    turn_id: None,
+                }
+            }
             _ => return failed(Fault::Conflict),
         },
         Call::RecordTurn { reply, turn_id, .. } => match value.dispatch {

@@ -26,6 +26,12 @@ pub enum Terminal {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Dispatch {
     Ready,
+    /// The native owner consumed move-only proof that this exact attempt never
+    /// entered the original turn write. Not a completion or inferred cancel.
+    /// The visible reply remains recorded; no cancelled prompt is replayed.
+    Skipped {
+        reply: u64,
+    },
     /// Surviving this state on reopen is an uncertain prior dispatch, not
     /// permission to replay it. Only an original-runtime receipt may settle it.
     Pending {
@@ -43,7 +49,8 @@ pub enum Dispatch {
 pub struct Association {
     pub scope: Scope,
     pub conversation: String,
-    pub thread_id: String,
+    /// None only for Skipped before any original thread receipt exists.
+    pub thread_id: Option<String>,
     pub revision: u64,
     pub dispatch: Dispatch,
 }
@@ -70,10 +77,22 @@ pub enum Call {
         conversation: String,
     },
     /// Persist the original thread receipt before admitting its first turn.
+    /// None revision requires absence; Some fills only exact SkippedNone while
+    /// preserving its visible unsent reply. Existing threads never remap.
     Bind {
         scope: Scope,
         conversation: String,
         thread_id: String,
+        expected_revision: Option<u64>,
+    },
+    /// Only the native same-attempt NeverStarted proof permits this barrier.
+    /// Missing revision requires absence. Existing Pending requires the exact
+    /// same reply and no original turn ID; generic transport/cancel is not proof.
+    Skip {
+        scope: Scope,
+        conversation: String,
+        expected_revision: Option<u64>,
+        reply: u64,
     },
     /// Persist before handing a new turn to the original process. The revision
     /// and increasing Page reply prevent a duplicate/replayed write.
@@ -115,7 +134,24 @@ impl Call {
                 scope,
                 conversation,
                 thread_id,
-            } => scope.valid() && valid_conversation(conversation) && valid_provider_id(thread_id),
+                expected_revision,
+            } => {
+                scope.valid()
+                    && valid_conversation(conversation)
+                    && valid_provider_id(thread_id)
+                    && expected_revision.is_none_or(number)
+            }
+            Self::Skip {
+                scope,
+                conversation,
+                expected_revision,
+                reply,
+            } => {
+                scope.valid()
+                    && valid_conversation(conversation)
+                    && expected_revision.is_none_or(number)
+                    && number(*reply)
+            }
             Self::Begin {
                 scope,
                 conversation,
@@ -198,33 +234,78 @@ mod tests {
             incarnation: [1; 16],
             grant_epoch: 1,
         };
-        assert!(Call::Bind {
-            scope,
-            conversation: "page-1".into(),
-            thread_id: "thread-1".into()
-        }
-        .valid());
-        assert!(!Call::Open {
-            incarnation: [0; 16]
-        }
-        .valid());
-        assert!(!Call::AdvanceGrant {
-            expected: Scope {
-                grant_epoch: 0,
-                ..scope
+        assert!(
+            Call::Bind {
+                scope,
+                conversation: "page-1".into(),
+                thread_id: "thread-1".into(),
+                expected_revision: None
             }
-        }
-        .valid());
-        assert!(!Call::Begin {
-            scope,
-            conversation: "page-1".into(),
-            expected_revision: 1,
-            reply: 0
-        }
-        .valid());
+            .valid()
+        );
+        assert!(
+            !Call::Open {
+                incarnation: [0; 16]
+            }
+            .valid()
+        );
+        assert!(
+            !Call::AdvanceGrant {
+                expected: Scope {
+                    grant_epoch: 0,
+                    ..scope
+                }
+            }
+            .valid()
+        );
+        assert!(
+            !Call::Begin {
+                scope,
+                conversation: "page-1".into(),
+                expected_revision: 1,
+                reply: 0
+            }
+            .valid()
+        );
         for id in ["", "../thread", "thread\n", "thread other"] {
             assert!(!valid_provider_id(id));
         }
         assert!(valid_provider_id("01234567-abcd_1234"));
+        for revision in [None, Some(1)] {
+            assert!(
+                Call::Skip {
+                    scope,
+                    conversation: "page-1".into(),
+                    expected_revision: revision,
+                    reply: 2
+                }
+                .valid()
+            );
+        }
+        for (revision, reply) in [
+            (Some(0), 2),
+            (None, 0),
+            (Some(u64::MAX), 2),
+            (None, u64::MAX),
+        ] {
+            assert!(
+                !Call::Skip {
+                    scope,
+                    conversation: "page-1".into(),
+                    expected_revision: revision,
+                    reply
+                }
+                .valid()
+            );
+        }
+        assert!(
+            !Call::Bind {
+                scope,
+                conversation: "page-1".into(),
+                thread_id: "original".into(),
+                expected_revision: Some(0)
+            }
+            .valid()
+        );
     }
 }

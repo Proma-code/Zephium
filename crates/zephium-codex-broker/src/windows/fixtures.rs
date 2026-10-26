@@ -39,6 +39,20 @@ pub(super) enum Mode {
     OwnerLostSettleAck,
     #[cfg(feature = "native-fixtures")]
     OwnerLostStartAck,
+    #[cfg(feature = "native-fixtures")]
+    OwnerCancelBeforeActor,
+    #[cfg(feature = "native-fixtures")]
+    OwnerCancelDuringPreparation,
+    #[cfg(feature = "native-fixtures")]
+    OwnerCancelBeforeWrite,
+    #[cfg(feature = "native-fixtures")]
+    OwnerLostBindAck,
+    #[cfg(feature = "native-fixtures")]
+    OwnerLostBeginAck,
+    #[cfg(feature = "native-fixtures")]
+    OwnerLostSkipAck,
+    #[cfg(feature = "native-fixtures")]
+    OwnerLostPreparationAck,
 }
 impl Mode {
     pub(super) fn args(self) -> &'static [&'static str] {
@@ -63,6 +77,22 @@ impl Mode {
             Self::OwnerLostSettleAck => &["transport-child", "owner-lost-settle-ack"],
             #[cfg(feature = "native-fixtures")]
             Self::OwnerLostStartAck => &["transport-child", "owner-lost-start-ack"],
+            #[cfg(feature = "native-fixtures")]
+            Self::OwnerCancelBeforeActor => &["transport-child", "owner-cancel-before-actor"],
+            #[cfg(feature = "native-fixtures")]
+            Self::OwnerCancelDuringPreparation => {
+                &["transport-child", "owner-cancel-during-preparation"]
+            }
+            #[cfg(feature = "native-fixtures")]
+            Self::OwnerCancelBeforeWrite => &["transport-child", "owner-cancel-before-write"],
+            #[cfg(feature = "native-fixtures")]
+            Self::OwnerLostBindAck => &["transport-child", "owner-lost-bind-ack"],
+            #[cfg(feature = "native-fixtures")]
+            Self::OwnerLostBeginAck => &["transport-child", "owner-lost-begin-ack"],
+            #[cfg(feature = "native-fixtures")]
+            Self::OwnerLostSkipAck => &["transport-child", "owner-lost-skip-ack"],
+            #[cfg(feature = "native-fixtures")]
+            Self::OwnerLostPreparationAck => &["transport-child", "owner-lost-preparation-ack"],
         }
     }
 }
@@ -333,7 +363,14 @@ pub(crate) fn child(mode: &str) -> Result<(), &'static str> {
         | "owner-cancel-before-turn"
         | "owner-revision-before-write"
         | "owner-lost-settle-ack"
-        | "owner-lost-start-ack") => {
+        | "owner-lost-start-ack"
+        | "owner-cancel-before-actor"
+        | "owner-cancel-during-preparation"
+        | "owner-cancel-before-write"
+        | "owner-lost-bind-ack"
+        | "owner-lost-begin-ack"
+        | "owner-lost-skip-ack"
+        | "owner-lost-preparation-ack") => {
             let scenario =
                 crate::connection::fixture_peer::Scenario::parse(mode).ok_or("helper-mode")?;
             crate::connection::fixture_peer::child(scenario)?;
@@ -358,6 +395,13 @@ pub(crate) fn owner_session(
             Scenario::RevisionBeforeWrite => Mode::OwnerRevisionBeforeWrite,
             Scenario::LostSettleAck => Mode::OwnerLostSettleAck,
             Scenario::LostStartAck => Mode::OwnerLostStartAck,
+            Scenario::CancelBeforeActor => Mode::OwnerCancelBeforeActor,
+            Scenario::CancelDuringPreparation => Mode::OwnerCancelDuringPreparation,
+            Scenario::CancelBeforeWrite => Mode::OwnerCancelBeforeWrite,
+            Scenario::LostBindAck => Mode::OwnerLostBindAck,
+            Scenario::LostBeginAck => Mode::OwnerLostBeginAck,
+            Scenario::LostSkipAck => Mode::OwnerLostSkipAck,
+            Scenario::LostPreparationAck => Mode::OwnerLostPreparationAck,
         },
         RuntimePaths::fresh_managed()?,
     )

@@ -1,7 +1,7 @@
 //! Serialized native owner of one original app-server connection. No generic
 //! RPC endpoint, provider thread ID adoption, credential export or automatic retry.
 use crate::{
-    catalog::{Catalog, CatalogBuilder, Effort, ModelChoice},
+    catalog::{Catalog, CatalogBuilder, EffortSelection, ModelChoice},
     compatibility::{self, ConfigProjection},
     conversation::{self, Command, Conversation, Phase, Scope},
     discovery,
@@ -14,7 +14,7 @@ use crate::{
     },
     protocol,
     text_policy::{self, PreparedText},
-    windows::{self, Session},
+    windows::{self, Session, TurnHistory, TurnIntent, TurnOperation},
     wire, RuntimePaths,
 };
 use serde_json::Value;
@@ -41,6 +41,7 @@ const SESSION: Duration = Duration::from_secs(4 * 60 * 60);
 const CLOSE: Duration = Duration::from_secs(30);
 const MAX_CONVERSATIONS: usize = 64;
 const MAX_POLL_FRAMES: usize = 32;
+const MAX_NOTIFICATION_FRAMES: usize = 100_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Fault {
@@ -105,10 +106,13 @@ impl TextAdmission {
             self.expected_revision,
         )
     }
-    fn check(&self) -> Result<(), Fault> {
-        if self.call_cancel.load(Ordering::Acquire) {
-            return Err(Fault::Cancelled);
-        }
+    fn preparation_fence(&self) -> windows::WriteFence {
+        windows::WriteFence::preparation(self.account_revision.clone(), self.expected_revision)
+    }
+    fn cancelled(&self) -> bool {
+        self.call_cancel.load(Ordering::Acquire)
+    }
+    fn check_scope(&self) -> Result<(), Fault> {
         if self.account_revision.load(Ordering::Acquire) != self.expected_revision {
             return Err(Fault::ScopeChanged);
         }
@@ -123,7 +127,7 @@ pub struct TextRequest {
     pub key: ConversationKey,
     pub new_conversation: bool,
     pub model: String,
-    pub effort: Effort,
+    pub effort: EffortSelection,
     pub text: String,
 }
 pub enum Event {
@@ -133,6 +137,10 @@ pub enum Event {
     Conversation(conversation::Event),
     /// Original terminal is known, but durable continuation acknowledgement is not.
     HistoryUncertain(conversation::TurnResult),
+    /// No model-frame handoff, exact durable Skip, and all preparation closed.
+    NeverStarted {
+        reply: u64,
+    },
 }
 pub struct ScopedEvent {
     scope: Scope,
@@ -160,6 +168,10 @@ struct Pending {
     deadline: Instant,
 }
 struct Prompt {
+    operation: TurnOperation,
+    intent: Option<TurnIntent>,
+    unsent: Option<windows::MatchedUnsent>,
+    acknowledged_revision: Option<u64>,
     admission: TextAdmission,
     reply: u64,
     key: ConversationKey,
@@ -197,6 +209,10 @@ pub struct Connection {
     account_deadline: Option<Instant>,
     closing_deadline: Option<Instant>,
     failure_events: Vec<ScopedEvent>,
+    ready_events: Vec<ScopedEvent>,
+    advisory_join: crate::notification_scope::AdvisoryJoin,
+    settled_turns: BTreeMap<ConversationKey, (String, String)>,
+    notification_frames: usize,
 }
 /// A native-held authenticated image that passed the exact production semantic
 /// startup policy in a fresh signed-out disposable home. No account home was open.
@@ -354,6 +370,10 @@ impl Connection {
             account_deadline: None,
             closing_deadline: None,
             failure_events: Vec::new(),
+            ready_events: Vec::new(),
+            advisory_join: crate::notification_scope::AdvisoryJoin::default(),
+            settled_turns: BTreeMap::new(),
+            notification_frames: 0,
         };
         connection.read_account(&scope, cancel)?;
         Ok(connection)
@@ -371,6 +391,14 @@ impl Connection {
     }
     pub fn is_closed(&self) -> bool {
         self.session.is_none()
+    }
+    /// Observational readiness only. The native Page reservation and final
+    /// writer admission still bind the exact scope/account/turn independently.
+    pub fn can_admit_text(&self, scope: &Scope) -> bool {
+        self.current(scope).is_ok()
+            && self.state() == AccountState::ChatGpt
+            && self.catalog.is_some()
+            && self.idle().is_ok()
     }
     fn current(&self, scope: &Scope) -> Result<(), Fault> {
         if *scope != self.scope {
@@ -533,6 +561,8 @@ impl Connection {
                     self.association_scope = updated;
                     self.conversations.clear();
                     self.records.clear();
+                    self.settled_turns.clear();
+                    self.advisory_join = crate::notification_scope::AdvisoryJoin::default();
                 }
                 let fence = if message.get("method").and_then(Value::as_str)
                     == Some("account/login/start")
@@ -592,7 +622,10 @@ impl Connection {
             effort,
             text,
         } = request;
-        admission.check()?;
+        // A queued per-call Stop still reaches current grant/history validation.
+        // It never bypasses scope, account, catalog or continuity admission.
+        admission.check_scope()?;
+        check(Instant::now() + RPC, cancel)?;
         self.current(scope)?;
         self.idle()?;
         if self.state() != AccountState::ChatGpt {
@@ -607,7 +640,6 @@ impl Connection {
         if reply == 0 || reply > i64::MAX as u64 {
             return Err(Fault::Policy);
         }
-        let prepared = text_policy::prepare_text(text).map_err(|_| Fault::UnsupportedText)?;
         let loaded = match self.associations.call(durable::Call::Load {
             scope: self.association_scope,
             conversation: key.0.clone(),
@@ -618,15 +650,16 @@ impl Connection {
         };
         if let Some(record) = loaded {
             self.validate_record(&key, &record)?;
-            if matches!(record.dispatch, durable::Dispatch::Pending { .. })
-                || matches!(record.dispatch,durable::Dispatch::Settled{reply:prior,..} if reply<=prior)
-            {
-                return Err(Fault::HistoryUncertain);
-            }
             let recorded_previous = match record.dispatch {
                 durable::Dispatch::Ready => None,
-                durable::Dispatch::Settled { reply, .. } => Some(reply),
-                durable::Dispatch::Pending { .. } => unreachable!("pending refused above"),
+                durable::Dispatch::Skipped { reply: prior }
+                | durable::Dispatch::Settled { reply: prior, .. } => {
+                    if reply <= prior {
+                        return Err(Fault::HistoryUncertain);
+                    }
+                    Some(prior)
+                }
+                durable::Dispatch::Pending { .. } => return Err(Fault::HistoryUncertain),
             };
             if previous_reply != recorded_previous {
                 return Err(Fault::HistoryDiverged);
@@ -638,11 +671,16 @@ impl Connection {
                 if self.conversations.len() >= MAX_CONVERSATIONS {
                     return Err(Fault::Limit);
                 }
-                let restored =
-                    Conversation::from_cold_store(self.scope.clone(), record.thread_id.clone())
-                        .map_err(conversation_fault)?;
+                let restored = match &record.thread_id {
+                    Some(thread) => {
+                        Conversation::from_cold_store(self.scope.clone(), thread.clone())
+                            .map_err(conversation_fault)?
+                    }
+                    None => Conversation::new(self.scope.clone()),
+                };
                 self.conversations.insert(key.clone(), restored);
             }
+            self.remember_settled(&key, &record);
             self.records.insert(key.clone(), record);
         } else {
             if previous_reply.is_some() {
@@ -664,8 +702,37 @@ impl Connection {
         if !matches!(phase, Phase::New | Phase::Closed) {
             return Err(Fault::Busy);
         }
+        let acknowledged_revision = self.records.get(&key).map(|r| r.revision);
+        let operation = TurnOperation::new(
+            self.scope.clone(),
+            TurnHistory {
+                incarnation: self.association_scope.incarnation,
+                grant_epoch: self.association_scope.grant_epoch,
+                conversation: key.0.clone(),
+                reply,
+                previous_reply,
+                expected_revision: acknowledged_revision,
+                thread_id: self.records.get(&key).and_then(|r| r.thread_id.clone()),
+            },
+            choice.model(),
+            choice.selection(),
+            &text,
+        )
+        .ok_or(Fault::Policy)?;
+        let prepared = text_policy::prepare_text(text).map_err(|_| Fault::UnsupportedText)?;
+        let intent = self
+            .session
+            .as_mut()
+            .ok_or(Fault::Closed)?
+            .reserve_turn(operation.clone())
+            .map_err(transport)?;
         let now = Instant::now();
+        self.notification_frames = 0;
         self.prompt = Some(Prompt {
+            operation,
+            intent: Some(intent),
+            unsent: None,
+            acknowledged_revision,
             admission,
             reply,
             key: key.clone(),
@@ -678,8 +745,23 @@ impl Connection {
         self.active = Some(key);
         self.open_prompt(cancel)
     }
+    fn check_prompt_scope(&mut self, cancel: &AtomicBool) -> Result<(), Fault> {
+        let prompt = self.prompt.as_ref().ok_or(Fault::Protocol)?;
+        check(prompt.deadline, cancel)
+            .and_then(|()| prompt.admission.check_scope())
+            .or_else(|f| self.fail(f))
+    }
+    fn prompt_cancelled(&self) -> bool {
+        self.prompt
+            .as_ref()
+            .is_some_and(|p| p.admission.cancelled())
+    }
     fn open_prompt(&mut self, cancel: &AtomicBool) -> Result<(), Fault> {
-        self.check_prompt(cancel)?;
+        self.check_prompt_scope(cancel)?;
+        if self.prompt_cancelled() {
+            self.reject_local_intent()?;
+            return self.finish_unsent();
+        }
         let id = self.id()?;
         let prompt = self.prompt.as_ref().ok_or(Fault::Protocol)?;
         let conversation = self
@@ -694,6 +776,67 @@ impl Connection {
         .map_err(conversation_fault)?;
         self.send_command(command, prompt.open_deadline, cancel)
     }
+    fn reject_local_intent(&mut self) -> Result<(), Fault> {
+        let prompt = self.prompt.as_mut().ok_or(Fault::Protocol)?;
+        if prompt.unsent.is_some() {
+            return Ok(());
+        }
+        let intent = prompt.intent.take().ok_or(Fault::Protocol)?;
+        let proof = self
+            .session
+            .as_ref()
+            .ok_or(Fault::Closed)?
+            .reject_intent(intent)
+            .ok_or(Fault::Protocol)?;
+        prompt.unsent = Some(proof.consume(&prompt.operation).ok_or(Fault::Protocol)?);
+        prompt.text = None;
+        Ok(())
+    }
+    fn finish_unsent(&mut self) -> Result<(), Fault> {
+        let prompt = self.prompt.as_ref().ok_or(Fault::Protocol)?;
+        let key = prompt.key.clone();
+        let reply = prompt.reply;
+        if !prompt
+            .unsent
+            .as_ref()
+            .is_some_and(|proof| proof.is_for(&prompt.operation))
+            || !matches!(
+                self.conversations.get(&key).ok_or(Fault::Protocol)?.phase(),
+                Phase::New | Phase::Closed
+            )
+            || self
+                .pending
+                .values()
+                .any(|p| matches!(p.kind, PendingKind::Conversation(_)))
+        {
+            return self.fail(Fault::Protocol);
+        }
+        let expected_revision = prompt.acknowledged_revision;
+        prompt.admission.check_scope().or_else(|f| self.fail(f))?;
+        if self.records.get(&key).map(|r| r.revision) != expected_revision {
+            return self.fail(Fault::PersistenceUnavailable);
+        }
+        let _proof = self
+            .prompt
+            .as_mut()
+            .and_then(|p| p.unsent.take())
+            .ok_or(Fault::Protocol)?;
+        self.persist(
+            &key,
+            durable::Call::Skip {
+                scope: self.association_scope,
+                conversation: key.0.clone(),
+                expected_revision,
+                reply,
+            },
+        )?;
+        self.prompt = None;
+        self.active = None;
+        self.closing_deadline = None;
+        self.ready_events
+            .push(self.event(Some(key), Event::NeverStarted { reply }));
+        Ok(())
+    }
     fn send_command(
         &mut self,
         command: Command,
@@ -701,77 +844,160 @@ impl Connection {
         cancel: &AtomicBool,
     ) -> Result<(), Fault> {
         let id = command_id(&command);
-        let admission_command = matches!(
+        let preparation = matches!(
             command,
-            Command::StartThread { .. } | Command::ResumeThread { .. } | Command::StartTurn { .. }
+            Command::StartThread { .. } | Command::ResumeThread { .. }
         );
-        if admission_command {
-            self.check_prompt(cancel)?;
+        if preparation {
+            self.check_prompt_scope(cancel)?;
         }
-        if matches!(command, Command::StartTurn { .. }) {
-            let prompt = self.prompt.as_ref().ok_or(Fault::Protocol)?;
+        if let Command::StartTurn { thread_id, .. } = &command {
+            self.check_prompt_scope(cancel)?;
+            if self.prompt_cancelled() {
+                self.reject_local_intent()?;
+                self.conversations
+                    .get_mut(self.active.as_ref().ok_or(Fault::Protocol)?)
+                    .ok_or(Fault::Protocol)?
+                    .abandon_unstarted(&self.scope, id)
+                    .map_err(conversation_fault)?;
+                self.closing_deadline = Some(Instant::now() + RPC);
+                return self.maybe_unsubscribe(cancel);
+            }
+            let prompt = self.prompt.as_mut().ok_or(Fault::Protocol)?;
+            let message = wire::command(
+                &command,
+                path(self.runtime.cwd())?,
+                &mut prompt.text,
+                self.projection,
+            )
+            .map_err(|_| Fault::Policy)?;
+            let intent = prompt.intent.take().ok_or(Fault::Protocol)?;
+            let turn = match intent.into_write(id, thread_id, message) {
+                Ok(turn) => turn,
+                Err(intent) => {
+                    prompt.intent = Some(intent);
+                    return self.fail(Fault::Policy);
+                }
+            };
             let key = prompt.key.clone();
             let reply = prompt.reply;
-            let record = self
-                .records
-                .get(&key)
+            let expected_revision = prompt
+                .acknowledged_revision
                 .ok_or(Fault::PersistenceUnavailable)?;
-            let call = durable::Call::Begin {
-                scope: self.association_scope,
-                conversation: key.0.clone(),
-                expected_revision: record.revision,
-                reply,
-            };
-            self.persist(&key, call)?;
-        }
-        let mut empty = None;
-        let prepared = self
-            .prompt
-            .as_mut()
-            .map(|p| &mut p.text)
-            .unwrap_or(&mut empty);
-        let message = wire::command(
-            &command,
-            path(self.runtime.cwd())?,
-            prepared,
-            self.projection,
-        )
-        .map_err(|_| Fault::Policy)?;
-        self.pending.insert(
-            id,
-            Pending {
-                kind: PendingKind::Conversation(command),
-                deadline,
-            },
-        );
-        let fence = if admission_command {
-            self.check_prompt(cancel)?;
-            Some(
-                self.prompt
-                    .as_ref()
-                    .ok_or(Fault::Protocol)?
-                    .admission
-                    .writer_fence(),
-            )
+            self.persist(
+                &key,
+                durable::Call::Begin {
+                    scope: self.association_scope,
+                    conversation: key.0.clone(),
+                    expected_revision,
+                    reply,
+                },
+            )?;
+            self.check_prompt_scope(cancel)?;
+            let fence = self
+                .prompt
+                .as_ref()
+                .ok_or(Fault::Protocol)?
+                .admission
+                .writer_fence();
+            self.pending.insert(
+                id,
+                Pending {
+                    kind: PendingKind::Conversation(command),
+                    deadline,
+                },
+            );
+            match self.session.as_mut().ok_or(Fault::Closed)?.send_turn_frame(
+                turn,
+                deadline.min(self.deadline),
+                cancel,
+                fence,
+            ) {
+                Ok(()) => Ok(()),
+                Err(failure) => {
+                    let fault = transport(failure.fault);
+                    let Some(proof) = failure.never_started else {
+                        return self.fail(fault);
+                    };
+                    let prompt = self.prompt.as_mut().ok_or(Fault::Protocol)?;
+                    if proof.wire_id() != Some(id) {
+                        return self.fail(Fault::Protocol);
+                    }
+                    prompt.unsent = Some(proof.consume(&prompt.operation).ok_or(Fault::Protocol)?);
+                    self.pending.remove(&id);
+                    self.conversations
+                        .get_mut(&key)
+                        .ok_or(Fault::Protocol)?
+                        .abandon_unstarted(&self.scope, id)
+                        .map_err(conversation_fault)?;
+                    // Scope retirement or transport teardown is not a cold-close
+                    // receipt. Only a healthy original owner may drain this path.
+                    self.check_prompt_scope(cancel)?;
+                    self.closing_deadline = Some(Instant::now() + RPC);
+                    self.maybe_unsubscribe(cancel)
+                }
+            }
         } else {
-            None
-        };
-        self.send_fenced(message, deadline, cancel, fence)
-    }
-    fn check_prompt(&mut self, cancel: &AtomicBool) -> Result<(), Fault> {
-        let prompt = self.prompt.as_ref().ok_or(Fault::Protocol)?;
-        check(prompt.deadline, cancel)
-            .and_then(|()| prompt.admission.check())
-            .or_else(|fault| self.fail(fault))
+            let mut empty = None;
+            let prepared = self
+                .prompt
+                .as_mut()
+                .map(|p| &mut p.text)
+                .unwrap_or(&mut empty);
+            let message = wire::command(
+                &command,
+                path(self.runtime.cwd())?,
+                prepared,
+                self.projection,
+            )
+            .map_err(|_| Fault::Policy)?;
+            self.pending.insert(
+                id,
+                Pending {
+                    kind: PendingKind::Conversation(command),
+                    deadline,
+                },
+            );
+            let fence = if preparation {
+                Some(
+                    self.prompt
+                        .as_ref()
+                        .ok_or(Fault::Protocol)?
+                        .admission
+                        .preparation_fence(),
+                )
+            } else {
+                None
+            };
+            self.send_fenced(message, deadline, cancel, fence)
+        }
     }
     pub fn cancel_turn(&mut self, scope: &Scope, cancel: &AtomicBool) -> Result<(), Fault> {
         self.current(scope)?;
         let key = self.active.clone().ok_or(Fault::Busy)?;
-        let conversation = self.conversations.get_mut(&key).ok_or(Fault::Protocol)?;
-        if matches!(conversation.phase(), Phase::Opening | Phase::Ready) {
-            return self.fail(Fault::Cancelled);
+        let Some(prompt) = self.prompt.as_mut() else {
+            return Ok(());
+        };
+        prompt.admission.call_cancel.store(true, Ordering::Release);
+        if prompt.unsent.is_some() {
+            return Ok(());
         }
-        let events = conversation.cancel(scope).map_err(conversation_fault)?;
+        if prompt.intent.is_some() {
+            let phase = self.conversations.get(&key).ok_or(Fault::Protocol)?.phase();
+            if matches!(phase, Phase::New | Phase::Closed) {
+                self.reject_local_intent()?;
+                return self.finish_unsent();
+            }
+            if matches!(phase, Phase::Opening | Phase::Ready) {
+                return Ok(());
+            }
+        }
+        let events = self
+            .conversations
+            .get_mut(&key)
+            .ok_or(Fault::Protocol)?
+            .cancel(scope)
+            .map_err(conversation_fault)?;
         self.conversation_effects(key, events, cancel, &mut Vec::new())
     }
     fn conversation_effects(
@@ -824,8 +1050,12 @@ impl Connection {
         for event in events {
             match &event {
                 conversation::Event::ThreadReady { thread_id, .. } => {
-                    if let Some(record) = self.records.get(&key) {
-                        if record.thread_id != *thread_id {
+                    if let Some(known) = self
+                        .records
+                        .get(&key)
+                        .and_then(|record| record.thread_id.as_ref())
+                    {
+                        if known != thread_id {
                             return self.fail(Fault::PersistenceUnavailable);
                         }
                     } else {
@@ -835,8 +1065,20 @@ impl Connection {
                                 scope: self.association_scope,
                                 conversation: key.0.clone(),
                                 thread_id: thread_id.clone(),
+                                expected_revision: self
+                                    .records
+                                    .get(&key)
+                                    .map(|record| record.revision),
                             },
                         )?;
+                    }
+                    self.check_prompt_scope(cancel)?;
+                    if self.prompt_cancelled() {
+                        self.reject_local_intent()?;
+                        self.closing_deadline = Some(Instant::now() + RPC);
+                        self.maybe_unsubscribe(cancel)?;
+                        out.push(self.event(Some(key.clone()), Event::Conversation(event)));
+                        continue;
                     }
                     let id = self.id()?;
                     let command = self
@@ -881,7 +1123,7 @@ impl Connection {
                         conversation::Outcome::Interrupted => durable::Terminal::Interrupted,
                         conversation::Outcome::Failed => durable::Terminal::Failed,
                         conversation::Outcome::Unknown => {
-                            return self.fail(Fault::HistoryUncertain)
+                            return self.fail(Fault::HistoryUncertain);
                         }
                     };
                     let record = self
@@ -910,9 +1152,14 @@ impl Connection {
                     self.closing_deadline = Some(Instant::now() + RPC);
                 }
                 conversation::Event::Closed { .. } => {
-                    self.active = None;
-                    self.prompt = None;
-                    self.closing_deadline = None;
+                    if self.prompt.as_ref().is_some_and(|p| p.unsent.is_some()) {
+                        self.finish_unsent()?;
+                        out.append(&mut self.ready_events);
+                    } else {
+                        self.active = None;
+                        self.prompt = None;
+                        self.closing_deadline = None;
+                    }
                 }
                 _ => {}
             }
@@ -952,7 +1199,7 @@ impl Connection {
     /// pipe backpressure and original notifications are not mistaken for state.
     pub fn poll(&mut self, scope: &Scope, cancel: &AtomicBool) -> Result<Vec<ScopedEvent>, Fault> {
         self.current(scope)?;
-        let mut observed = Vec::new();
+        let mut observed = std::mem::take(&mut self.ready_events);
         match self.poll_inner(cancel, &mut observed) {
             Ok(()) => Ok(observed),
             Err(fault) => {
@@ -961,7 +1208,9 @@ impl Connection {
                 observed.retain(|event| {
                     matches!(
                         event.event,
-                        Event::Conversation(_) | Event::HistoryUncertain(_)
+                        Event::Conversation(_)
+                            | Event::HistoryUncertain(_)
+                            | Event::NeverStarted { .. }
                     )
                 });
                 wire::preserve_observed(observed, &mut self.failure_events);
@@ -1021,6 +1270,7 @@ impl Connection {
                 }
             }
         }
+        out.append(&mut self.ready_events);
         Ok(())
     }
     fn reply(
@@ -1102,6 +1352,28 @@ impl Connection {
                     )
                     .map_err(|_| Fault::Policy)?;
                 }
+                match &command {
+                    Command::StartThread { .. } => self
+                        .advisory_join
+                        .thread_reply(
+                            result
+                                .pointer("/thread/id")
+                                .and_then(Value::as_str)
+                                .ok_or(Fault::Protocol)?,
+                        )
+                        .map_err(|()| Fault::Protocol)?,
+                    Command::StartTurn { thread_id, .. } => self
+                        .advisory_join
+                        .turn_reply(
+                            thread_id,
+                            result
+                                .pointer("/turn/id")
+                                .and_then(Value::as_str)
+                                .ok_or(Fault::Protocol)?,
+                        )
+                        .map_err(|()| Fault::Protocol)?,
+                    _ => (),
+                }
                 let events = self
                     .conversations
                     .get_mut(&key)
@@ -1120,42 +1392,98 @@ impl Connection {
         cancel: &AtomicBool,
         out: &mut Vec<ScopedEvent>,
     ) -> Result<(), Fault> {
-        let account = match method {
-            "account/updated" => Some(managed_account::Notification::AccountUpdated),
-            "account/login/completed" => Some(managed_account::Notification::LoginCompleted),
-            _ => None,
-        };
-        if let Some(notification) = account {
-            let event = self
-                .account
-                .notification(&self.scope, notification, params)
-                .map_err(|_| Fault::Protocol)?;
-            return self.account_effect(event, cancel, out);
+        use wire::NotificationClass;
+        self.notification_frames = self
+            .notification_frames
+            .checked_add(1)
+            .ok_or(Fault::Limit)?;
+        if self.notification_frames > MAX_NOTIFICATION_FRAMES {
+            return Err(Fault::Limit);
         }
-        if wire::advisory(method, &params).map_err(|_| Fault::Protocol)? {
-            return Ok(());
-        }
-        if method == "remoteControl/status/changed" {
-            return Err(Fault::Policy);
-        }
-        let known = matches!(
-            method,
-            "thread/started"
-                | "thread/status/changed"
-                | "thread/closed"
-                | "turn/started"
-                | "turn/completed"
-                | "item/agentMessage/delta"
-                | "item/started"
-                | "item/completed"
-                | "thread/tokenUsage/updated"
-                | "item/reasoning/summaryTextDelta"
-                | "item/reasoning/summaryPartAdded"
-                | "item/reasoning/textDelta"
-                | "error"
-        );
-        if !known {
-            return Err(Fault::UnsupportedAction);
+        let classified =
+            wire::classify_notification(method, &params).map_err(|fault| match fault {
+                wire::Fault::Unsupported => Fault::UnsupportedAction,
+                wire::Fault::Policy => Fault::Policy,
+                wire::Fault::Envelope => Fault::Protocol,
+            })?;
+        match classified {
+            NotificationClass::AccountInvalidation | NotificationClass::AccountLoginCompleted => {
+                let notification = if classified == NotificationClass::AccountInvalidation {
+                    managed_account::Notification::AccountUpdated
+                } else {
+                    managed_account::Notification::LoginCompleted
+                };
+                let event = self
+                    .account
+                    .notification(&self.scope, notification, params)
+                    .map_err(|_| Fault::Protocol)?;
+                return self.account_effect(event, cancel, out);
+            }
+            NotificationClass::RemoteAuthority => return Err(Fault::Policy),
+            NotificationClass::Informational(advisory) => {
+                // Inert metadata can arrive before its RPC reply or after a
+                // settled terminal. Join only to retained native ownership;
+                // it cannot create a thread, authenticate or finish a call.
+                let threads: Vec<_> = self
+                    .conversations
+                    .values()
+                    .filter_map(Conversation::thread_id)
+                    .collect();
+                let mut turns: Vec<_> = self
+                    .conversations
+                    .values()
+                    .filter_map(|conversation| {
+                        Some((conversation.thread_id()?, conversation.active_turn_id()?))
+                    })
+                    .collect();
+                turns.extend(
+                    self.settled_turns
+                        .values()
+                        .map(|(thread, turn)| (thread.as_str(), turn.as_str())),
+                );
+                let starting_thread = self.pending.values().any(|pending| {
+                    matches!(
+                        pending.kind,
+                        PendingKind::Conversation(Command::StartThread { .. })
+                    )
+                });
+                let starting_turn = self
+                    .pending
+                    .values()
+                    .find_map(|pending| match &pending.kind {
+                        PendingKind::Conversation(Command::StartTurn { thread_id, .. }) => {
+                            Some(thread_id.as_str())
+                        }
+                        _ => None,
+                    });
+                return self
+                    .advisory_join
+                    .accept(
+                        advisory.scope,
+                        &threads,
+                        &turns,
+                        starting_thread,
+                        starting_turn,
+                    )
+                    .map_err(|()| Fault::Protocol);
+            }
+            NotificationClass::ConversationUsage(wire::AdvisoryScope::Turn {
+                thread_id,
+                turn_id,
+            }) => {
+                // Original usage may trail its authoritative terminal, even
+                // after the next Begin replaced the durable row. Known-tail
+                // metadata is not new spend, a new turn or completion proof.
+                if self
+                    .settled_turns
+                    .values()
+                    .any(|(thread, turn)| thread == thread_id && turn == turn_id)
+                {
+                    return Ok(());
+                }
+            }
+            NotificationClass::ConversationUsage(_) => return Err(Fault::Protocol),
+            NotificationClass::Conversation => (),
         }
         let Some(key) = self.active.clone() else {
             return Err(Fault::Protocol);
@@ -1168,6 +1496,16 @@ impl Connection {
             .map_err(conversation_fault)?;
         self.conversation_effects(key, events, cancel, out)
     }
+    fn remember_settled(&mut self, key: &ConversationKey, record: &durable::Association) {
+        if let durable::Dispatch::Settled { turn_id, .. } = &record.dispatch {
+            // One last terminal per bounded owned conversation survives Begin
+            // replacing its Store row. Delayed inert tails are not new turns.
+            if let Some(thread) = &record.thread_id {
+                self.settled_turns
+                    .insert(key.clone(), (thread.clone(), turn_id.clone()));
+            }
+        }
+    }
     fn validate_record(
         &self,
         key: &ConversationKey,
@@ -1177,76 +1515,112 @@ impl Connection {
             || record.conversation != key.0
             || record.revision == 0
             || record.revision > i64::MAX as u64
-            || !durable::valid_provider_id(&record.thread_id)
+            || match &record.thread_id {
+                Some(thread) => !durable::valid_provider_id(thread),
+                None => !matches!(record.dispatch, durable::Dispatch::Skipped { .. }),
+            }
         {
             return Err(Fault::PersistenceUnavailable);
         }
         Ok(())
     }
     fn persist(&mut self, key: &ConversationKey, call: durable::Call) -> Result<(), Fault> {
-        let expected = call.clone();
-        let record = match self.associations.call(call) {
-            durable::Reply::Association(Some(value)) => value,
+        let previous = self.records.get(key).cloned();
+        let prior_revision = previous.as_ref().map(|r| r.revision);
+        if self
+            .prompt
+            .as_ref()
+            .is_some_and(|p| p.key == *key && p.acknowledged_revision != prior_revision)
+        {
+            return self.fail(Fault::PersistenceUnavailable);
+        }
+        let call_revision = match &call {
+            durable::Call::Bind {
+                expected_revision, ..
+            }
+            | durable::Call::Skip {
+                expected_revision, ..
+            } => *expected_revision,
+            durable::Call::Begin {
+                expected_revision, ..
+            }
+            | durable::Call::RecordTurn {
+                expected_revision, ..
+            }
+            | durable::Call::Settle {
+                expected_revision, ..
+            } => Some(*expected_revision),
             _ => return self.fail(Fault::PersistenceUnavailable),
         };
-        let exact = match expected {
-            durable::Call::Bind { thread_id, .. } => {
-                record.thread_id == thread_id
-                    && record.revision == 1
-                    && record.dispatch == durable::Dispatch::Ready
-            }
-            durable::Call::Begin {
-                expected_revision,
-                reply,
-                ..
-            } => {
-                Some(record.revision) == expected_revision.checked_add(1)
-                    && record.dispatch
+        if call_revision != prior_revision {
+            return self.fail(Fault::PersistenceUnavailable);
+        }
+        let expected = call.clone();
+        let record = match self.associations.call(call) {
+            durable::Reply::Association(Some(r)) => r,
+            _ => return self.fail(Fault::PersistenceUnavailable),
+        };
+        let next = prior_revision.unwrap_or(0).checked_add(1);
+        let exact = Some(record.revision) == next
+            && match expected {
+                durable::Call::Bind { thread_id, .. } => {
+                    record.thread_id.as_ref() == Some(&thread_id)
+                        && match &previous {
+                            None => record.dispatch == durable::Dispatch::Ready,
+                            Some(prior) => {
+                                prior.thread_id.is_none()
+                                    && matches!(prior.dispatch, durable::Dispatch::Skipped { .. })
+                                    && record.dispatch == prior.dispatch
+                            }
+                        }
+                }
+                durable::Call::Skip { reply, .. } => {
+                    record.thread_id == previous.as_ref().and_then(|p| p.thread_id.clone())
+                        && record.dispatch == durable::Dispatch::Skipped { reply }
+                }
+                durable::Call::Begin { reply, .. } => {
+                    record.dispatch
                         == durable::Dispatch::Pending {
                             reply,
                             turn_id: None,
                         }
-            }
-            durable::Call::RecordTurn {
-                expected_revision,
-                reply,
-                turn_id,
-                ..
-            } => {
-                Some(record.revision) == expected_revision.checked_add(1)
-                    && record.dispatch
+                }
+                durable::Call::RecordTurn { reply, turn_id, .. } => {
+                    record.dispatch
                         == durable::Dispatch::Pending {
                             reply,
                             turn_id: Some(turn_id),
                         }
-            }
-            durable::Call::Settle {
-                expected_revision,
-                reply,
-                turn_id,
-                outcome,
-                ..
-            } => {
-                Some(record.revision) == expected_revision.checked_add(1)
-                    && record.dispatch
+                }
+                durable::Call::Settle {
+                    reply,
+                    turn_id,
+                    outcome,
+                    ..
+                } => {
+                    record.dispatch
                         == durable::Dispatch::Settled {
                             reply,
                             turn_id,
                             outcome,
                         }
-            }
-            _ => false,
-        };
+                }
+                _ => false,
+            };
         if !exact || self.validate_record(key, &record).is_err() {
             return self.fail(Fault::PersistenceUnavailable);
         }
-        if self
-            .records
-            .get(key)
-            .is_some_and(|previous| previous.thread_id != record.thread_id)
+        if previous
+            .as_ref()
+            .and_then(|p| p.thread_id.as_ref())
+            .is_some_and(|thread| record.thread_id.as_ref() != Some(thread))
         {
             return self.fail(Fault::PersistenceUnavailable);
         }
+        if let Some(prompt) = self.prompt.as_mut().filter(|p| p.key == *key) {
+            prompt.acknowledged_revision = Some(record.revision);
+        }
+        self.remember_settled(key, &record);
         self.records.insert(key.clone(), record);
         Ok(())
     }
@@ -1520,6 +1894,17 @@ fn startup_receive(
         match frame.map_err(|_| Fault::Protocol)? {
             wire::Startup::RemoteDisabled => return Ok(None),
             wire::Startup::Reply(value) => return Ok(Some(value)),
+            wire::Startup::Informational(kind) => {
+                if !matches!(
+                    kind,
+                    wire::AdvisoryKind::RateLimits
+                        | wire::AdvisoryKind::Warning
+                        | wire::AdvisoryKind::Deprecation
+                        | wire::AdvisoryKind::SkillsChanged
+                ) {
+                    return Err(Fault::Protocol);
+                }
+            }
             wire::Startup::AccountInvalidation(params) => {
                 let event = account
                     .notification(scope, managed_account::Notification::AccountUpdated, params)

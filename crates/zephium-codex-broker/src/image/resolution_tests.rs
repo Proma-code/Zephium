@@ -115,8 +115,18 @@ fn native_visible_junction_resolves_to_held_identical_physical_file() {
     assert!(resolved.file.metadata().unwrap().is_file());
     drop(resolved);
     std::fs::write(&image, b"after-close").unwrap();
+    // Discovery admits a held non-executable candidate, not an authenticated
+    // runtime. The later whole-image provenance boundary must still refuse it.
+    let candidate = CliCandidate::open(&image).expect("held candidate shape");
+    let hashed = candidate
+        .hash(
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .expect("bounded candidate hash");
+    assert!(hashed.reference().is_none());
     assert!(matches!(
-        CliCandidate::open(&image),
+        hashed.admit_reference(),
         Err(ExistingImageFault::Unsupported)
     ));
     root.close().unwrap();

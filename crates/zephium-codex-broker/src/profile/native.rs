@@ -166,7 +166,7 @@ impl ProfileLease {
             }
             Err(error) => return Err(io_failure(IoStage::RootMetadata, error)),
         };
-        let root_hold = hold_directory(&root, owner)?;
+        let root_hold = hold_metadata_directory(&root, owner)?;
         let mut lock = if fresh {
             create_file(&root.join("lease"), owner, 0)?
         } else {
@@ -207,7 +207,11 @@ impl ProfileLease {
             if fresh {
                 create_dir(&path, owner)?
             }
-            let held = hold_directory(&path, owner)?;
+            let held = if index == 0 {
+                hold_metadata_directory(&path, owner)?
+            } else {
+                hold_directory(&path, owner)?
+            };
             nodes[index + 1] = identity(&held)?;
             pins.push(held);
         }
@@ -682,6 +686,25 @@ fn hold_directory(path: &Path, owner: &str) -> Result<File, Error> {
     verify_security(&file, owner, true)?;
     Ok(file)
 }
+// Only the two native-owned metadata parents need child-entry mutation: the
+// profile root (registration) and codex-home (config). READ desired access and
+// protected owner/DACL/no-reparse admission are unchanged; sharing WRITE lets
+// Windows open the rename target directory for FILE_ADD_FILE. DELETE is still
+// denied, retaining directory identity. Ancestor/image and file pins stay strict.
+fn hold_metadata_directory(path: &Path, owner: &str) -> Result<File, Error> {
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .custom_flags(0x0220_0000)
+        .open(path)
+        .map_err(|_| Error::Invalid)?;
+    let meta = file.metadata().map_err(|_| Error::Invalid)?;
+    if !meta.is_dir() || meta.file_attributes() & 0x400 != 0 {
+        return Err(Error::Invalid);
+    }
+    verify_security(&file, owner, true)?;
+    Ok(file)
+}
 fn verify_file(file: &File, owner: &str) -> Result<(), Error> {
     let meta = file
         .metadata()
@@ -1016,92 +1039,145 @@ mod tests {
     }
     #[test]
     #[ignore = "owned Windows retained-handle rights differential; no account/provider calls"]
-    fn retained_metadata_handle_rename_preserves_identity_without_reopening_source() {
+    fn retained_metadata_rename_requires_mutable_owned_parent_and_preserves_identity() {
         use windows::Win32::Storage::FileSystem::{
             MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
         };
-        let parent = tempfile::tempdir().unwrap();
-        let profile = ProfileLease::fixture(parent.path(), id()).unwrap();
-        let owner = owner_sid().unwrap();
-        let home = profile.root.join("codex-home");
-        let source = home.join("guard-source");
-        let target = home.join("guard-target");
-        let old = b"owned-old-metadata";
-        let new = b"owned-new-metadata";
-        write_new(&source, &owner, new).unwrap();
-        write_new(&target, &owner, old).unwrap();
-        let target_before = open_read(&target).unwrap();
-        let old_target_id = identity(&target_before).unwrap();
-        drop(target_before);
-        let mut baseline = OpenOptions::new()
-            .access_mode(0x8001_0000)
-            .share_mode(5)
-            .custom_flags(0x0020_0000)
-            .open(&source)
-            .unwrap();
-        verify_file(&baseline, &owner).unwrap();
-        let expected = identity(&baseline).unwrap();
-        assert_eq!(read_bounded(&mut baseline, new.len()).unwrap(), new);
-        let source_wide = wide(source.as_os_str()).unwrap();
-        let target_wide = wide(target.as_os_str()).unwrap();
-        let move_exact = || unsafe {
-            MoveFileExW(
-                PCWSTR(source_wide.as_ptr()),
-                PCWSTR(target_wide.as_ptr()),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
-        let error = move_exact().expect_err("baseline DELETE guard must reproduce sharing refusal");
-        assert_eq!(error.code().0 as u32, 0x8007_0020);
-        assert_eq!(identity(&baseline).unwrap(), expected);
-        assert_eq!(read_bounded(&mut baseline, new.len()).unwrap(), new);
-        let mut unchanged_target = open_read(&target).unwrap();
-        assert_eq!(identity(&unchanged_target).unwrap(), old_target_id);
-        assert_eq!(read_bounded(&mut unchanged_target, old.len()).unwrap(), old);
-        drop(unchanged_target);
-        // Keep the identical verified READ|DELETE handle, directory/lease pins,
-        // desired access and shares. Only the rename API changes: it now acts
-        // on this source object rather than reopening the source pathname.
-        let mut candidate = baseline;
-        assert_eq!(
-            OpenOptions::new()
-                .write(true)
-                .share_mode(7)
+        // Exercise both exact production roles, not only the previously observed
+        // codex-home case. Every iteration starts with fresh owned metadata.
+        for role in 0u8..2 {
+            let parent = tempfile::tempdir().unwrap();
+            let mut profile = ProfileLease::fixture(parent.path(), id()).unwrap();
+            let owner = owner_sid().unwrap();
+            let (container, container_id) = if role == 0 {
+                (profile.root.join("codex-home"), profile.record.nodes[1])
+            } else {
+                (profile.root.clone(), profile.record.nodes[0])
+            };
+            let matches: Vec<_> = profile
+                ._pins
+                .iter()
+                .enumerate()
+                .filter_map(|(index, pin)| {
+                    (identity(pin).unwrap() == container_id).then_some(index)
+                })
+                .collect();
+            assert_eq!(matches.len(), 1);
+            let pin_index = matches[0];
+            let old_guard = hold_directory(&container, &owner).unwrap();
+            assert_eq!(identity(&old_guard).unwrap(), container_id);
+            drop(std::mem::replace(&mut profile._pins[pin_index], old_guard));
+            let delete_denied = || {
+                assert_eq!(
+                    OpenOptions::new()
+                        .access_mode(0x0001_0080)
+                        .share_mode(7)
+                        .custom_flags(0x0220_0000)
+                        .open(&container)
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(32)
+                )
+            };
+            delete_denied();
+            let source = container.join("guard-source");
+            let target = container.join("guard-target");
+            let old = b"owned-old-metadata";
+            let new = b"owned-new-metadata";
+            write_new(&source, &owner, new).unwrap();
+            write_new(&target, &owner, old).unwrap();
+            let old_target_id = identity(&open_read(&target).unwrap()).unwrap();
+            let mut candidate = OpenOptions::new()
+                .access_mode(0x8001_0000)
+                .share_mode(5)
+                .custom_flags(0x0020_0000)
                 .open(&source)
-                .unwrap_err()
-                .raw_os_error(),
-            Some(32)
-        );
-        rename_metadata(&candidate, &target).expect("same held source handle must rename exactly");
-        assert!(matches!(std::fs::symlink_metadata(&source), Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound));
-        assert_eq!(identity(&candidate).unwrap(), expected);
-        assert_eq!(read_bounded(&mut candidate, new.len()).unwrap(), new);
-        // This additional observer must share the DELETE authority still held
-        // by the source object; it still denies writers (same share READ|DELETE).
-        let mut final_target = OpenOptions::new()
-            .read(true)
-            .share_mode(5)
-            .custom_flags(0x0020_0000)
-            .open(&target)
-            .unwrap();
-        verify_file(&final_target, &owner).unwrap();
-        assert_eq!(identity(&final_target).unwrap(), expected);
-        assert_ne!(identity(&final_target).unwrap(), old_target_id);
-        assert_eq!(read_bounded(&mut final_target, new.len()).unwrap(), new);
-        assert_eq!(
-            OpenOptions::new()
-                .write(true)
-                .share_mode(7)
+                .unwrap();
+            verify_file(&candidate, &owner).unwrap();
+            let expected = identity(&candidate).unwrap();
+            assert_eq!(read_bounded(&mut candidate, new.len()).unwrap(), new);
+            let source_wide = wide(source.as_os_str()).unwrap();
+            let target_wide = wide(target.as_os_str()).unwrap();
+            let error = unsafe {
+                MoveFileExW(
+                    PCWSTR(source_wide.as_ptr()),
+                    PCWSTR(target_wide.as_ptr()),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            }
+            .expect_err("old parent guard must refuse pathname rename");
+            assert_eq!(error.code().0 as u32, 0x8007_0020);
+            LAST_NATIVE_FAILURE.set(None);
+            assert_eq!(rename_metadata(&candidate, &target), Err(Error::Io));
+            assert_eq!(LAST_NATIVE_FAILURE.get(), Some((23, 0x8007_0020)));
+            let mut unchanged = open_read(&target).unwrap();
+            assert_eq!(identity(&unchanged).unwrap(), old_target_id);
+            assert_eq!(read_bounded(&mut unchanged, old.len()).unwrap(), old);
+            drop(unchanged);
+            assert_eq!(identity(&candidate).unwrap(), expected);
+            assert_eq!(read_bounded(&mut candidate, new.len()).unwrap(), new);
+            let writer_denied = |path: &Path| {
+                assert_eq!(
+                    OpenOptions::new()
+                        .write(true)
+                        .share_mode(7)
+                        .open(path)
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(32)
+                )
+            };
+            writer_denied(&source);
+            // The verified replacement is held BEFORE the old pin is released.
+            // Only this exact containing directory changes sharing; desired
+            // access, all other pins, source object, ACL and lease stay held.
+            let replacement = hold_metadata_directory(&container, &owner).unwrap();
+            assert_eq!(identity(&replacement).unwrap(), container_id);
+            let retained: Vec<_> = profile
+                ._pins
+                .iter()
+                .map(|pin| identity(pin).unwrap())
+                .collect();
+            let lease_id = identity(&profile.lock.lock().unwrap()).unwrap();
+            drop(std::mem::replace(
+                &mut profile._pins[pin_index],
+                replacement,
+            ));
+            delete_denied();
+            rename_metadata(&candidate, &target)
+                .expect("mutable owned parent must allow held-object rename");
+            assert!(
+                matches!(std::fs::symlink_metadata(&source),Err(error) if error.kind()==std::io::ErrorKind::NotFound)
+            );
+            assert_eq!(identity(&candidate).unwrap(), expected);
+            assert_eq!(read_bounded(&mut candidate, new.len()).unwrap(), new);
+            let mut final_target = OpenOptions::new()
+                .read(true)
+                .share_mode(5)
+                .custom_flags(0x0020_0000)
                 .open(&target)
-                .unwrap_err()
-                .raw_os_error(),
-            Some(32)
-        );
-        drop(final_target);
-        drop(candidate);
-        drop(profile);
-        parent.close().unwrap();
+                .unwrap();
+            verify_file(&final_target, &owner).unwrap();
+            assert_eq!(identity(&final_target).unwrap(), expected);
+            assert_ne!(identity(&final_target).unwrap(), old_target_id);
+            assert_eq!(read_bounded(&mut final_target, new.len()).unwrap(), new);
+            writer_denied(&target);
+            delete_denied();
+            assert_eq!(
+                profile
+                    ._pins
+                    .iter()
+                    .map(|pin| identity(pin).unwrap())
+                    .collect::<Vec<_>>(),
+                retained
+            );
+            assert_eq!(identity(&profile.lock.lock().unwrap()).unwrap(), lease_id);
+            eprintln!("owned-metadata-parent-differential: role={role} baseline=32 candidate=0 identity=1 writer-denied=32 delete-denied=32");
+            drop(final_target);
+            drop(candidate);
+            drop(profile);
+            parent.close().unwrap();
+        }
     }
 }
 
@@ -1211,6 +1287,11 @@ mod directory_pin_diagnostic {
                 .collect();
             assert_eq!(matching.len(), 1);
             let home_index = matching[0];
+            // Reconstruct the exact original READ/shareREAD baseline independently
+            // of the current production policy, without dropping identity custody.
+            let baseline = hold_directory(&home, &owner).unwrap();
+            assert_eq!(identity(&baseline).unwrap(), home_id);
+            drop(std::mem::replace(&mut profile._pins[home_index], baseline));
             let other_ids: Vec<_> = profile
                 ._pins
                 .iter()
@@ -1243,12 +1324,7 @@ mod directory_pin_diagnostic {
             } else if case == 3 {
                 // Open and verify the new guard BEFORE releasing the old one.
                 // At no point can another handle acquire DELETE on this directory.
-                let replacement = OpenOptions::new()
-                    .read(true)
-                    .share_mode(3)
-                    .custom_flags(0x0220_0000)
-                    .open(&home)
-                    .unwrap();
+                let replacement = hold_metadata_directory(&home, &owner).unwrap();
                 verify_security(&replacement, &owner, true).unwrap();
                 assert_eq!(identity(&replacement).unwrap(), home_id);
                 drop(std::mem::replace(

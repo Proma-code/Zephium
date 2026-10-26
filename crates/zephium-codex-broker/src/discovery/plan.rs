@@ -207,6 +207,29 @@ mod tests {
         );
     }
     #[test]
+    fn exact_published_npm_metadata_matches_the_qualified_vendor_layout() {
+        // Actual official registry tarball package.json files, not synthesized
+        // package shapes. Provenance is recorded beside these fixtures. These
+        // remain locator hints; only the held complete EXE digest admits code.
+        assert_eq!(
+            root_package(include_bytes!("fixtures/npm-root-0.164.0.json")),
+            Ok("0.164.0".into())
+        );
+        assert_eq!(
+            platform_package(include_bytes!("fixtures/npm-win32-x64-0.164.0.json")),
+            Ok("0.164.0".into())
+        );
+        assert_eq!(
+            format!("package/{}", VENDOR_IMAGE.join("/")),
+            "package/vendor/x86_64-pc-windows-msvc/bin/codex.exe"
+        );
+        assert_eq!(crate::pin::ImageKind::Cli.bytes(), 354_558_768);
+        assert_eq!(
+            crate::pin::ImageKind::Cli.sha256(),
+            "6f267830b029ee25d9339864aa867cd45de9f8fd4c5ea007d2e63c13a0c66d36"
+        );
+    }
+    #[test]
     fn stable_future_version_is_only_a_fixed_origin_locator_hint() {
         for version in ["0.163.0", "0.165.0", "1.2.3"] {
             let mut value = root();
