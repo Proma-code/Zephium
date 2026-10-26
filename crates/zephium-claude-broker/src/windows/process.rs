@@ -576,8 +576,10 @@ fn read_available(
 }
 fn verify_token(process: HANDLE, capabilities: &SECURITY_CAPABILITIES) -> Result<(), &'static str> {
     let mut raw = HANDLE::default();
-    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut raw) }
-        .map_err(|_| "token inspection failed")?;
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut raw) }.map_err(|error| {
+        super::diagnostic("open-process-token", error.code().0);
+        "token inspection failed"
+    })?;
     let token = unsafe { OwnedHandle::from_raw_handle(raw.0) };
     for class in [TokenIsAppContainer, TokenIsLessPrivilegedAppContainer] {
         let mut value = 0u32;
@@ -591,8 +593,15 @@ fn verify_token(process: HANDLE, capabilities: &SECURITY_CAPABILITIES) -> Result
                 &mut length,
             )
         }
-        .map_err(|_| "LPAC token inspection failed")?;
+        .map_err(|error| {
+            super::diagnostic("token-information-class", class.0);
+            super::diagnostic("token-information-query", error.code().0);
+            "LPAC token inspection failed"
+        })?;
         if length != size_of::<u32>() as u32 || value != 1 {
+            super::diagnostic("token-information-class", class.0);
+            super::diagnostic("token-information-length", length as i32);
+            super::diagnostic("token-information-value", value as i32);
             return Err("LPAC token was not applied");
         }
     }
@@ -607,7 +616,10 @@ fn verify_token(process: HANDLE, capabilities: &SECURITY_CAPABILITIES) -> Result
             &mut length,
         )
     }
-    .map_err(|_| "LPAC identity unavailable")?;
+    .map_err(|error| {
+        super::diagnostic("token-appcontainer-sid-query", error.code().0);
+        "LPAC identity unavailable"
+    })?;
     if length < size_of::<TOKEN_APPCONTAINER_INFORMATION>() as u32
         || length as usize > size_of_val(&buffer)
     {
@@ -627,7 +639,10 @@ fn verify_token(process: HANDLE, capabilities: &SECURITY_CAPABILITIES) -> Result
             &mut length,
         )
     }
-    .map_err(|_| "LPAC capabilities unavailable")?;
+    .map_err(|error| {
+        super::diagnostic("token-capabilities-query", error.code().0);
+        "LPAC capabilities unavailable"
+    })?;
     if length < size_of::<TOKEN_GROUPS>() as u32 || length as usize > size_of_val(&buffer) {
         return Err("LPAC capabilities invalid");
     }

@@ -241,6 +241,9 @@ fn server(
                 Err(error) => panic!("fixture accept failed: {error}"),
             }
         };
+        // Windows inherits the listener's nonblocking mode on the accepted socket.
+        // The fixture's bounded blocking reads must not race the client's first write.
+        socket.set_nonblocking(false).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
