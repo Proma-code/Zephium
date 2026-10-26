@@ -5,7 +5,7 @@ use std::{
     ffi::OsStr,
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    mem::{size_of, size_of_val},
+    mem::{offset_of, size_of, size_of_val},
     os::windows::{
         ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt},
@@ -29,11 +29,10 @@ use windows::{
             TOKEN_QUERY, TOKEN_USER,
         },
         Storage::FileSystem::{
-            CreateDirectoryW, CreateFileW, FileDispositionInfo, FileIdInfo,
-            GetFileInformationByHandle, GetFileInformationByHandleEx, MoveFileExW,
-            SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, CREATE_NEW,
-            FILE_DISPOSITION_INFO, FILE_FLAGS_AND_ATTRIBUTES, FILE_ID_INFO, FILE_SHARE_MODE,
-            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+            CreateDirectoryW, CreateFileW, FileDispositionInfo, FileIdInfo, FileRenameInfo,
+            GetFileInformationByHandle, GetFileInformationByHandleEx, SetFileInformationByHandle,
+            BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_DISPOSITION_INFO,
+            FILE_FLAGS_AND_ATTRIBUTES, FILE_ID_INFO, FILE_RENAME_INFO, FILE_SHARE_MODE,
         },
         System::{
             Com::{CoCreateGuid, CoTaskMemFree},
@@ -83,13 +82,13 @@ enum IoStage {
     StageWrite = 13,
     StageSync = 14,
     StageReopen = 15,
-    MoveReplace = 16,
     ReadSeek = 17,
     ReadExact = 18,
     DirectoryCreate = 19,
     FileCreate = 20,
     ReadOpen = 21,
     VerifyMetadata = 22,
+    RenameByHandle = 23,
 }
 fn io_failure(stage: IoStage, error: std::io::Error) -> Error {
     #[cfg(test)]
@@ -458,9 +457,8 @@ fn replace_metadata(
     drop(staged);
     phase(4); // Reopen and verify the staged object before rename.
     let staged = OpenOptions::new()
-        // This guard verifies identity/content only. DELETE is used by the
-        // pathname rename, not by this retained read handle.
-        .access_mode(0x8000_0000)
+        // Retain the verified object and use its DELETE authority for rename.
+        .access_mode(0x8001_0000)
         .share_mode(5)
         .custom_flags(0x0020_0000)
         .open(stage)
@@ -472,17 +470,8 @@ fn replace_metadata(
     // The exclusive lease and directory pins remain held. Only these two fixed
     // owned metadata leaves may be replaced; never auth or rollout files.
     drop(current);
-    let source = wide(stage.as_os_str())?;
-    let target = wide(path.as_os_str())?;
-    phase(5); // Path-based atomic replacement, unchanged flags.
-    unsafe {
-        MoveFileExW(
-            PCWSTR(source.as_ptr()),
-            PCWSTR(target.as_ptr()),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    }
-    .map_err(|error| win_failure(IoStage::MoveReplace, error))?;
+    phase(5); // Rename the same verified staged object, without reopening its path.
+    rename_metadata(&staged, path)?;
     drop(staged);
     phase(6); // Reopen, verify exact identity, and verify exact new bytes.
     let mut held = open_read(path)?;
@@ -491,6 +480,44 @@ fn replace_metadata(
         return Err(Error::Scope);
     }
     Ok(held)
+}
+/// Same-volume rename of the verified held source; no path-source reopening,
+/// copy fallback, POSIX replacement, or sharing relaxation. The staged content
+/// and journal were synced before this call. FileRenameInfo does not promise
+/// MoveFileEx WRITE_THROUGH semantics: recovery is qualified for interrupted
+/// processes, not arbitrary power-loss atomicity.
+fn rename_metadata(file: &File, target: &Path) -> Result<(), Error> {
+    if !target.is_absolute() {
+        return Err(Error::Invalid);
+    }
+    let mut name = wide(target.as_os_str())?;
+    name.pop(); // FileNameLength excludes the optional terminating NUL.
+    let name_bytes = name
+        .len()
+        .checked_mul(size_of::<u16>())
+        .ok_or(Error::Invalid)?;
+    let length = offset_of!(FILE_RENAME_INFO, FileName)
+        .checked_add(name_bytes)
+        .ok_or(Error::Invalid)?
+        .max(size_of::<FILE_RENAME_INFO>());
+    let length_u32 = u32::try_from(length).map_err(|_| Error::Invalid)?;
+    let name_bytes_u32 = u32::try_from(name_bytes).map_err(|_| Error::Invalid)?;
+    // usize storage provides the HANDLE alignment required by FILE_RENAME_INFO.
+    let mut storage = vec![0usize; length.div_ceil(size_of::<usize>())];
+    let rename = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        (*rename).Anonymous.ReplaceIfExists = true;
+        (*rename).RootDirectory = HANDLE::default();
+        (*rename).FileNameLength = name_bytes_u32;
+        std::ptr::copy_nonoverlapping(name.as_ptr(), (*rename).FileName.as_mut_ptr(), name.len());
+        SetFileInformationByHandle(
+            HANDLE(file.as_raw_handle()),
+            FileRenameInfo,
+            storage.as_ptr().cast(),
+            length_u32,
+        )
+    }
+    .map_err(|error| win_failure(IoStage::RenameByHandle, error))
 }
 fn finish_migration(
     root: &Path,
@@ -983,7 +1010,10 @@ mod tests {
     }
     #[test]
     #[ignore = "owned Windows retained-handle rights differential; no account/provider calls"]
-    fn retained_metadata_read_guard_allows_replace_without_delete_access() {
+    fn retained_metadata_handle_rename_preserves_identity_without_reopening_source() {
+        use windows::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
         let parent = tempfile::tempdir().unwrap();
         let profile = ProfileLease::fixture(parent.path(), id()).unwrap();
         let owner = owner_sid().unwrap();
@@ -1023,19 +1053,10 @@ mod tests {
         assert_eq!(identity(&unchanged_target).unwrap(), old_target_id);
         assert_eq!(read_bounded(&mut unchanged_target, old.len()).unwrap(), old);
         drop(unchanged_target);
-        drop(baseline);
-
-        // The only variable is the unnecessary DELETE bit. The same source,
-        // target, directory/lease pins, share flags and MoveFileEx flags remain.
-        let mut candidate = OpenOptions::new()
-            .access_mode(0x8000_0000)
-            .share_mode(5)
-            .custom_flags(0x0020_0000)
-            .open(&source)
-            .unwrap();
-        verify_file(&candidate, &owner).unwrap();
-        assert_eq!(identity(&candidate).unwrap(), expected);
-        assert_eq!(read_bounded(&mut candidate, new.len()).unwrap(), new);
+        // Keep the identical verified READ|DELETE handle, directory/lease pins,
+        // desired access and shares. Only the rename API changes: it now acts
+        // on this source object rather than reopening the source pathname.
+        let mut candidate = baseline;
         assert_eq!(
             OpenOptions::new()
                 .write(true)
@@ -1045,12 +1066,19 @@ mod tests {
                 .raw_os_error(),
             Some(32)
         );
-        move_exact().expect("READ-only retained guard must allow exact replacement");
+        rename_metadata(&candidate, &target).expect("same held source handle must rename exactly");
         assert!(matches!(std::fs::symlink_metadata(&source), Err(error)
             if error.kind() == std::io::ErrorKind::NotFound));
         assert_eq!(identity(&candidate).unwrap(), expected);
         assert_eq!(read_bounded(&mut candidate, new.len()).unwrap(), new);
-        let mut final_target = open_read(&target).unwrap();
+        // This additional observer must share the DELETE authority still held
+        // by the source object; it still denies writers (same share READ|DELETE).
+        let mut final_target = OpenOptions::new()
+            .read(true)
+            .share_mode(5)
+            .custom_flags(0x0020_0000)
+            .open(&target)
+            .unwrap();
         verify_file(&final_target, &owner).unwrap();
         assert_eq!(identity(&final_target).unwrap(), expected);
         assert_ne!(identity(&final_target).unwrap(), old_target_id);
