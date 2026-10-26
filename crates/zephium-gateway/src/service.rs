@@ -602,6 +602,9 @@ impl Service {
                 emit(WorkModelEvent::ToolCall(tool.clone()));
             }
         }
+        if !self.lease_valid(&lease) {
+            return Err(retired(true));
+        }
         Ok(outcome)
     }
     /// Native profile changes retire leases even on a quick away/back transition.

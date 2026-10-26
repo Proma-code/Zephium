@@ -17,6 +17,8 @@ enum Connection {
     ChatGpt,
     Gateway(String),
     InvalidGateway,
+    Go(String),
+    InvalidGo,
 }
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct Source {
@@ -27,6 +29,7 @@ struct Source {
 enum Kind {
     ChatGpt,
     Gateway,
+    Go,
 }
 impl Kind {
     fn uncertain(self) -> WorkModelError {
@@ -34,6 +37,10 @@ impl Kind {
             // Protocol is the existing non-retriable unknown-outcome signal.
             // Do not downgrade an unobserved dispatched request to a refusal.
             Self::ChatGpt => WorkModelError::Protocol,
+            Self::Go => WorkModelError::OpenCodeGo {
+                fault: OpenCodeGoModelFault::Unavailable,
+                usage_unknown: true,
+            },
             Self::Gateway => WorkModelError::Gateway {
                 fault: GatewayModelFault::Unavailable,
                 usage_unknown: true,
@@ -45,6 +52,10 @@ impl Kind {
             Self::ChatGpt => WorkModelError::ChatGpt {
                 fault: ChatGptModelFault::Unsupported,
             },
+            Self::Go => WorkModelError::OpenCodeGo {
+                fault: OpenCodeGoModelFault::Unsupported,
+                usage_unknown: false,
+            },
             Self::Gateway => WorkModelError::Gateway {
                 fault: GatewayModelFault::Unsupported,
                 usage_unknown: false,
@@ -54,7 +65,8 @@ impl Kind {
     fn terminal(self, error: WorkModelError) -> WorkModelError {
         match (self, error) {
             (Self::ChatGpt, error @ WorkModelError::ChatGpt { .. })
-            | (Self::Gateway, error @ WorkModelError::Gateway { .. }) => error,
+            | (Self::Gateway, error @ WorkModelError::Gateway { .. })
+            | (Self::Go, error @ WorkModelError::OpenCodeGo { .. }) => error,
             // A protected client must not leak a retriable API error through
             // this boundary, including a cancellation with unknown dispatch.
             _ => self.uncertain(),
@@ -74,6 +86,41 @@ fn source(profile: ProfileId, entry: &WorkModelEntry) -> Option<(Source, Kind, b
                 connection: Connection::ChatGpt,
             },
             Kind::ChatGpt,
+            valid,
+        ));
+    }
+    if entry.id.starts_with("opencode-go/") || entry.model.provider == WorkModelProvider::OpenCodeGo
+    {
+        let pair = entry
+            .id
+            .strip_prefix("opencode-go/")
+            .and_then(|id| id.split_once('/'));
+        let (connection, valid) = match pair {
+            Some((scope, model))
+                if scope.len() == 32
+                    && scope
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
+            {
+                (
+                    Connection::Go(scope.into()),
+                    !model.is_empty()
+                        && model == entry.model.model
+                        && entry.model.provider == WorkModelProvider::OpenCodeGo
+                        && matches!(
+                            entry.model.wire,
+                            WorkModelWire::ChatCompletions | WorkModelWire::OpenAiResponses
+                        ),
+                )
+            }
+            _ => (Connection::InvalidGo, false),
+        };
+        return Some((
+            Source {
+                profile,
+                connection,
+            },
+            Kind::Go,
             valid,
         ));
     }

@@ -9,6 +9,8 @@ export {
   keyState,
   hasChatGptModels,
   hasGatewayModels,
+  hasGoModels,
+  type KeyedProvider,
   connectionName,
   keyedProviders,
   locked,

@@ -9,7 +9,7 @@ import type {
 } from "$shared/ipc/bindings";
 
 /** Providers that take the person's own key, in the order they are shown. */
-export const keyedProviders: readonly WorkModelProvider[] = [
+export const keyedProviders = [
   "anthropic",
   "open_ai",
   "google",
@@ -20,7 +20,8 @@ export const keyedProviders: readonly WorkModelProvider[] = [
   "cerebras",
   "open_router",
   "compatible",
-];
+] as const satisfies readonly WorkModelProvider[];
+export type KeyedProvider = (typeof keyedProviders)[number];
 
 const names: Record<WorkModelProvider, string> = {
   anthropic: "Anthropic",
@@ -34,6 +35,7 @@ const names: Record<WorkModelProvider, string> = {
   cerebras: "Cerebras",
   compatible: "Custom",
   cloud: "Zephium",
+  open_code_go: "OpenCode Go",
 };
 
 export function providerName(provider: WorkModelProvider): string {
@@ -50,7 +52,8 @@ export function modelName(entry: WorkModelEntry): string {
 /** Independent routing source; display metadata must not become a model identity. */
 export function modelConnection(
   entry: WorkModelEntry,
-): "chatgpt" | "api" | "gateway" | "endpoint" | null {
+): "chatgpt" | "api" | "gateway" | "endpoint" | "go" | null {
+  if (entry.model.provider === "open_code_go") return "go";
   if (entry.model.provider === "open_ai")
     return entry.id.startsWith("chatgpt/") ? "chatgpt" : "api";
   if (entry.model.provider === "compatible")
@@ -64,6 +67,7 @@ export function connectionName(source: NonNullable<ReturnType<typeof modelConnec
     api: m.model_source_api,
     gateway: m.model_source_gateway,
     endpoint: m.model_source_endpoint,
+    go: m.go_title,
   }[source]();
 }
 
@@ -73,6 +77,17 @@ function gatewayEntry(entry: WorkModelEntry): boolean {
 
 export function hasGatewayModels(models: WorkModelsV1 | null): boolean {
   return !!models?.entries.some(gatewayEntry);
+}
+
+function goEntry(entry: WorkModelEntry): boolean {
+  return (
+    entry.model.provider === "open_code_go" && /^opencode-go\/[0-9a-f]{32}\/.+$/u.test(entry.id)
+  );
+}
+
+/** A native-published supported catalog, not proof that the public listing authenticated a key. */
+export function hasGoModels(models: WorkModelsV1 | null): boolean {
+  return !!models?.entries.some(goEntry);
 }
 
 /** The model's name as the trigger shows it: the mark beside it says the family. */
@@ -97,7 +112,7 @@ export function hasChatGptModels(models: WorkModelsV1 | null): boolean {
 
 /** A provider can run calls now: its key is set and not refused. */
 export function usable(models: WorkModelsV1 | null, provider: WorkModelProvider): boolean {
-  if (!models) return false;
+  if (!models || provider === "open_code_go") return false;
   if (provider === "cloud")
     return (
       models.cloud.signed_in &&
@@ -136,11 +151,12 @@ export function pickerGroups(
       .filter(
         (entry) =>
           (entry.model.provider === "open_ai" && entry.id.startsWith("chatgpt/")) ||
-          gatewayEntry(entry),
+          gatewayEntry(entry) ||
+          goEntry(entry),
       )
       .map((entry) => entry.id) ?? [],
   );
-  const order: readonly WorkModelProvider[] = ["cloud", ...keyedProviders];
+  const order: readonly WorkModelProvider[] = ["cloud", ...keyedProviders, "open_code_go"];
   const ready: ModelGroup[] = [];
   const needsKey: WorkModelProvider[] = [];
   for (const provider of order) {
@@ -158,11 +174,13 @@ export function pickerGroups(
       })
       .sort((a, b) => Number(b.recommended) - Number(a.recommended));
     const providerUsable = usable(models, provider);
-    const available = offered.filter((entry) =>
-      entry.id.startsWith("chatgpt/") || entry.id.startsWith("gateway/")
+    const available = offered.filter((entry) => {
+      if (entry.model.provider === "open_code_go" || entry.id.startsWith("opencode-go/"))
+        return goEntry(entry) && accountEntries.has(entry.id);
+      return entry.id.startsWith("chatgpt/") || entry.id.startsWith("gateway/")
         ? accountEntries.has(entry.id)
-        : providerUsable,
-    );
+        : providerUsable;
+    });
     if (available.length) ready.push({ provider, entries: available });
     if (!providerUsable && !available.length && suggested.includes(provider))
       needsKey.push(provider);

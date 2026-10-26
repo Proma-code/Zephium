@@ -28,7 +28,7 @@ test("subscription setup is explicit about unavailable and unsupported integrati
     "Claude via Claude Code",
     "Claude via Claude Code",
     "Google Antigravity",
-    "OpenCode",
+    "OpenCode CLI",
   ])
     await expect.element(screen.getByRole("heading", { name, exact: true })).toBeVisible();
   expect(screen.getByText("Not available in Zephium yet", { exact: true }).all()).toHaveLength(2);
@@ -36,7 +36,7 @@ test("subscription setup is explicit about unavailable and unsupported integrati
   await expect
     .element(
       screen.getByText(
-        "A subscription is not an API key or API credit. The API-key settings below stay separate and unchanged.",
+        "These CLI tools manage their own provider sessions. Their sign-ins are separate from Zephium’s API keys and OpenCode Go connection.",
       ),
     )
     .toBeVisible();
@@ -80,8 +80,8 @@ test("a rejected guide opening is explained and an explicit retry clears the err
     .mockResolvedValueOnce({ accepted: false, operation_id: null })
     .mockResolvedValueOnce({ accepted: true, operation_id: null });
   const screen = await render(AiSubscriptions);
-  await screen.getByRole("button", { name: "Setup guidance for OpenCode" }).click();
-  const open = screen.getByRole("button", { name: "Open official OpenCode guide" });
+  await screen.getByRole("button", { name: "Setup guidance for OpenCode CLI" }).click();
+  const open = screen.getByRole("button", { name: "Open official OpenCode CLI guide" });
   await open.click();
   await expect.element(screen.getByRole("alert")).toHaveTextContent("Could not confirm");
   await open.click();
@@ -104,16 +104,16 @@ test("repeated clicks stay single-flight and a closed guide ignores a late failu
   let resolve!: (value: OperationAdmission) => void;
   native.open.mockImplementation(() => new Promise<OperationAdmission>((done) => (resolve = done)));
   const screen = await render(AiSubscriptions);
-  await screen.getByRole("button", { name: "Setup guidance for OpenCode" }).click();
-  const open = screen.getByRole("button", { name: "Open official OpenCode guide" });
+  await screen.getByRole("button", { name: "Setup guidance for OpenCode CLI" }).click();
+  const open = screen.getByRole("button", { name: "Open official OpenCode CLI guide" });
   await open.click();
   await expect.element(open).toBeDisabled();
   const button = open.element();
   if (!(button instanceof HTMLButtonElement)) throw new Error("Expected a button");
   button.click();
   expect(native.open).toHaveBeenCalledTimes(1);
-  await screen.getByRole("button", { name: "Hide guidance for OpenCode" }).click();
-  await screen.getByRole("button", { name: "Setup guidance for OpenCode" }).click();
+  await screen.getByRole("button", { name: "Hide guidance for OpenCode CLI" }).click();
+  await screen.getByRole("button", { name: "Setup guidance for OpenCode CLI" }).click();
   await expect.element(open).toBeDisabled();
   resolve({ accepted: false, operation_id: null });
   await expect.element(open).not.toBeDisabled();
@@ -125,7 +125,7 @@ test("gated OpenCode discovery is unknown rather than missing or connected", asy
     id: "opencode",
     cli: { id: "opencode", status: "unknown", version: null, path: null, account: null },
   });
-  await expect.element(screen.getByRole("heading", { name: "OpenCode" })).toBeVisible();
+  await expect.element(screen.getByRole("heading", { name: "OpenCode CLI" })).toBeVisible();
   await expect.element(screen.getByText("Sign-in verification unavailable")).toBeVisible();
   await expect.element(screen.getByRole("button", { name: "Install" })).not.toBeInTheDocument();
 });

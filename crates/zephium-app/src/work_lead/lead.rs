@@ -341,7 +341,8 @@ where
                 }
                 Err(
                     failure @ (CallFailure::ChatGptUnknownOutcome { .. }
-                    | CallFailure::GatewayUsageUnknown { .. }),
+                    | CallFailure::GatewayUsageUnknown { .. }
+                    | CallFailure::GoUsageUnknown { .. }),
                 ) => {
                     self.record_turn(
                         None,
@@ -372,6 +373,7 @@ where
                             | WorkModelError::Hosted { .. }
                             | WorkModelError::ChatGpt { .. }
                             | WorkModelError::Gateway { .. }
+                            | WorkModelError::OpenCodeGo { .. }
                     );
                     if fatal {
                         return Ok(WorkAttemptStatus::Failed);
@@ -1621,11 +1623,20 @@ where
     ) {
         let partial_usage_unknown = matches!(
             failure,
-            CallFailure::ChatGptUnknownOutcome { .. } | CallFailure::GatewayUsageUnknown { .. }
+            CallFailure::ChatGptUnknownOutcome { .. }
+                | CallFailure::GatewayUsageUnknown { .. }
+                | CallFailure::GoUsageUnknown { .. }
         );
         let (failure, usage) = match failure {
             CallFailure::ChatGptUnknownOutcome { fault, reservation } => (
                 CallFailure::Refused(WorkModelError::ChatGpt { fault }),
+                Some(reservation),
+            ),
+            CallFailure::GoUsageUnknown { fault, reservation } => (
+                CallFailure::Refused(WorkModelError::OpenCodeGo {
+                    fault,
+                    usage_unknown: true,
+                }),
                 Some(reservation),
             ),
             CallFailure::GatewayUsageUnknown { fault, reservation } => (
@@ -1648,6 +1659,7 @@ where
             match failure {
                 CallFailure::Refused(WorkModelError::ChatGpt { fault }) => chatgpt_note(fault),
                 CallFailure::Refused(WorkModelError::Gateway { fault, .. }) => gateway_note(fault),
+                CallFailure::Refused(WorkModelError::OpenCodeGo { fault, .. }) => go_note(fault),
                 CallFailure::Refused(WorkModelError::OverBudget) if hosted => {
                     "Zephium AI's included usage is spent; upgrade, buy extra usage or use your own key"
                 }
@@ -2121,6 +2133,18 @@ const USED_BATCH_CHARS: usize = 12_000;
 const FRESH_RESULTS: usize = 2;
 const STUB: &str = "[Used; dropped to keep the conversation small.";
 
+fn go_note(fault: OpenCodeGoModelFault) -> &'static str {
+    match fault {
+        OpenCodeGoModelFault::NotConfigured => "The selected OpenCode Go connection is unavailable. Check its settings before starting a new run.",
+        OpenCodeGoModelFault::Unauthorized => "OpenCode Go refused the access key. Check the connection in Settings.",
+        OpenCodeGoModelFault::Forbidden => "OpenCode Go did not allow this request. Check the account, model and Console privacy settings.",
+        OpenCodeGoModelFault::RateLimited => "OpenCode Go reported a usage limit. No other billing source was selected by Zephium.",
+        OpenCodeGoModelFault::Unsupported => "This OpenCode Go route does not support the selected model, capability or conversation context.",
+        OpenCodeGoModelFault::Unavailable => "OpenCode Go could not return a confirmed result. Check the connection before starting a new run.",
+        OpenCodeGoModelFault::Protocol | OpenCodeGoModelFault::Incomplete | OpenCodeGoModelFault::UsageUnavailable => "OpenCode Go did not return a complete result with confirmed usage. The run stopped without another billing route.",
+    }
+}
+
 /// Keeps the conversation small without moving the cached prefix every
 /// turn: large tool results the model has moved past are replaced together
 /// by a stub with their source keys, and past the hard budget the older
@@ -2130,6 +2154,7 @@ pub(super) fn model_stop(error: WorkModelError) -> &'static str {
     match error {
         WorkModelError::ChatGpt { fault } => chatgpt_note(fault),
         WorkModelError::Gateway { fault, .. } => gateway_note(fault),
+        WorkModelError::OpenCodeGo { fault, .. } => go_note(fault),
         WorkModelError::RateLimited { .. } => {
             "The model provider kept limiting requests, so I stopped."
         }
@@ -2177,7 +2202,9 @@ fn model_fault(error: WorkModelError, hosted: bool) -> Option<WorkModelFaultV1> 
     Some(match error {
         // The exact note above is truthful; API-key and Zephium-plan UI actions
         // would misdirect a locally authorized ChatGPT account.
-        WorkModelError::ChatGpt { .. } | WorkModelError::Gateway { .. } => return None,
+        WorkModelError::ChatGpt { .. }
+        | WorkModelError::Gateway { .. }
+        | WorkModelError::OpenCodeGo { .. } => return None,
         WorkModelError::MissingKey if hosted => WorkModelFaultV1::SignedOut,
         WorkModelError::MissingKey => WorkModelFaultV1::MissingKey,
         WorkModelError::Unauthorized if hosted => WorkModelFaultV1::SignedOut,

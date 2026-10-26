@@ -167,6 +167,7 @@ windows = { version = "0.61", features = ["Win32_Graphics_Gdi"] }
 zephium-credentials = { workspace = true, optional = true }
 zephium-chatgpt.workspace = true
 zephium-gateway.workspace = true
+zephium-opencode-go.workspace = true
 zeroize = "=1.9.0"
 zephium-work-composition = { workspace = true, optional = true }
 zephium-blocker = { workspace = true, features = ["runtime"] }

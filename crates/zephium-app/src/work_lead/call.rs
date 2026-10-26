@@ -45,6 +45,11 @@ pub(crate) enum CallFailure {
         fault: ChatGptModelFault,
         reservation: WorkUsage,
     },
+    /// A Go request may have consumed usage without a confirmed response.
+    GoUsageUnknown {
+        fault: OpenCodeGoModelFault,
+        reservation: WorkUsage,
+    },
     /// A local gateway request may have reached upstream without measured usage.
     GatewayUsageUnknown {
         fault: GatewayModelFault,
@@ -120,6 +125,12 @@ fn protected_source_failure(
         }
         WorkModelError::ChatGpt { fault } if observed_output => {
             Some(CallFailure::ChatGptUnknownOutcome { fault, reservation })
+        }
+        WorkModelError::OpenCodeGo {
+            fault,
+            usage_unknown,
+        } if usage_unknown || observed_output => {
+            Some(CallFailure::GoUsageUnknown { fault, reservation })
         }
         WorkModelError::Gateway {
             fault,
@@ -220,7 +231,8 @@ pub(crate) async fn call(
         }
         if let Some(
             failure @ (CallFailure::ChatGptUnknownOutcome { reservation, .. }
-            | CallFailure::GatewayUsageUnknown { reservation, .. }),
+            | CallFailure::GatewayUsageUnknown { reservation, .. }
+            | CallFailure::GoUsageUnknown { reservation, .. }),
         ) = protected_source_failure(
             &model.entry.id,
             error,
@@ -563,5 +575,32 @@ mod tests {
         );
         assert_eq!(say_line("  "), None);
         assert!(say_line(&"word ".repeat(200)).unwrap().len() <= 243);
+    }
+    #[test]
+    fn go_failure_accounting_never_retries_or_infers_free_usage() {
+        let remaining = WorkExecutionLimits {
+            model_tokens: 100,
+            cost_micro_usd: 200,
+            operations: 10,
+            timeout_seconds: 30,
+            max_workers: 1,
+        };
+        for unknown in [false, true] {
+            let error = WorkModelError::OpenCodeGo {
+                fault: OpenCodeGoModelFault::RateLimited,
+                usage_unknown: unknown,
+            };
+            assert_eq!(retry_wait(error, 0), None);
+            let classified =
+                protected_source_failure("opencode-go/fixture/model", error, false, remaining);
+            assert_eq!(
+                matches!(classified, Some(CallFailure::GoUsageUnknown { .. })),
+                unknown
+            );
+            assert!(matches!(
+                protected_source_failure("opencode-go/fixture/model", error, true, remaining),
+                Some(CallFailure::GoUsageUnknown { .. })
+            ));
+        }
     }
 }

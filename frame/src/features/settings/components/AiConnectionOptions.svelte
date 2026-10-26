@@ -1,10 +1,32 @@
 <script lang="ts">
   import * as m from "$shared/i18n/messages";
-  let { kind, profile }: { kind: "accounts" | "gateway"; profile: string } = $props();
+  let { kind, profile }: { kind: "accounts" | "gateway" | "go"; profile: string } = $props();
   let open = $state(false);
-  const gateway = $derived(kind === "gateway");
+  const title = $derived(
+    kind === "gateway"
+      ? m.gateway_title()
+      : kind === "go"
+        ? m.go_title()
+        : m.ai_subscriptions_expand(),
+  );
+  const loading = $derived(
+    kind === "gateway"
+      ? m.gateway_loading()
+      : kind === "go"
+        ? m.go_loading()
+        : m.ai_subscriptions_loading(),
+  );
+  const failure = $derived(
+    kind === "gateway"
+      ? m.gateway_load_failed()
+      : kind === "go"
+        ? m.go_load_failed()
+        : m.ai_subscriptions_load_failed(),
+  );
   async function load() {
-    if (gateway)
+    if (kind === "go")
+      return { kind: "go" as const, Component: (await import("./OpenCodeGo.svelte")).default };
+    if (kind === "gateway")
       return {
         kind: "gateway" as const,
         Component: (await import("./LocalGateway.svelte")).default,
@@ -17,15 +39,15 @@
 </script>
 
 <details class="other-accounts" bind:open>
-  <summary>{gateway ? m.gateway_title() : m.ai_subscriptions_expand()}</summary>
+  <summary>{title}</summary>
   {#if open}
     {#await load()}
-      <p role="status">{gateway ? m.gateway_loading() : m.ai_subscriptions_loading()}</p>
+      <p role="status">{loading}</p>
     {:then view}
-      {#if view.kind === "gateway"}<view.Component {profile} />
+      {#if view.kind !== "accounts"}<view.Component {profile} />
       {:else}<view.Component />{/if}
     {:catch}
-      <p role="alert">{gateway ? m.gateway_load_failed() : m.ai_subscriptions_load_failed()}</p>
+      <p role="alert">{failure}</p>
     {/await}
   {/if}
 </details>

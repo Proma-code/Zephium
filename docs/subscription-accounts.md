@@ -1,7 +1,7 @@
 # Windows subscription accounts
 
-This experimental personal fork adds a direct ChatGPT connection and an optional
-connection to an existing local model gateway. It is not an upstream release.
+This experimental personal fork adds direct ChatGPT and OpenCode Go connections and an
+optional connection to an existing local model gateway. It is not an upstream release.
 Use only the separate [Windows trial](windows-subscription-trial.md); keep your
 ordinary Zephium installation and data.
 
@@ -35,10 +35,30 @@ This option is not Google account sign-in. Google does not support third-party
 consumer Antigravity wrapping; check the [official FAQ](https://antigravity.google/docs/faq).
 A compatible gateway's availability does not establish any upstream entitlement.
 
+## OpenCode Go
+
+The branch also includes an OpenCode Go connection using the subscription access
+key issued by the [OpenCode Console](https://opencode.ai/console), not an OpenCode
+CLI login. In Settings → AI, review the coding-agent-use and billing disclosure,
+enter that key, acknowledge the controls, and save. Choose **Check models** to
+read its public catalog, then explicitly select OpenCode Go in the model picker.
+A public catalog does not verify the key or a paid plan.
+
+OpenCode Go is intended for coding-agent work. Its Console **Extra Usage** setting
+can charge your balance after included usage runs out. Zephium does not enable
+that setting or choose another billing route, but cannot override the provider's
+setting. Review it before sending requests. The latest completed request's
+provider-reported billing source is shown separately from quota.
+
+Only the currently implemented model/protocol subset is offered. Other listed
+models are not silently routed through a different API. Remaining numeric quota
+is unavailable here; check the provider Console. See the [official Go guide](https://opencode.ai/v2/docs/console/go/)
+for current limits, model availability and privacy settings.
+
 ## Current limits
 
-- Claude and OpenCode subscription chat are still in development; setup guidance
-  alone is not a working connection.
+- Claude account chat remains in development. OpenCode CLI setup guidance is
+  separate from the Go access-key connection and does not establish a CLI login.
 - Numeric remaining subscription quota is not available through the current
   connected routes. Unknown quota is not shown as empty or full. Use the relevant
   provider's official account page to check usage.

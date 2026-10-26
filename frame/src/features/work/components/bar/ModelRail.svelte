@@ -48,7 +48,10 @@
 
   function caption(seat: Seat) {
     const name = names(seat.provider);
-    if (seat.provider === "open_ai" && seat.standing === "key")
+    if (
+      (seat.provider === "open_ai" || seat.provider === "open_code_go") &&
+      seat.standing === "key"
+    )
       return m.model_rail_connect({ provider: name });
     switch (seat.standing) {
       case "ready":

@@ -28,6 +28,8 @@ pub enum WorkModelProvider {
     Cerebras,
     /// Any OpenAI-compatible chat endpoint the person configured.
     Compatible,
+    /// OpenCode Go, using its own profile-owned subscription access key.
+    OpenCodeGo,
     /// Zephium Cloud: the upstream's native body, our base URL and bearer.
     Cloud,
 }
@@ -253,6 +255,12 @@ pub enum WorkModelError {
     ChatGpt {
         fault: ChatGptModelFault,
     },
+    /// An explicitly selected OpenCode Go failure; never retry or route to BYOK.
+    OpenCodeGo {
+        fault: OpenCodeGoModelFault,
+        /// A dispatched request may have consumed usage; never imply zero cost.
+        usage_unknown: bool,
+    },
     /// An explicitly selected local gateway failure. Never automatically retried.
     Gateway {
         fault: GatewayModelFault,
@@ -260,6 +268,29 @@ pub enum WorkModelError {
         /// This is not a claim that the gateway or provider charged anything.
         usage_unknown: bool,
     },
+}
+
+/// Closed OpenCode Go errors. Provider-authored text and credentials never cross.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenCodeGoModelFault {
+    /// This exact profile-owned connection is absent or replaced.
+    NotConfigured,
+    /// The provider refused the subscription access key.
+    Unauthorized,
+    /// The workspace, plan, privacy policy or model refused the request.
+    Forbidden,
+    /// The provider reported a limit. Zephium does not try another billing source.
+    RateLimited,
+    /// The provider could not be reached within a bounded operation.
+    Unavailable,
+    /// The model, operation or native conversation scope is unsupported.
+    Unsupported,
+    /// The response violated its documented bounded protocol.
+    Protocol,
+    /// A response ended early or hit an output limit.
+    Incomplete,
+    /// The response omitted validated usage or billing provenance.
+    UsageUnavailable,
 }
 
 /// Closed local gateway errors, separate from native subscription and API keys.

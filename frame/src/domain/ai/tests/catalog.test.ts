@@ -6,6 +6,8 @@ import {
   effortLevels,
   hasChatGptModels,
   hasGatewayModels,
+  hasGoModels,
+  keyedProviders,
   connectionName,
   locked,
   modelName,
@@ -238,5 +240,64 @@ describe("local gateway catalog sources", () => {
     view.entries.push({ ...gateway(), id: "gateway/not-a-native-connection/model" });
     expect(hasGatewayModels(view)).toBe(false);
     expect(pickerGroups(view, "lead").ready).toEqual([]);
+  });
+});
+
+describe("OpenCode Go is its own native-managed provider", () => {
+  const go = () =>
+    entry("open_code_go", "example", "Example", false, ["lead", "page", "light"], {
+      id: `opencode-go/${"a".repeat(32)}/example`,
+      price: null,
+    });
+  test("native catalog admission never uses global API-key settings or Custom endpoint access", () => {
+    const view = models({});
+    view.entries.push(go());
+    expect(keyedProviders).not.toContain("open_code_go");
+    expect(hasGoModels(view)).toBe(true);
+    expect(usable(view, "open_code_go")).toBe(false);
+    expect(pickerGroups(view, "lead").ready.map((group) => group.provider)).toEqual([
+      "open_code_go",
+    ]);
+    expect(modelName(go())).toBe("Example");
+    expect(modelConnection(go())).toBe("go");
+    expect(connectionName("go")).toBe("OpenCode Go");
+  });
+  test("an endpoint or more-model reply cannot fabricate Go access", () => {
+    const view = models({ keys: { open_ai: "valid" }, base: "http://localhost:11434/v1" });
+    expect(
+      pickerGroups(view, "lead", [go()]).ready.flatMap((group) => group.entries),
+    ).not.toContainEqual(go());
+    view.entries.push({ ...go(), id: "opencode-go/unscoped/example" });
+    expect(hasGoModels(view)).toBe(false);
+    expect(
+      pickerGroups(view, "lead").ready.some((group) => group.provider === "open_code_go"),
+    ).toBe(false);
+  });
+  test("a more-model result cannot relabel a native Go identity as another billing provider", () => {
+    const view = models({ keys: { open_ai: "valid" } });
+    view.entries.push(go());
+    const spoof = entry("open_ai", "example", "API example", false, ["lead"], { id: go().id });
+    const offered = pickerGroups(view, "lead", [spoof]).ready.flatMap((group) => group.entries);
+    expect(offered.filter((row) => row.id === go().id)).toEqual([go()]);
+  });
+  test("disconnect preserves unrelated catalogs and the unavailable saved Go choice", () => {
+    const view = models({ keys: { open_ai: "valid" }, base: "http://localhost:11434/v1" });
+    view.entries.push(go());
+    view.chosen.page = go().id;
+    const endpoint = entry("compatible", "example", "Example", false);
+    expect(
+      pickerGroups(view, "page", [endpoint]).ready.some(
+        (group) => group.provider === "open_code_go",
+      ),
+    ).toBe(true);
+    view.entries = view.entries.filter((row) => row.model.provider !== "open_code_go");
+    expect(view.chosen.page).toBe(go().id);
+    expect(usable(view, "open_ai")).toBe(true);
+    expect(usable(view, "compatible")).toBe(true);
+    expect(
+      pickerGroups(view, "page", [endpoint]).ready.some(
+        (group) => group.provider === "open_code_go",
+      ),
+    ).toBe(false);
   });
 });

@@ -225,11 +225,20 @@ impl PartReport {
 fn terminal_model_report(failure: CallFailure, objects: Vec<WorkArtifactId>) -> Option<PartReport> {
     let (error, unknown) = match failure {
         CallFailure::Refused(
-            error @ (WorkModelError::Gateway { .. } | WorkModelError::ChatGpt { .. }),
+            error @ (WorkModelError::Gateway { .. }
+            | WorkModelError::ChatGpt { .. }
+            | WorkModelError::OpenCodeGo { .. }),
         ) => (error, false),
         CallFailure::ChatGptUnknownOutcome { fault, .. } => {
             (WorkModelError::ChatGpt { fault }, true)
         }
+        CallFailure::GoUsageUnknown { fault, .. } => (
+            WorkModelError::OpenCodeGo {
+                fault,
+                usage_unknown: true,
+            },
+            true,
+        ),
         CallFailure::GatewayUsageUnknown { fault, .. } => (
             WorkModelError::Gateway {
                 fault,

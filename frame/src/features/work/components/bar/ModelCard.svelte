@@ -68,6 +68,7 @@
           source: connectionName(connection),
         }),
       );
+    if (entry.model.provider === "open_code_go") words.push(m.go_coding_only());
     if (tier) words.push(CHARACTERS[tier]());
     else if (entry.model.provider === "compatible") words.push(m.model_character_own());
     if (entry.context_window < 500_000)

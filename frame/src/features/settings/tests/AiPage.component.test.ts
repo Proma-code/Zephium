@@ -24,6 +24,16 @@ const native = vi.hoisted(() => ({
     fault: null,
   })),
 }));
+const go = vi.hoisted(() => ({ read: vi.fn() }));
+vi.mock("$shared/ipc/go-bindings", async () => {
+  const { goView, mockGoBindings } = await import("$shared/testing/opencode-go");
+  return mockGoBindings({
+    goStatus: async (profile) => {
+      go.read(profile);
+      return goView(profile);
+    },
+  });
+});
 const gateway = vi.hoisted(() => ({ read: vi.fn() }));
 vi.mock("$shared/ipc/gateway-bindings", async () => {
   const { gatewayView, mockGatewayBindings } = await import("$shared/testing/gateway");
@@ -330,4 +340,43 @@ test("native gateway models are selectable without a custom endpoint and source 
   await expect
     .element(page.getByRole("option", { name: "Example model", exact: true }))
     .toHaveAccessibleDescription("Local gateway");
+});
+
+test("OpenCode Go is a lazy independent section, not another generic API-key row", async () => {
+  native.read.mockResolvedValue(models({}));
+  go.read.mockClear();
+  const screen = await render(AiPage);
+  expect(go.read).not.toHaveBeenCalled();
+  const summary = screen.getByText("OpenCode Go", { exact: true });
+  summary.element().focus();
+  await userEvent.keyboard("{Enter}");
+  await expect.element(screen.getByRole("button", { name: "Set up OpenCode Go" })).toBeVisible();
+  expect(go.read).toHaveBeenCalledExactlyOnceWith(PROFILE);
+  await userEvent.keyboard("{Enter}");
+  await expect
+    .element(screen.getByRole("button", { name: "Set up OpenCode Go" }))
+    .not.toBeInTheDocument();
+});
+
+test("Go role choices use native catalog entries and keep provider/source outside the name", async () => {
+  const view = models({});
+  view.entries.push(
+    entry("open_code_go", "example", "Example", false, ["lead"], {
+      id: `opencode-go/${"a".repeat(32)}/example`,
+      price: null,
+      supports: {
+        tools: true,
+        vision: false,
+        native_search: false,
+        reasoning: false,
+        prompt_cache: false,
+      },
+    }),
+  );
+  native.read.mockResolvedValue(view);
+  const screen = await render(AiPage);
+  await screen.getByRole("button", { name: "Work", exact: true }).click();
+  await expect
+    .element(page.getByRole("option", { name: "Example", exact: true }))
+    .toHaveAccessibleDescription("OpenCode Go");
 });

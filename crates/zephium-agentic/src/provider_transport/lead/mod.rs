@@ -17,6 +17,8 @@ mod listing;
 pub mod local_gateway;
 pub mod models;
 mod openai;
+/// Fixed-origin OpenCode Go coding-agent transport.
+pub mod opencode_go;
 mod sse;
 mod transcribe;
 
@@ -161,9 +163,9 @@ impl LeadTarget {
             WorkModelProvider::Mistral => (WorkModelWire::ChatCompletions, MISTRAL_BASE),
             WorkModelProvider::Groq => (WorkModelWire::ChatCompletions, GROQ_BASE),
             WorkModelProvider::Cerebras => (WorkModelWire::ChatCompletions, CEREBRAS_BASE),
-            WorkModelProvider::Compatible | WorkModelProvider::Cloud => {
-                return Err(WorkModelError::BadRequest)
-            }
+            WorkModelProvider::Compatible
+            | WorkModelProvider::Cloud
+            | WorkModelProvider::OpenCodeGo => return Err(WorkModelError::BadRequest),
         };
         Ok(Self {
             wire,
@@ -203,7 +205,8 @@ impl LeadTarget {
             | WorkModelProvider::Groq
             | WorkModelProvider::Cerebras
             | WorkModelProvider::Compatible
-            | WorkModelProvider::Cloud => return Err(WorkModelError::BadRequest),
+            | WorkModelProvider::Cloud
+            | WorkModelProvider::OpenCodeGo => return Err(WorkModelError::BadRequest),
         };
         Ok(Self {
             wire,

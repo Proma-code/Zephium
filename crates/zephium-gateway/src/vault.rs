@@ -84,11 +84,11 @@ impl Vault for SystemVault {
         #[cfg(windows)]
         {
             let _turn = zephium_credentials::turn().map_err(|_| VaultError::Unavailable)?;
-            return match zephium_credentials::read(&target) {
+            match zephium_credentials::read(&target) {
                 Ok(bytes) => decode(profile, &bytes).map(Some),
                 Err(zephium_credentials::VaultError::Missing) => Ok(None),
                 Err(_) => Err(VaultError::Unavailable),
-            };
+            }
         }
         #[cfg(not(windows))]
         {
@@ -102,8 +102,7 @@ impl Vault for SystemVault {
         #[cfg(windows)]
         {
             let _turn = zephium_credentials::turn().map_err(|_| VaultError::Unavailable)?;
-            return zephium_credentials::write(&target, &bytes)
-                .map_err(|_| VaultError::Unavailable);
+            zephium_credentials::write(&target, &bytes).map_err(|_| VaultError::Unavailable)
         }
         #[cfg(not(windows))]
         {
@@ -116,10 +115,10 @@ impl Vault for SystemVault {
         #[cfg(windows)]
         {
             let _turn = zephium_credentials::turn().map_err(|_| VaultError::Unavailable)?;
-            return match zephium_credentials::delete(&target) {
+            match zephium_credentials::delete(&target) {
                 Ok(()) | Err(zephium_credentials::VaultError::Missing) => Ok(()),
                 Err(_) => Err(VaultError::Unavailable),
-            };
+            }
         }
         #[cfg(not(windows))]
         {

@@ -5,6 +5,7 @@ use std::task::Poll;
 use tokio::sync::{Notify, Semaphore};
 
 const A: &str = "gateway/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const GO: &str = "opencode-go/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const B: &str = "gateway/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 fn profile() -> ProfileId {
     ProfileId::parse("00000000000000000000000001").unwrap()
@@ -36,15 +37,18 @@ fn request(model: &LeadModel) -> WorkModelRequest {
 }
 fn entry(prefix: &str, model: &str) -> WorkModelEntry {
     let gateway = prefix.starts_with("gateway/");
+    let go = prefix.starts_with("opencode-go/");
     WorkModelEntry {
         id: format!("{prefix}/{model}"),
         model: WorkModelRef {
-            provider: if gateway {
+            provider: if go {
+                WorkModelProvider::OpenCodeGo
+            } else if gateway {
                 WorkModelProvider::Compatible
             } else {
                 WorkModelProvider::OpenAi
             },
-            wire: if gateway {
+            wire: if gateway || go {
                 WorkModelWire::ChatCompletions
             } else {
                 WorkModelWire::OpenAiResponses
@@ -118,6 +122,11 @@ fn quota(prefix: &str) -> WorkModelError {
         WorkModelError::ChatGpt {
             fault: ChatGptModelFault::UsageLimit,
         }
+    } else if prefix.starts_with("opencode-go/") {
+        WorkModelError::OpenCodeGo {
+            fault: OpenCodeGoModelFault::RateLimited,
+            usage_unknown: true,
+        }
     } else {
         WorkModelError::Gateway {
             fault: GatewayModelFault::RateLimited,
@@ -127,7 +136,7 @@ fn quota(prefix: &str) -> WorkModelError {
 }
 #[tokio::test]
 async fn failed_page_blocks_light_and_lead_across_distinct_model_clients() {
-    for prefix in ["chatgpt", A] {
+    for prefix in ["chatgpt", A, GO] {
         let calls = Arc::new(AtomicUsize::new(0));
         let error = quota(prefix);
         let models = guard_run_sources(
@@ -186,41 +195,43 @@ async fn failed_page_blocks_light_and_lead_across_distinct_model_clients() {
 }
 #[tokio::test]
 async fn different_explicit_connections_and_sources_remain_independent() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let mut raw = group(
-        A,
-        [
-            ready(&calls, None),
-            ready(&calls, Some(quota(A))),
-            ready(&calls, None),
-        ],
-    );
-    raw.light.entry = entry(B, "light");
-    raw.lead.entry = entry("chatgpt", "lead");
-    let models = guard_run_sources(profile(), raw);
-    assert!(models
-        .page
-        .client
-        .call(request(&models.page), &|_| {})
-        .await
-        .is_err());
-    assert!(models
-        .light
-        .client
-        .call(request(&models.light), &|_| {})
-        .await
-        .is_ok());
-    assert!(models
-        .lead
-        .client
-        .call(request(&models.lead), &|_| {})
-        .await
-        .is_ok());
-    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    for (first, second) in [(A, B), (GO, "opencode-go/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut raw = group(
+            first,
+            [
+                ready(&calls, None),
+                ready(&calls, Some(quota(first))),
+                ready(&calls, None),
+            ],
+        );
+        raw.light.entry = entry(second, "light");
+        raw.lead.entry = entry("chatgpt", "lead");
+        let models = guard_run_sources(profile(), raw);
+        assert!(models
+            .page
+            .client
+            .call(request(&models.page), &|_| {})
+            .await
+            .is_err());
+        assert!(models
+            .light
+            .client
+            .call(request(&models.light), &|_| {})
+            .await
+            .is_ok());
+        assert!(models
+            .lead
+            .client
+            .call(request(&models.lead), &|_| {})
+            .await
+            .is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
 }
 #[tokio::test]
 async fn a_fresh_explicit_run_and_another_profile_get_fresh_admission() {
-    for prefix in ["chatgpt", A] {
+    for prefix in ["chatgpt", A, GO] {
         let calls = Arc::new(AtomicUsize::new(0));
         for owner in [
             profile(),
@@ -399,7 +410,7 @@ async fn dropping_a_queued_waiter_does_not_poison_a_successful_owner() {
 }
 #[tokio::test]
 async fn dropping_a_dispatched_owner_blocks_every_sibling_with_unknown_usage() {
-    for prefix in ["chatgpt", A] {
+    for prefix in ["chatgpt", A, GO] {
         let owner = blocked(None);
         let calls = owner.calls.clone();
         let models = guard_run_sources(
@@ -422,6 +433,8 @@ async fn dropping_a_dispatched_owner_blocks_every_sibling_with_unknown_usage() {
         assert!(cancelled.is_cancelled());
         let expected = if prefix == "chatgpt" {
             Kind::ChatGpt.uncertain()
+        } else if prefix == GO {
+            Kind::Go.uncertain()
         } else {
             Kind::Gateway.uncertain()
         };
@@ -485,7 +498,7 @@ async fn a_different_connection_does_not_wait_on_the_active_source_lock() {
 }
 #[tokio::test]
 async fn unexpected_retriable_errors_are_closed_source_faults() {
-    for prefix in ["chatgpt", A] {
+    for prefix in ["chatgpt", A, GO] {
         let calls = Arc::new(AtomicUsize::new(0));
         let models = guard_run_sources(
             profile(),
@@ -500,6 +513,8 @@ async fn unexpected_retriable_errors_are_closed_source_faults() {
         );
         let expected = if prefix == "chatgpt" {
             Kind::ChatGpt.uncertain()
+        } else if prefix == GO {
+            Kind::Go.uncertain()
         } else {
             Kind::Gateway.uncertain()
         };
@@ -582,4 +597,36 @@ async fn chatgpt_protocol_before_output_remains_unknown_not_an_uncharged_refusal
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(events.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn malformed_go_identity_provider_and_wire_never_dispatch() {
+    for variant in 0..4 {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut raw = group(
+            GO,
+            [
+                ready(&calls, None),
+                ready(&calls, None),
+                ready(&calls, None),
+            ],
+        );
+        match variant {
+            0 => raw.page.entry.id = "opencode-go/invalid/page".into(),
+            1 => raw.page.entry.model.provider = WorkModelProvider::Compatible,
+            2 => raw.page.entry.model.wire = WorkModelWire::AnthropicMessages,
+            _ => raw.page.entry.id = "unscoped/page".into(),
+        }
+        let models = guard_run_sources(profile(), raw);
+        assert_eq!(
+            models
+                .page
+                .client
+                .call(request(&models.page), &|_| {})
+                .await
+                .err(),
+            Some(Kind::Go.unsupported())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 }

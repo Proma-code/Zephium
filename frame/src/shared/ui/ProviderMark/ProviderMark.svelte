@@ -1,5 +1,6 @@
 <script lang="ts">
   import ServerStack01Icon from "@hugeicons/core-free-icons/ServerStack01Icon";
+  import SourceCodeIcon from "@hugeicons/core-free-icons/SourceCodeIcon";
   import Icon from "$shared/ui/Icon";
   import { MARKS } from "./marks";
 
@@ -15,7 +16,8 @@
     | "groq"
     | "cerebras"
     | "compatible"
-    | "cloud";
+    | "cloud"
+    | "open_code_go";
 
   /** A provider's own mark in its own colours; a monochrome mark takes the
    *  surrounding ink, so it holds on a light tile and a dark one. */
@@ -55,7 +57,11 @@
           clip-rule={layer.evenOdd ? "evenodd" : undefined}
         />{/each}</g
     ></svg
-  >{:else}<Icon icon={ServerStack01Icon} size={Math.round(size * 0.94)} strokeWidth={1.6} />{/if}
+  >{:else}<Icon
+    icon={provider === "open_code_go" ? SourceCodeIcon : ServerStack01Icon}
+    size={Math.round(size * 0.94)}
+    strokeWidth={1.6}
+  />{/if}
 
 <style>
   .provider-mark {

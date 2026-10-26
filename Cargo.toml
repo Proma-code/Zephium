@@ -25,6 +25,7 @@ zephium-agent-runtime = { path = "crates/zephium-agent-runtime", version = "=0.1
 zephium-agent-provider-transport = { path = "crates/zephium-agent-provider-transport", version = "=0.1.0" }
 zephium-provider-accounts = { path = "crates/zephium-provider-accounts", version = "=0.1.0" }
 zephium-claude-broker = { path = "crates/zephium-claude-broker", version = "=0.1.0" }
+zephium-opencode-go = { path = "crates/zephium-opencode-go", version = "=0.1.0" }
 zephium-gateway = { path = "crates/zephium-gateway", version = "=0.1.0" }
 zephium-chatgpt = { path = "crates/zephium-chatgpt", version = "=0.1.0" }
 zephium-agent-controller = { path = "crates/zephium-agent-controller", version = "=0.1.0" }

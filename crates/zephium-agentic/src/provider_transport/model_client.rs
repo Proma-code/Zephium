@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use sha2::{Digest as _, Sha256};
 use zephium_core::work::model::{
-    ChatGptModelFault, GatewayModelFault, HostedRefusal, WorkModelClient, WorkModelEntry,
-    WorkModelError, WorkModelEvent, WorkModelPrice, WorkModelRef, WorkModelUsage,
+    ChatGptModelFault, GatewayModelFault, HostedRefusal, OpenCodeGoModelFault, WorkModelClient,
+    WorkModelEntry, WorkModelError, WorkModelEvent, WorkModelPrice, WorkModelRef, WorkModelUsage,
 };
 
 use super::*;
@@ -337,6 +337,15 @@ const fn failure_for(error: WorkModelError) -> AgentProviderFailure {
             ChatGptModelFault::UsageLimit | ChatGptModelFault::Unavailable => {
                 AgentProviderFailureClass::Provider
             }
+        },
+        WorkModelError::OpenCodeGo { fault, .. } => match fault {
+            OpenCodeGoModelFault::NotConfigured | OpenCodeGoModelFault::Unauthorized => {
+                AgentProviderFailureClass::Authentication
+            }
+            OpenCodeGoModelFault::Forbidden => AgentProviderFailureClass::Permission,
+            OpenCodeGoModelFault::Unsupported => AgentProviderFailureClass::InvalidRequest,
+            // Explicit-source failures must never become automatic paid retries.
+            _ => AgentProviderFailureClass::Provider,
         },
         WorkModelError::Gateway { fault, .. } => match fault {
             GatewayModelFault::NotConfigured | GatewayModelFault::Unauthorized => {

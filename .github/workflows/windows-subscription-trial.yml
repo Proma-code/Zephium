@@ -44,6 +44,11 @@ jobs:
       - name: Isolation contract and build guard tests
         run: |
           ./scripts/test-windows-trial-staging.ps1
+          ./scripts/test-windows-trial-install-checks.ps1
+          rustc --edition 2021 --test desktop/src/subscription_registry.rs -o "$env:RUNNER_TEMP/subscription-registry-tests.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$env:RUNNER_TEMP/subscription-registry-tests.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node --test scripts/windows-trial.test.mjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked --manifest-path desktop/windows-trial-config-tests/Cargo.toml
@@ -57,6 +62,7 @@ jobs:
           src/features/settings/tests/AiSubscriptions.component.test.ts
           src/features/settings/tests/ChatGptAccount.component.test.ts
           src/features/settings/tests/LocalGateway.component.test.ts
+          src/features/settings/tests/OpenCodeGo.component.test.ts
           src/features/settings/tests/AiPage.component.test.ts
           src/features/work/tests/ModelPicker.component.test.ts
           src/shared/ui/Select/tests/Select.component.test.ts
@@ -66,7 +72,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm --dir frame run check:styles
       - name: Native account protocol and trial Credential Manager tests
-        run: cargo test -p zephium-chatgpt -p zephium-gateway -p zephium-provider-accounts -p zephium-credentials --locked --features zephium-credentials/windows-subscription-trial
+        run: cargo test -p zephium-chatgpt -p zephium-gateway -p zephium-opencode-go -p zephium-provider-accounts -p zephium-credentials --locked --features zephium-credentials/windows-subscription-trial
       - name: Subscription routing, accounting and profile-erasure journal regressions
         run: |
           cargo test -p zephium-app --features work-runtime,work-execution --locked work_models::tests
@@ -81,6 +87,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p zephium-ipc --locked local_gateway::tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p zephium-ipc --locked opencode_go::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p zephium-agentic --features provider-transport --locked opencode_go::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p zephium-agentic --features provider-transport --locked local_gateway::tests
       - name: Protected native trial identity test (no user profile)
         run: cargo test -p zephium-private-fs --lib --locked subscription_trial_has_a_distinct_closed_native_storage_component
@@ -91,10 +101,22 @@ jobs:
           python scripts/release/third_party_notices.py target/THIRD_PARTY_NOTICES.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo clippy -p zephium-desktop --all-targets --locked --features windows-subscription-trial -- -D warnings
+      - name: Regenerate complete native IPC bindings and reject drift
+        run: |
+          $env:TAURI_CONFIG = Get-Content desktop/tauri.windows-subscription-trial.conf.json -Raw
+          cargo test -p zephium-desktop --locked --features windows-subscription-trial subscription_registry
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p zephium-desktop --locked --features windows-subscription-trial export_typescript_bindings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --exit-code -- frame/src/shared/ipc/bindings.ts frame/src/shared/ipc/work-constants.ts
       - name: Build unsigned isolated Windows installer
         run: node scripts/windows-trial.mjs --build
       - name: Verify generated installer identity and stage checksums
         run: ./scripts/stage-windows-trial.ps1
+      - name: Disposable installer preservation smoke (synthetic sentinels, no app launch)
+        run: |
+          $installer = Join-Path $PWD 'target/windows-subscription-trial-artifact/Zephium-Subscription-Trial-Windows-x64-setup.exe'
+          ./scripts/windows-trial-install-smoke.ps1 -ExpectedSourceRevision $env:GITHUB_SHA -ExpectedInstallerSha256 ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant())
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: Zephium-Subscription-Trial-Windows-x64-${{ github.sha }}

@@ -7,6 +7,7 @@ use specta::Type;
 
 pub mod chatgpt;
 pub mod local_gateway;
+pub mod opencode_go;
 pub mod page_assist;
 mod time;
 pub mod work;

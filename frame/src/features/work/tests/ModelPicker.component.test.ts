@@ -7,6 +7,7 @@ import { preferences } from "$domain/preferences";
 import ModelPicker from "../components/bar/ModelPicker.svelte";
 import ModelBarStage from "./ModelBarStage.svelte";
 import { PROFILE, entry, models } from "$shared/testing/work-models";
+import { goView } from "$shared/testing/opencode-go";
 import { gatewayView } from "$shared/testing/gateway";
 import { chatgptView } from "$shared/testing/chatgpt";
 import type { ChatGptViewV1 } from "$shared/ipc/chatgpt-bindings";
@@ -66,6 +67,11 @@ vi.mock("$shared/ipc/chatgpt-bindings", async () => {
     chatgptRefreshModels: chatgpt.models,
   });
 });
+const go = vi.hoisted(() => ({ read: vi.fn(), check: vi.fn(), disconnect: vi.fn() }));
+vi.mock("$shared/ipc/go-bindings", async () => {
+  const { mockGoBindings } = await import("$shared/testing/opencode-go");
+  return mockGoBindings({ goStatus: go.read, goCheck: go.check, goDisconnect: go.disconnect });
+});
 const gateway = vi.hoisted(() => ({ read: vi.fn(), check: vi.fn(), disconnect: vi.fn() }));
 vi.mock("$shared/ipc/gateway-bindings", async () => {
   const { mockGatewayBindings } = await import("$shared/testing/gateway");
@@ -76,6 +82,9 @@ vi.mock("$shared/ipc/gateway-bindings", async () => {
   });
 });
 beforeEach(() => {
+  for (const command of Object.values(go)) command.mockReset();
+  go.read.mockResolvedValue(goView(PROFILE));
+  go.disconnect.mockResolvedValue(goView(PROFILE));
   for (const command of Object.values(gateway)) command.mockReset();
   gateway.read.mockResolvedValue(gatewayView(PROFILE));
   gateway.disconnect.mockResolvedValue(gatewayView(PROFILE));
@@ -158,6 +167,7 @@ test("the rail holds every provider, each with its own state", async () => {
     "Groq, needs a key",
     "Cerebras, needs a key",
     "Custom server, connect a server",
+    "OpenCode Go, choose a connection",
   ]);
 });
 
@@ -965,4 +975,93 @@ test("gateway setup opens existing Settings, never inline secrets or automatic m
   await screen.getByRole("button", { name: "Set up local gateway" }).click();
   expect(onsettings).toHaveBeenCalledTimes(1);
   expect(gateway.check).not.toHaveBeenCalled();
+});
+
+test("OpenCode Go has its own provider seat, clean models, and no automatic catalog request", async () => {
+  await page.viewport(1000, 800);
+  const id = `opencode-go/${"a".repeat(32)}/example`;
+  const catalog = models({ keys: { open_ai: "valid" }, lead: id, chosen: id });
+  catalog.entries.push(
+    entry("open_code_go", "example", "Example", false, ["lead"], {
+      id,
+      price: null,
+      supports: {
+        tools: true,
+        vision: false,
+        prompt_cache: false,
+        reasoning: false,
+        native_search: false,
+      },
+    }),
+  );
+  native.read.mockResolvedValue(catalog);
+  native.ready.mockImplementation(ready(true));
+  go.read.mockResolvedValue(
+    goView(PROFILE, {
+      state: "catalogued",
+      connection_id: "a".repeat(32),
+      models: 1,
+      last_billing: { source: "go_plus", observed_at_ms: "1700000000000" },
+    }),
+  );
+  const screen = await render(ModelPicker, { profile: PROFILE });
+  await screen.getByRole("button", { name: "Model: Example", exact: true }).click();
+  await expect
+    .element(screen.getByRole("tab", { name: "OpenCode Go", exact: true }))
+    .toHaveAttribute("aria-selected", "true");
+  expect(screen.getByRole("tab", { name: /^OpenCode Go/u }).all()).toHaveLength(1);
+  await expect.element(screen.getByRole("option", { name: /^Example(?:\s|$)/u })).toBeVisible();
+  await expect
+    .element(screen.getByRole("option", { name: /^Example(?:\s|$)/u }))
+    .toHaveAttribute("data-id", id);
+  await expect
+    .element(screen.getByText("Public catalog; not key or plan verification."))
+    .toBeVisible();
+  await expect
+    .element(
+      screen.getByText("Last provider-reported billing: Go Plus allowance", { exact: false }),
+    )
+    .toBeVisible();
+  await expect
+    .element(screen.getByText("Remaining OpenCode Go quota is not provided by this connection."))
+    .toBeVisible();
+  expect(go.check).not.toHaveBeenCalled();
+  const choices = native.choose.mock.calls.length;
+  await screen.getByRole("tab", { name: "OpenAI", exact: true }).click();
+  expect(native.choose).toHaveBeenCalledTimes(choices);
+  await expect
+    .element(screen.getByRole("button", { name: "Model: Example", exact: true }))
+    .toBeVisible();
+  await screen.getByRole("tab", { name: "OpenCode Go", exact: true }).click();
+  native.read.mockResolvedValue({
+    ...catalog,
+    entries: catalog.entries.filter((row) => row.id !== id),
+    effective: { ...catalog.effective, lead: null },
+  });
+  await screen.getByRole("button", { name: "Disconnect OpenCode Go" }).click();
+  emitNativeEvent("workModelsChanged", { version: 1 });
+  await expect
+    .element(screen.getByText("Saved OpenCode Go model unavailable", { exact: false }))
+    .toBeVisible();
+  expect(go.disconnect).toHaveBeenCalledExactlyOnceWith(PROFILE, "a".repeat(32));
+  expect(native.choose).toHaveBeenCalledTimes(choices);
+  await screen.getByRole("tab", { name: "OpenAI", exact: true }).click();
+  await expect.element(screen.getByRole("option", { name: /^GPT-6 Luna(?:\s|$)/u })).toBeVisible();
+});
+
+test("Go setup uses its own settings flow, not the generic API-key or Custom form", async () => {
+  await page.viewport(1000, 800);
+  native.read.mockResolvedValue(models({}));
+  native.ready.mockImplementation(ready(false));
+  const onsettings = vi.fn();
+  const screen = await render(ModelPicker, { profile: PROFILE, onsettings });
+  await screen.getByRole("button", { name: "Connect a model" }).click();
+  await screen.getByRole("tab", { name: /^OpenCode Go/u }).click();
+  await expect.element(screen.getByText("No OpenCode Go key saved")).toBeVisible();
+  await expect
+    .element(screen.getByRole("button", { name: "Add key", exact: true }))
+    .not.toBeInTheDocument();
+  await screen.getByRole("button", { name: "Set up OpenCode Go" }).click();
+  expect(onsettings).toHaveBeenCalledTimes(1);
+  expect(go.check).not.toHaveBeenCalled();
 });

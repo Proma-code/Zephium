@@ -610,3 +610,26 @@ async fn cold_load_disconnect_cannot_delete_after_profile_scope_retires() {
     assert_eq!(s.view().connection_id, id);
     assert!(vault.load(PROFILE).unwrap().is_some());
 }
+
+#[tokio::test]
+async fn retirement_during_tool_notification_cannot_return_executable_outcome() {
+    let (service, fake) = setup(PROFILE, Arc::new(MemoryVault::default()));
+    save(&service).await;
+    service
+        .check_models(service.view().connection_id)
+        .await
+        .unwrap();
+    let lease = service.lease(&service.entries()[0].id).unwrap();
+    let tools = AtomicUsize::new(0);
+    let result = service
+        .call(lease, request(), &|event| {
+            if matches!(event, WorkModelEvent::ToolCall(_)) {
+                tools.fetch_add(1, Ordering::SeqCst);
+                service.set_foreground(false);
+            }
+        })
+        .await;
+    assert_eq!(result.err(), Some(retired(true)));
+    assert_eq!(tools.load(Ordering::SeqCst), 1);
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+}

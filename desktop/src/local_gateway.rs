@@ -23,14 +23,16 @@ mod live {
         services: Mutex<HashMap<ProfileId, Arc<Service>>>,
         foreground: std::sync::RwLock<Option<String>>,
         scope_epoch: std::sync::atomic::AtomicU64,
+        closed: std::sync::atomic::AtomicBool,
     }
     impl Registry {
         // Read identity and epoch under one foreground lock so an A→B→A
         // transition cannot revive a command awaiting the actor profile view.
         fn capture_scope(&self, expected: &str) -> Option<u64> {
             let current = self.foreground.read().ok()?;
-            (current.as_deref() == Some(expected))
-                .then(|| self.scope_epoch.load(std::sync::atomic::Ordering::Acquire))
+            (!self.closed.load(std::sync::atomic::Ordering::Acquire)
+                && current.as_deref() == Some(expected))
+            .then(|| self.scope_epoch.load(std::sync::atomic::Ordering::Acquire))
         }
         fn owns_scope(&self, expected: &str, epoch: u64) -> bool {
             self.capture_scope(expected) == Some(epoch)
@@ -46,7 +48,8 @@ mod live {
             service: &Service,
         ) -> Option<zephium_gateway::service::Scope> {
             let current = self.foreground.read().ok()?;
-            if current.as_deref() != Some(expected)
+            if self.closed.load(std::sync::atomic::Ordering::Acquire)
+                || current.as_deref() != Some(expected)
                 || self.scope_epoch.load(std::sync::atomic::Ordering::Acquire) != epoch
             {
                 return None;
@@ -54,7 +57,22 @@ mod live {
             service.scope().ok()
         }
         fn get(&self, profile: ProfileId) -> Option<Arc<Service>> {
-            self.services.lock().ok()?.get(&profile).cloned()
+            let services = self.services.lock().ok()?;
+            if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+                return None;
+            }
+            services.get(&profile).cloned()
+        }
+        fn close(&self) {
+            let services = super::super::subscription_registry::close(
+                &self.services,
+                &self.foreground,
+                &self.scope_epoch,
+                &self.closed,
+            );
+            for service in services {
+                service.close();
+            }
         }
         fn service(
             &self,
@@ -62,6 +80,9 @@ mod live {
             require_foreground: bool,
         ) -> Result<Arc<Service>, Fault> {
             let mut services = self.services.lock().map_err(|_| Fault::Vault)?;
+            if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(Fault::Cancelled);
+            }
             if let Some(service) = services.get(&profile) {
                 return Ok(service.clone());
             }
@@ -184,12 +205,44 @@ mod live {
             }))
         }
     }
+    #[cfg(test)]
+    mod registry_tests {
+        use super::*;
+
+        #[test]
+        fn subscription_registry_cannot_create_first_service_after_shutdown() {
+            let profile = ProfileId::parse("00000000000000000000000001").unwrap();
+            let registry = Registry {
+                services: Mutex::new(HashMap::new()),
+                foreground: std::sync::RwLock::new(Some(profile.to_string())),
+                scope_epoch: std::sync::atomic::AtomicU64::new(0),
+                closed: std::sync::atomic::AtomicBool::new(false),
+            };
+            let old_scope = registry.capture_scope(&profile.to_string()).unwrap();
+            registry.close();
+            assert!(!registry.owns_scope(&profile.to_string(), old_scope));
+            assert!(matches!(
+                registry.service(profile, true),
+                Err(Fault::Cancelled)
+            ));
+            assert!(matches!(
+                registry.service(profile, false),
+                Err(Fault::Cancelled)
+            ));
+            assert!(registry.get(profile).is_none());
+            assert!(registry.services.lock().unwrap().is_empty());
+            registry.close();
+            assert!(registry.capture_scope(&profile.to_string()).is_none());
+        }
+    }
+
     pub(super) fn install() {
         let registry = REGISTRY.get_or_init(|| {
             Arc::new(Registry {
                 services: Mutex::new(HashMap::new()),
                 foreground: std::sync::RwLock::new(None),
                 scope_epoch: std::sync::atomic::AtomicU64::new(0),
+                closed: std::sync::atomic::AtomicBool::new(false),
             })
         });
         zephium_app::work_models::install_gateway_session(registry.clone());
@@ -204,6 +257,9 @@ mod live {
             let Ok(services) = registry.services.lock() else {
                 return;
             };
+            if registry.closed.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
             if let Ok(mut foreground) = registry.foreground.write() {
                 if *foreground != current {
                     registry
@@ -231,27 +287,20 @@ mod live {
     }
     pub(super) fn stop() {
         if let Some(registry) = REGISTRY.get() {
-            let services = registry
-                .services
-                .lock()
-                .map(|services| services.values().cloned().collect::<Vec<_>>())
-                .unwrap_or_default();
-            for service in services {
-                service.close();
-            }
+            registry.close();
         }
     }
     pub(super) async fn drained() -> bool {
-        let services = REGISTRY
-            .get()
-            .and_then(|registry| {
-                registry
-                    .services
-                    .lock()
-                    .ok()
-                    .map(|services| services.values().cloned().collect::<Vec<_>>())
-            })
-            .unwrap_or_default();
+        let Some(registry) = REGISTRY.get() else {
+            return true;
+        };
+        if !registry.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        let services = match registry.services.lock() {
+            Ok(services) => services.values().cloned().collect::<Vec<_>>(),
+            Err(_) => return false,
+        };
         tokio::time::timeout(std::time::Duration::from_secs(2), async move {
             for service in services {
                 service.drained().await;

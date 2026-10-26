@@ -19,6 +19,7 @@ const WIRE = {
   cerebras: "chat_completions",
   compatible: "chat_completions",
   cloud: "anthropic_messages",
+  open_code_go: "chat_completions",
 } as const;
 
 const SLUG = {
@@ -33,6 +34,7 @@ const SLUG = {
   cerebras: "cerebras",
   compatible: "compatible",
   cloud: "zephium",
+  open_code_go: "opencode-go",
 } as const;
 
 export function entry(

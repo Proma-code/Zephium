@@ -257,15 +257,18 @@ impl Service {
     /// Close task admission and stop output. Only app shutdown uses this; a
     /// normal sign-out remains reversible by another explicit sign-in.
     pub fn close(&self) {
-        {
+        let first = {
             let mut tasks = self.tasks.state.lock().unwrap_or_else(|e| e.into_inner());
-            if tasks.closed {
-                return;
-            }
+            let first = !tasks.closed;
             tasks.closed = true;
-        }
+            first
+        };
+        // A concurrent first close may have latched task admission but not yet
+        // retired the foreground lease. Every returning close must fence output.
         self.set_foreground(false);
-        self.stop();
+        if first {
+            self.stop();
+        }
     }
 
     /// Whether a retired owner has no outstanding task obligation. The native
@@ -1772,6 +1775,25 @@ mod tests {
         assert!(!service.accepts(old, "gpt-fixture"));
         assert!(service.accepts(service.lease().unwrap(), "gpt-fixture"));
         assert!(!service.accepts(service.lease().unwrap(), "unknown-model"));
+    }
+
+    #[tokio::test]
+    async fn repeated_close_fences_output_when_first_close_has_only_closed_admission() {
+        let (service, _, _) = fixture(Some(token("fixture", u64::MAX)));
+        service.load().await.unwrap();
+        assert!(service.lease().is_some());
+        let cancellation = service.cancellation.subscribe();
+        // Deterministic state of a first close paused before its foreground fence.
+        service.tasks.state.lock().unwrap().closed = true;
+        service.close();
+        assert!(service.lease().is_none());
+        assert!(!service.state.read().unwrap().foreground);
+        assert!(cancellation.has_changed().unwrap());
+        let epoch = *service.cancellation.borrow();
+        service.close();
+        assert_eq!(*service.cancellation.borrow(), epoch);
+        service.set_foreground(true);
+        assert!(service.lease().is_none());
     }
 
     #[tokio::test]

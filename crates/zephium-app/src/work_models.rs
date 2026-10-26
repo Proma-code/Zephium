@@ -134,6 +134,43 @@ pub trait WorkGatewaySession: Send + Sync {
 }
 static GATEWAY: RwLock<Option<Arc<dyn WorkGatewaySession>>> = RwLock::new(None);
 
+/// Original OpenCode Go service; this is not a global BYOK key or CLI login.
+pub trait WorkGoSession: Send + Sync {
+    /// Erase only this profile's subscription access key before deletion finalizes.
+    fn erase_profile(&self, profile: ProfileId, deadline: Instant) -> bool;
+    /// Cached exact-model catalog; no I/O under the model-state lock.
+    fn entries(&self, profile: ProfileId) -> Vec<WorkModelEntry>;
+    /// Bind a revocable source and opaque native conversation. A metadata-only
+    /// client with no session must refuse dispatch rather than invent a session.
+    fn client(
+        &self,
+        profile: ProfileId,
+        model_id: &str,
+        session: Option<String>,
+    ) -> Result<Arc<dyn WorkModelClient>, WorkModelError>;
+}
+static GO: RwLock<Option<Arc<dyn WorkGoSession>>> = RwLock::new(None);
+/// Install the native owner without selecting a model or changing API keys.
+pub fn install_go_session(session: Arc<dyn WorkGoSession>) {
+    if let Ok(mut slot) = GO.write() {
+        *slot = Some(session);
+    }
+    notify();
+}
+/// Native configuration/catalog or completed request attribution changed.
+pub fn go_session_changed() {
+    notify();
+}
+fn go() -> Option<Arc<dyn WorkGoSession>> {
+    GO.read().ok()?.clone()
+}
+#[cfg(test)]
+pub(crate) fn replace_go_for_test(
+    session: Option<Arc<dyn WorkGoSession>>,
+) -> Option<Arc<dyn WorkGoSession>> {
+    std::mem::replace(&mut *GO.write().unwrap(), session)
+}
+
 static SETTINGS: RwLock<Option<Arc<dyn WorkModelSettings>>> = RwLock::new(None);
 static CLOUD: RwLock<Option<Arc<dyn WorkCloudSession>>> = RwLock::new(None);
 static CHATGPT: RwLock<Option<Arc<dyn WorkChatGptSession>>> = RwLock::new(None);
@@ -190,6 +227,7 @@ pub fn chatgpt_session_changed() {
 pub(crate) fn erase_local_account_profiles(profile: ProfileId, deadline: Instant) -> bool {
     chatgpt().is_none_or(|session| session.erase_profile(profile, deadline))
         && gateway().is_none_or(|session| session.erase_profile(profile, deadline))
+        && go().is_none_or(|session| session.erase_profile(profile, deadline))
 }
 
 #[cfg(test)]
@@ -220,8 +258,11 @@ fn is_chatgpt(entry: &WorkModelEntry) -> bool {
 fn is_gateway(entry: &WorkModelEntry) -> bool {
     entry.id.starts_with("gateway/")
 }
+fn is_go(entry: &WorkModelEntry) -> bool {
+    entry.id.starts_with("opencode-go/")
+}
 fn is_explicit_connection(entry: &WorkModelEntry) -> bool {
-    is_chatgpt(entry) || is_gateway(entry)
+    is_chatgpt(entry) || is_gateway(entry) || is_go(entry)
 }
 
 fn gateway_entries(profile: ProfileId) -> Vec<WorkModelEntry> {
@@ -242,6 +283,34 @@ fn gateway_entries(profile: ProfileId) -> Vec<WorkModelEntry> {
                 && !entry.model.model.is_empty()
                 && entry.model.provider == P::Compatible
                 && entry.model.wire == WorkModelWire::ChatCompletions
+                && entry.price.is_none()
+                && !entry.supports.reasoning
+                && !entry.supports.native_search
+                && !entry.supports.vision
+        })
+        .collect()
+}
+
+fn go_entries(profile: ProfileId) -> Vec<WorkModelEntry> {
+    go().map(|session| session.entries(profile))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| {
+            let mut parts = entry.id.splitn(3, '/');
+            parts.next() == Some("opencode-go")
+                && parts.next().is_some_and(|id| {
+                    id.len() == 32
+                        && id
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+                && parts.next() == Some(entry.model.model.as_str())
+                && !entry.model.model.is_empty()
+                && entry.model.provider == P::OpenCodeGo
+                && matches!(
+                    entry.model.wire,
+                    WorkModelWire::ChatCompletions | WorkModelWire::OpenAiResponses
+                )
                 && entry.price.is_none()
                 && !entry.supports.reasoning
                 && !entry.supports.native_search
@@ -819,6 +888,7 @@ fn effective(state: &State, profile: ProfileId, role: WorkModelRole) -> Option<W
             return chatgpt_entries(profile)
                 .into_iter()
                 .chain(gateway_entries(profile))
+                .chain(go_entries(profile))
                 .find(|entry| entry.id == choice.id);
         }
         let exists = if choice.model.provider == P::Cloud {
@@ -1089,6 +1159,58 @@ fn client(
     client_for(state, entry, None, None)
 }
 
+/// Derive a stable opaque conversation header from native provenance, never a
+/// prompt/system-text cache key. Raw local task/profile identifiers stay local.
+fn go_conversation(
+    profile: ProfileId,
+    model_id: &str,
+    source: Option<&WorkCallSource>,
+) -> Result<Option<String>, WorkModelError> {
+    use sha2::{Digest, Sha256};
+    let unsupported = WorkModelError::OpenCodeGo {
+        fault: OpenCodeGoModelFault::Unsupported,
+        usage_unknown: false,
+    };
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let (kind, id) = match source {
+        WorkCallSource::Task {
+            profile: owner,
+            work,
+        } if owner == &profile.to_string() => ("work", work.as_str()),
+        WorkCallSource::Page { conversation, .. } => ("page", conversation.as_str()),
+        _ => return Err(unsupported),
+    };
+    if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
+        return Err(unsupported);
+    }
+    let connection = model_id
+        .strip_prefix("opencode-go/")
+        .and_then(|id| id.split_once('/'))
+        .map(|(connection, _)| connection)
+        .ok_or(unsupported)?;
+    if connection.len() != 32
+        || !connection
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(unsupported);
+    }
+    let mut hash = Sha256::new();
+    for value in [
+        "zephium-opencode-go/v1",
+        profile.to_string().as_str(),
+        connection,
+        kind,
+        id,
+    ] {
+        hash.update(value.as_bytes());
+        hash.update([0]);
+    }
+    Ok(Some(format!("{:x}", hash.finalize())))
+}
+
 fn client_for(
     state: &State,
     entry: &WorkModelEntry,
@@ -1119,6 +1241,21 @@ fn client_for(
             .find(|current| current.id == entry.id)
             .ok_or(unavailable)?;
         return gateway().ok_or(unavailable)?.client(profile, &current.id);
+    }
+    if is_go(entry) {
+        let unavailable = WorkModelError::OpenCodeGo {
+            fault: OpenCodeGoModelFault::NotConfigured,
+            usage_unknown: false,
+        };
+        let profile = profile.ok_or(unavailable)?;
+        let current = go_entries(profile)
+            .into_iter()
+            .find(|current| current.id == entry.id)
+            .ok_or(unavailable)?;
+        let session = go_conversation(profile, &current.id, source.as_ref())?;
+        return go()
+            .ok_or(unavailable)?
+            .client(profile, &current.id, session);
     }
     let provider = entry.model.provider;
     let (target, credential): (LeadTarget, Arc<dyn LeadCredential>) = match provider {
@@ -1154,6 +1291,12 @@ fn client_for(
                 provider,
                 generation: state.generations.get(&provider).copied().unwrap_or(0),
             }));
+        }
+        P::OpenCodeGo => {
+            return Err(WorkModelError::OpenCodeGo {
+                fault: OpenCodeGoModelFault::NotConfigured,
+                usage_unknown: false,
+            })
         }
         P::Compatible => (
             LeadTarget::compatible(&compatible_base().ok_or(WorkModelError::MissingKey)?)?,
@@ -1216,6 +1359,7 @@ pub async fn resolve_entry_for(
             chatgpt_entries(profile)
                 .into_iter()
                 .chain(gateway_entries(profile))
+                .chain(go_entries(profile))
                 .any(|entry| entry.id == source.id && !entry.roles.contains(&role))
         });
         if source.as_ref().is_some_and(is_chatgpt) {
@@ -1232,6 +1376,15 @@ pub async fn resolve_entry_for(
                     GatewayModelFault::Unsupported
                 } else {
                     GatewayModelFault::NotConfigured
+                },
+                usage_unknown: false,
+            }
+        } else if source.as_ref().is_some_and(is_go) {
+            WorkModelError::OpenCodeGo {
+                fault: if unsupported_role {
+                    OpenCodeGoModelFault::Unsupported
+                } else {
+                    OpenCodeGoModelFault::NotConfigured
                 },
                 usage_unknown: false,
             }
@@ -1285,6 +1438,7 @@ pub async fn view(profile: ProfileId) -> WorkModelsView {
     let mut entries = entries(&state);
     entries.extend(chatgpt_entries(profile));
     entries.extend(gateway_entries(profile));
+    entries.extend(go_entries(profile));
     for role in ROLES {
         if let Some(choice) = stored_choice(&state, profile, role) {
             if !is_explicit_connection(&choice)
@@ -1350,6 +1504,7 @@ pub fn choose(
                 .into_iter()
                 .chain(chatgpt_entries(profile))
                 .chain(gateway_entries(profile))
+                .chain(go_entries(profile))
                 .chain(state.listed.values().flatten().cloned())
                 .find(|entry| entry.id == id)
                 .ok_or(WorkModelError::BadRequest)?;
@@ -2340,6 +2495,192 @@ mod tests {
         assert_eq!(key_status(&state(), P::OpenAi), WorkKeyStatus::Set);
     }
 
+    #[tokio::test]
+    async fn go_is_an_explicit_profile_source_not_a_free_compatible_fallback() {
+        let _guard = CHATGPT_TEST_SERIAL.lock().await;
+        install_settings(Arc::new(Memory(Mutex::new(HashMap::new()))));
+        with_keys(&[P::OpenAi, P::Compatible]);
+        struct Go {
+            profile: ProfileId,
+            entry: WorkModelEntry,
+        }
+        struct Client;
+        impl WorkModelClient for Client {
+            fn call<'a>(
+                &'a self,
+                _: WorkModelRequest,
+                _: &'a (dyn Fn(WorkModelEvent) + Send + Sync),
+            ) -> WorkModelFuture<'a> {
+                Box::pin(async { Err(WorkModelError::Cancelled) })
+            }
+        }
+        impl WorkGoSession for Go {
+            fn erase_profile(&self, _: ProfileId, _: Instant) -> bool {
+                true
+            }
+            fn entries(&self, profile: ProfileId) -> Vec<WorkModelEntry> {
+                if profile == self.profile {
+                    vec![self.entry.clone()]
+                } else {
+                    vec![]
+                }
+            }
+            fn client(
+                &self,
+                profile: ProfileId,
+                id: &str,
+                _: Option<String>,
+            ) -> Result<Arc<dyn WorkModelClient>, WorkModelError> {
+                if profile == self.profile && id == self.entry.id {
+                    Ok(Arc::new(Client))
+                } else {
+                    Err(WorkModelError::BadRequest)
+                }
+            }
+        }
+        struct Restore(Option<Arc<dyn WorkGoSession>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                replace_go_for_test(self.0.take());
+            }
+        }
+        let profile = profile_id(47);
+        let byok = models::builtin()
+            .into_iter()
+            .find(|entry| entry.model.provider == P::OpenAi)
+            .unwrap();
+        let mut entry = byok.clone();
+        entry.id = format!("opencode-go/{}/fixture/model", "a".repeat(32));
+        entry.model = WorkModelRef {
+            provider: P::OpenCodeGo,
+            wire: WorkModelWire::ChatCompletions,
+            model: "fixture/model".into(),
+        };
+        entry.display_name = "Fixture".into();
+        entry.roles = vec![
+            WorkModelRole::Lead,
+            WorkModelRole::Page,
+            WorkModelRole::Light,
+        ];
+        entry.price = None;
+        entry.supports.reasoning = false;
+        entry.supports.native_search = false;
+        entry.supports.vision = false;
+        choose(profile, WorkModelRole::Lead, Some(&byok.id)).unwrap();
+        let _restore = Restore(replace_go_for_test(Some(Arc::new(Go {
+            profile,
+            entry: entry.clone(),
+        }))));
+        assert_eq!(
+            effective(&state(), profile, WorkModelRole::Lead)
+                .unwrap()
+                .id,
+            byok.id
+        );
+        assert_eq!(go_entries(profile_id(48)), Vec::<WorkModelEntry>::new());
+        assert_eq!(
+            choose(profile_id(48), WorkModelRole::Lead, Some(&entry.id)),
+            Err(WorkModelError::BadRequest)
+        );
+        choose(profile, WorkModelRole::Lead, Some(&entry.id)).unwrap();
+        assert_eq!(
+            effective(&state(), profile, WorkModelRole::Lead)
+                .unwrap()
+                .id,
+            entry.id
+        );
+        assert!(resolve_entry(profile, WorkModelRole::Lead).await.is_ok());
+        for role in [WorkModelRole::Page, WorkModelRole::Light] {
+            assert_eq!(effective(&state(), profile, role).unwrap().id, entry.id);
+            assert_eq!(resolve_entry(profile, role).await.unwrap().0.id, entry.id);
+        }
+        assert_eq!(
+            search_readiness(profile).await,
+            WorkSearchReadiness::Unavailable
+        );
+        choose(profile, WorkModelRole::Page, Some(&byok.id)).unwrap();
+        assert_eq!(
+            effective(&state(), profile, WorkModelRole::Page)
+                .unwrap()
+                .id,
+            byok.id
+        );
+        assert_eq!(
+            effective(&state(), profile, WorkModelRole::Light)
+                .unwrap()
+                .id,
+            entry.id
+        );
+        choose(profile, WorkModelRole::Page, None).unwrap();
+        assert!(!model_fallback_allowed(&entry, &byok));
+        assert!(!model_fallback_allowed(&byok, &entry));
+        assert!(!paid_search_fallback_allowed(&[&entry]));
+        assert!(!helper_fallback_allowed(
+            profile,
+            WorkModelRole::Page,
+            &entry
+        ));
+        assert!(super::view(profile)
+            .await
+            .entries
+            .iter()
+            .any(|e| e.id == entry.id));
+        assert!(!super::view(profile)
+            .await
+            .efforts
+            .iter()
+            .any(|(id, _)| id == &entry.id));
+        let mut limited = entry.clone();
+        limited.roles = vec![WorkModelRole::Lead];
+        replace_go_for_test(Some(Arc::new(Go {
+            profile,
+            entry: limited,
+        })));
+        assert!(effective(&state(), profile, WorkModelRole::Page).is_none());
+        assert!(matches!(
+            resolve_entry(profile, WorkModelRole::Page).await,
+            Err(WorkModelError::OpenCodeGo {
+                fault: OpenCodeGoModelFault::Unsupported,
+                usage_unknown: false
+            })
+        ));
+        assert!(!helper_fallback_allowed(
+            profile,
+            WorkModelRole::Page,
+            &byok
+        ));
+        replace_go_for_test(None);
+        go_session_changed();
+        assert!(effective(&state(), profile, WorkModelRole::Lead).is_none());
+        assert!(effective(&state(), profile, WorkModelRole::Page).is_none());
+        assert!(effective(&state(), profile, WorkModelRole::Light).is_none());
+        for role in [WorkModelRole::Page, WorkModelRole::Light] {
+            assert!(matches!(
+                resolve_entry(profile, role).await,
+                Err(WorkModelError::OpenCodeGo {
+                    fault: OpenCodeGoModelFault::NotConfigured,
+                    usage_unknown: false
+                })
+            ));
+        }
+        assert_eq!(
+            stored_choice(&state(), profile, WorkModelRole::Lead)
+                .unwrap()
+                .id,
+            entry.id
+        );
+        assert!(!super::view(profile).await.entries.iter().any(is_go));
+        assert!(matches!(
+            resolve_entry(profile, WorkModelRole::Lead).await,
+            Err(WorkModelError::OpenCodeGo {
+                fault: OpenCodeGoModelFault::NotConfigured,
+                usage_unknown: false
+            })
+        ));
+        assert_eq!(key_status(&state(), P::Compatible), WorkKeyStatus::Set);
+        assert_eq!(key_status(&state(), P::OpenAi), WorkKeyStatus::Set);
+    }
+
     #[test]
     fn subscription_routes_cannot_fall_through_to_other_billing_paths() {
         let byok = models::builtin()
@@ -2355,6 +2696,53 @@ mod tests {
         assert!(paid_search_fallback_allowed(&[&byok]));
         assert!(!paid_search_fallback_allowed(&[&byok, &subscription]));
         assert!(!paid_search_fallback_allowed(&[&subscription, &byok]));
+    }
+
+    #[test]
+    fn go_conversation_uses_native_scope_not_model_or_prompt_cache() {
+        let profile = profile_id(51);
+        let model = format!("opencode-go/{}/glm-5.3", "a".repeat(32));
+        let other_model = format!("opencode-go/{}/gpt-6-luna", "a".repeat(32));
+        let task = WorkCallSource::Task {
+            profile: profile.to_string(),
+            work: "native-work-one".into(),
+        };
+        let first = go_conversation(profile, &model, Some(&task))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.len(), 64);
+        assert_eq!(
+            Some(first.clone()),
+            go_conversation(profile, &other_model, Some(&task)).unwrap()
+        );
+        assert_eq!(None, go_conversation(profile, &model, None).unwrap());
+        assert!(go_conversation(profile_id(52), &model, Some(&task)).is_err());
+        assert!(go_conversation(profile, &model, Some(&WorkCallSource::Voice)).is_err());
+        let next = WorkCallSource::Task {
+            profile: profile.to_string(),
+            work: "native-work-two".into(),
+        };
+        assert_ne!(
+            Some(first.clone()),
+            go_conversation(profile, &model, Some(&next)).unwrap()
+        );
+        let changed_key = model.replace(&"a".repeat(32), &"b".repeat(32));
+        assert_ne!(
+            Some(first),
+            go_conversation(profile, &changed_key, Some(&task)).unwrap()
+        );
+        let page = WorkCallSource::Page {
+            conversation: "native-conversation".into(),
+            reply: 1,
+        };
+        let next_reply = WorkCallSource::Page {
+            conversation: "native-conversation".into(),
+            reply: 2,
+        };
+        assert_eq!(
+            go_conversation(profile, &model, Some(&page)).unwrap(),
+            go_conversation(profile, &model, Some(&next_reply)).unwrap()
+        );
     }
 
     fn profile_id(id: u128) -> ProfileId {

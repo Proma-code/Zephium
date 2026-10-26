@@ -98,6 +98,7 @@ mod media;
 mod memory_pressure;
 mod menu_text;
 mod notes;
+mod opencode_go;
 mod overlay;
 mod page_assist;
 #[cfg(target_os = "macos")]
@@ -115,6 +116,8 @@ mod spaces;
 mod startup_alert;
 #[cfg(feature = "work-development-traces")]
 mod startup_styles;
+#[cfg(windows)]
+mod subscription_registry;
 mod swipe;
 mod system_time;
 mod updates;
@@ -881,6 +884,7 @@ impl ShutdownCoordinator {
         drop(admission);
         chatgpt::stop();
         local_gateway::stop();
+        opencode_go::stop();
     }
 
     fn try_startup_admission(&self, admit: impl FnOnce() -> bool) -> bool {
@@ -942,6 +946,10 @@ impl ShutdownCoordinator {
                 if !chatgpt::drained().await {
                     coordinator.terminal_failure.store(true, Ordering::Release);
                     diagnostic!("shutdown: ChatGPT account mutation cleanup was not proven");
+                }
+                if !opencode_go::drained().await {
+                    coordinator.terminal_failure.store(true, Ordering::Release);
+                    diagnostic!("shutdown: OpenCode Go mutation cleanup was not proven");
                 }
                 if !local_gateway::drained().await {
                     coordinator.terminal_failure.store(true, Ordering::Release);
@@ -5774,6 +5782,7 @@ fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
     {
         chatgpt::stop();
         local_gateway::stop();
+        opencode_go::stop();
         return;
     };
     if exit_request_is_authorized(
@@ -5893,6 +5902,10 @@ pub fn run() {
         chatgpt::chatgpt_cancel,
         chatgpt::chatgpt_sign_out,
         chatgpt::chatgpt_refresh_models,
+        opencode_go::go_status,
+        opencode_go::go_save,
+        opencode_go::go_check,
+        opencode_go::go_disconnect,
         local_gateway::gateway_status,
         local_gateway::gateway_save,
         local_gateway::gateway_check,
@@ -5927,6 +5940,7 @@ pub fn run() {
         .invoke_handler(move |invoke| {
             if zephium_ipc::chatgpt::ChatGptCommand::owns(invoke.message.command())
                 || zephium_ipc::local_gateway::GatewayCommand::owns(invoke.message.command())
+                || zephium_ipc::opencode_go::GoCommand::owns(invoke.message.command())
             {
                 account_handler(invoke)
             } else {
@@ -6058,6 +6072,7 @@ pub fn run() {
                 work_models::install(app.handle());
                 chatgpt::install(app.handle());
                 local_gateway::install();
+                opencode_go::install();
                 account::install(app.handle());
 
                 #[cfg(target_os = "windows")]
@@ -6526,6 +6541,7 @@ pub fn run() {
                 Projection::Profiles(view) => {
                     chatgpt::profiles_changed(&view);
                     local_gateway::profiles_changed(&view);
+                    opencode_go::profiles_changed(&view);
                     emit_to_privileged(&emit_handle, MAIN_LABEL, "zephium:profiles", &view)
                 }
 

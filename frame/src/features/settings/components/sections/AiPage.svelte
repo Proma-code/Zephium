@@ -8,6 +8,7 @@
     keyedProviders,
     hasChatGptModels,
     hasGatewayModels,
+    hasGoModels,
     connectionName,
     locked,
     modelName,
@@ -60,6 +61,7 @@
     !!models &&
       (hasChatGptModels(models) ||
         hasGatewayModels(models) ||
+        hasGoModels(models) ||
         usable(models, "cloud") ||
         keyedProviders.some((provider) => usable(models, provider))),
   );
@@ -78,7 +80,8 @@
       provider === "deep_seek" ||
       provider === "cloud" ||
       provider === "open_ai" ||
-      provider === "compatible"
+      provider === "compatible" ||
+      provider === "open_code_go"
         ? modelName(entry)
         : `${entry.display_name} · ${providerName(provider)}`;
     return note ? `${name} · ${note}` : name;
@@ -91,11 +94,13 @@
 
   function roleDescription(row: (typeof roles)[number]) {
     const selected = models?.chosen[row.role];
-    const connection = selected?.startsWith("chatgpt/")
-      ? m.model_source_chatgpt()
-      : selected?.startsWith("gateway/")
-        ? m.model_source_gateway()
-        : connectionLabel(entryOf(models, selected ?? models?.effective[row.role]));
+    const connection = selected?.startsWith("opencode-go/")
+      ? m.go_title()
+      : selected?.startsWith("chatgpt/")
+        ? m.model_source_chatgpt()
+        : selected?.startsWith("gateway/")
+          ? m.model_source_gateway()
+          : connectionLabel(entryOf(models, selected ?? models?.effective[row.role]));
     return connection
       ? `${row.description()} ${m.model_connection_info({ source: connection })}`
       : row.description();
@@ -113,14 +118,18 @@
     ]).ready.flatMap((group) => group.entries);
     const chosen = models?.chosen[role];
     const missingAccountChoice =
-      (chosen?.startsWith("chatgpt/") || chosen?.startsWith("gateway/")) &&
+      (chosen?.startsWith("chatgpt/") ||
+        chosen?.startsWith("gateway/") ||
+        chosen?.startsWith("opencode-go/")) &&
       !offered.some((entry) => entry.id === chosen)
         ? [
             {
               value: chosen,
-              label: chosen.startsWith("gateway/")
-                ? m.gateway_choice_unavailable()
-                : m.ai_chatgpt_choice_unavailable(),
+              label: chosen.startsWith("opencode-go/")
+                ? m.go_choice_unavailable()
+                : chosen.startsWith("gateway/")
+                  ? m.gateway_choice_unavailable()
+                  : m.ai_chatgpt_choice_unavailable(),
               disabled: true,
             },
           ]
@@ -164,6 +173,7 @@
         />{/each}{/if}
   </SettingsGroup>
 
+  <AiConnectionOptions kind="go" profile={profile.id} />
   <AiConnectionOptions kind="gateway" profile={profile.id} />
 
   <SettingsGroup

@@ -14,6 +14,7 @@
     keyedProviders,
     hasChatGptModels,
     hasGatewayModels,
+    hasGoModels,
     connectionName,
     locked,
     modelName,
@@ -84,6 +85,7 @@
   const current = $derived(entryOf(models, models?.effective[role]));
   const chosen = $derived(models?.effective[role] ?? null);
   const savedAccountChoice = $derived(models?.chosen[role]?.startsWith("chatgpt/") ?? false);
+  const savedGoChoice = $derived(models?.chosen[role]?.startsWith("opencode-go/") ?? false);
   const savedGatewayChoice = $derived(models?.chosen[role]?.startsWith("gateway/") ?? false);
   const groups = $derived(pickerGroups(models, role, session?.endpoint ?? []));
   const tierOf = $derived(tiers(groups.ready));
@@ -103,7 +105,7 @@
     const own: Seat[] = [];
     const ready: Seat[] = [];
     const rest: Seat[] = [];
-    for (const provider of ["cloud", ...keyedProviders] as const) {
+    for (const provider of ["cloud", ...keyedProviders, "open_code_go"] as const) {
       if (provider === "cloud") {
         if (usable(models, provider) || account?.signed_in)
           own.push({ provider, standing: "ready" });
@@ -112,7 +114,8 @@
       } else if (
         usable(models, provider) ||
         (provider === "open_ai" && hasChatGptModels(models)) ||
-        (provider === "compatible" && hasGatewayModels(models))
+        (provider === "compatible" && hasGatewayModels(models)) ||
+        (provider === "open_code_go" && hasGoModels(models))
       )
         ready.push({ provider, standing: "ready" });
       else
@@ -152,7 +155,13 @@
         (row) =>
           row.provider ===
           (current?.model.provider ??
-            (savedAccountChoice ? "open_ai" : savedGatewayChoice ? "compatible" : null)),
+            (savedAccountChoice
+              ? "open_ai"
+              : savedGatewayChoice
+                ? "compatible"
+                : savedGoChoice
+                  ? "open_code_go"
+                  : null)),
       )?.provider ??
       seats[0]?.provider ??
       null
@@ -556,7 +565,8 @@
           seat &&
           seat.standing !== "ready" &&
           shownSource !== "chatgpt" &&
-          shownSource !== "gateway"
+          shownSource !== "gateway" &&
+          shown !== "open_code_go"
         )
           step(seat);
         return;
@@ -821,7 +831,17 @@
             {/await}
           {/if}
         {/if}
-        {#if !spanning && ((shownSource === "chatgpt" && !hasChatGptModels(models)) || (shownSource === "gateway" && !hasGatewayModels(models)))}
+        {#if shown === "open_code_go" && !spanning && open}
+          {#if savedGoChoice && !hasGoModels(models)}<p class="note" role="status">
+              {m.go_choice_unavailable()}
+            </p>{/if}
+          {#await import("./ModelGo.svelte")}
+            <p class="note" role="status">{m.go_loading()}</p>
+          {:then connection}
+            <connection.default {profile} hasModels={hasGoModels(models)} onsettings={settings} />
+          {:catch}<p class="note failure" role="alert">{m.go_load_failed()}</p>{/await}
+        {/if}
+        {#if !spanning && ((shownSource === "chatgpt" && !hasChatGptModels(models)) || (shownSource === "gateway" && !hasGatewayModels(models)) || (shown === "open_code_go" && !hasGoModels(models)))}
           <!-- The native connection view above explains the missing catalog. -->
         {:else if shown === "open_ai" && !spanning && source === "api" && !usable(models, "open_ai")}
           <ModelAsk
@@ -849,7 +869,7 @@
           <div
             class="list"
             class:account-list={!spanning &&
-              (shownSource === "chatgpt" || shownSource === "gateway")}
+              (shownSource === "chatgpt" || shownSource === "gateway" || shown === "open_code_go")}
             id="{uid}-list"
             role="listbox"
             aria-label={searching ? m.model_search() : title}

@@ -5434,6 +5434,8 @@ export type WorkModelPrice = {
 export type WorkModelProvider = "open_ai" | "anthropic" | "google" | "deep_seek" | "open_router" | "xai" | "mistral" | "groq" | "cerebras" |
 /**  Any OpenAI-compatible chat endpoint the person configured. */
 "compatible" |
+/**  OpenCode Go, using its own profile-owned subscription access key. */
+"open_code_go" |
 /**  Zephium Cloud: the upstream's native body, our base URL and bearer. */
 "cloud";
 

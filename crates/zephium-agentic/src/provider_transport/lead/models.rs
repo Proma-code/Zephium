@@ -412,7 +412,8 @@ pub fn wire(provider: WorkModelProvider) -> WorkModelWire {
         | P::Groq
         | P::Cerebras
         | P::Compatible
-        | P::Cloud => WorkModelWire::ChatCompletions,
+        | P::Cloud
+        | P::OpenCodeGo => WorkModelWire::ChatCompletions,
     }
 }
 
@@ -434,6 +435,7 @@ pub fn provider_slug(provider: WorkModelProvider) -> &'static str {
         P::Groq => "groq",
         P::Cerebras => "cerebras",
         P::Compatible => "compatible",
+        P::OpenCodeGo => "opencode-go",
         P::Cloud => "zephium",
     }
 }
@@ -451,6 +453,7 @@ pub fn provider_from_slug(slug: &str) -> Option<WorkModelProvider> {
         "groq" => P::Groq,
         "cerebras" => P::Cerebras,
         "compatible" => P::Compatible,
+        "opencode-go" => P::OpenCodeGo,
         "zephium" => P::Cloud,
         _ => return None,
     })
@@ -677,7 +680,7 @@ pub fn parse_cloud_defaults(body: &Value) -> Option<CloudDefaults> {
 fn cloud_row(row: &Value) -> Option<CloudModel> {
     let text = |key: &str| row.get(key).and_then(Value::as_str);
     let upstream = provider_from_slug(text("provider")?)?;
-    if matches!(upstream, P::Cloud | P::Compatible) {
+    if matches!(upstream, P::Cloud | P::Compatible | P::OpenCodeGo) {
         return None;
     }
     let id = text("id").filter(|id| valid_text(id, 128))?;
