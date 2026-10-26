@@ -72,6 +72,22 @@ impl RetainedStatusOnly {
     }
 }
 
+// Closed diagnostic vocabulary only; never prints arbitrary error/provider text.
+fn process_failure_category(error: &'static str) -> i32 {
+    match error {
+        "cancelled before creation" => 1,
+        "cancelled or resume failed" => 2,
+        "confined process creation failed" => 3,
+        "retained environment proof failed" => 4,
+        "retained environment binding changed" => 5,
+        "retained status owner mismatch" => 6,
+        "retained status profile rejected" => 7,
+        "retained status runtime rejected" => 8,
+        "retained status custody missing" => 9,
+        _ => 0,
+    }
+}
+
 #[cfg(all(windows, feature = "native-fixtures"))]
 mod native {
     use super::*;
@@ -149,10 +165,39 @@ mod native {
             crate::windows::diagnostic("durable-status-dirty-admitted", 0);
             // Image preparation and the actual spawn both retain this same
             // operation. The process seam derives all paths from ActiveStore.
+            let image_started = Instant::now();
+            crate::windows::diagnostic(
+                "durable-status-before-image-budget-ms",
+                control
+                    .deadline()
+                    .saturating_duration_since(image_started)
+                    .as_millis()
+                    .min(i32::MAX as u128) as i32,
+            );
             let image = active
                 .stage_verified_image(&self.original)
                 .map_err(|_| Error::Process)?;
+            let image_finished = Instant::now();
             crate::windows::diagnostic("durable-status-image-held", 0);
+            crate::windows::diagnostic(
+                "durable-status-image-elapsed-ms",
+                image_finished
+                    .duration_since(image_started)
+                    .as_millis()
+                    .min(i32::MAX as u128) as i32,
+            );
+            crate::windows::diagnostic(
+                "durable-status-after-image-budget-ms",
+                control
+                    .deadline()
+                    .saturating_duration_since(image_finished)
+                    .as_millis()
+                    .min(i32::MAX as u128) as i32,
+            );
+            crate::windows::diagnostic(
+                "durable-status-after-image-expired",
+                i32::from(image_finished >= control.deadline()),
+            );
             let call = process::run_store_status(
                 active,
                 &image,
@@ -160,7 +205,17 @@ mod native {
                 self.policy.owner,
                 control,
             )
-            .map_err(|_| Error::Process)?;
+            .map_err(|error| {
+                crate::windows::diagnostic(
+                    "durable-status-process-failure",
+                    process_failure_category(error),
+                );
+                crate::windows::diagnostic(
+                    "durable-status-failure-expired",
+                    i32::from(Instant::now() >= control.deadline()),
+                );
+                Error::Process
+            })?;
             crate::windows::diagnostic("durable-status-native-returned", 0);
             let status = ActiveStore::finish_status_fixture(call).map_err(|_| Error::Protocol)?;
             // CLEAN concerns native operation settlement only. Status comes only
@@ -423,6 +478,24 @@ mod tests {
             ),
             Err(Error::Closed)
         );
+    }
+    #[test]
+    fn process_failure_diagnostics_never_relax_or_expose_unknown_messages() {
+        assert_eq!(process_failure_category("cancelled before creation"), 1);
+        assert_eq!(process_failure_category("cancelled or resume failed"), 2);
+        assert_eq!(
+            process_failure_category("confined process creation failed"),
+            3
+        );
+        assert_eq!(
+            process_failure_category("retained environment proof failed"),
+            4
+        );
+        assert_eq!(
+            process_failure_category("retained status custody missing"),
+            9
+        );
+        assert_eq!(process_failure_category("synthetic unknown message"), 0);
     }
     #[test]
     fn retained_status_binds_full_key_and_allows_fresh_readback_only() {
