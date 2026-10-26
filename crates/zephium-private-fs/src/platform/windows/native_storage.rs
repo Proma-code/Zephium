@@ -31,6 +31,8 @@ pub use work_fixture::NativeWorkStorageTestSession;
 pub enum NativeApplication {
     /// The ordinary Zephium installation.
     Product,
+    /// The separately installed Windows subscription-account trial.
+    SubscriptionTrial,
     /// `pnpm dev` builds, kept apart from the installed product's profile.
     Development,
     /// The separately identified browser hardening review installation.
@@ -55,6 +57,7 @@ impl NativeApplication {
     fn component(self) -> &'static str {
         match self {
             Self::Product => "app.zephium",
+            Self::SubscriptionTrial => "app.zephium.subscription-trial",
             Self::Development => "app.zephium.dev",
             Self::ReviewQa => "app.zephium.review-qa",
             Self::ExtensionQa => "app.zephium.webext-qa",

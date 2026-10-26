@@ -1,0 +1,49 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Zephium Subscription Trial",
+  "identifier": "app.zephium.subscription-trial",
+  "mainBinaryName": "zephium-subscription-trial",
+  "build": {
+    "devUrl": null
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "create": false,
+        "title": "Zephium Subscription Trial",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 680,
+        "minHeight": 480,
+        "decorations": false,
+        "shadow": true,
+        "transparent": true,
+        "url": "browser.html"
+      }
+    ]
+  },
+  "bundle": {
+    "targets": ["nsis"],
+    "createUpdaterArtifacts": false,
+    "publisher": "Proma-code (experimental fork)",
+    "homepage": "https://github.com/Proma-code/Zephium",
+    "shortDescription": "An isolated Windows trial of Zephium subscription-account development.",
+    "fileAssociations": [],
+    "resources": {
+      "../target/THIRD_PARTY_NOTICES.txt": "licenses/THIRD_PARTY_NOTICES.txt"
+    },
+    "windows": {
+      "webviewInstallMode": { "type": "skip" },
+      "nsis": {
+        "installerHooks": "windows/subscription-trial-hooks.nsh",
+        "installMode": "currentUser",
+        "startMenuFolder": "Zephium Subscription Trial"
+      }
+    }
+  },
+  "plugins": {
+    "updater": null,
+    "deep-link": null
+  }
+}

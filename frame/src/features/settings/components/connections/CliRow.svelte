@@ -7,22 +7,33 @@
   import * as m from "$shared/i18n/messages";
 
   /** A tool, or `null` while its status is being asked. */
-  let { id, cli }: { id: "gh" | "git" | "codex" | "claude"; cli: WorkCliRowV1 | null } = $props();
+  let {
+    id,
+    cli,
+  }: { id: "gh" | "git" | "codex" | "claude" | "opencode"; cli: WorkCliRowV1 | null } = $props();
 
   const NAME = {
     gh: m.connections_cli_gh,
     git: m.connections_cli_git,
     codex: m.connections_cli_codex,
     claude: m.connections_cli_claude,
+    opencode: m.connections_cli_opencode,
   } as const;
   const DOES = {
     gh: m.connections_cli_gh_desc,
     git: m.connections_cli_git_desc,
     codex: m.connections_cli_codex_desc,
     claude: m.connections_cli_claude_desc,
+    opencode: m.connections_cli_opencode_desc,
   } as const;
   /** What the person runs in Terminal to sign in. */
-  const LOGIN = { gh: "gh auth login", git: "", codex: "codex login", claude: "claude auth login" };
+  const LOGIN = {
+    gh: "gh auth login",
+    git: "",
+    codex: "codex login",
+    claude: "claude auth login",
+    opencode: "opencode auth login",
+  };
 
   const status = $derived.by(() => {
     if (!cli) return { tone: "quiet", text: m.connections_checking() };
@@ -54,6 +65,7 @@
     git: "https://git-scm.com/install/mac",
     codex: "https://developers.openai.com/codex/cli/",
     claude: "https://code.claude.com/docs/en/setup",
+    opencode: "https://opencode.ai/docs/",
   };
   let linkFailed = $state(false);
   const missing = $derived(cli?.status === "missing");

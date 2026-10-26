@@ -4,7 +4,9 @@ import {
   contextSize,
   dollars,
   effortLevels,
+  hasChatGptModels,
   locked,
+  modelName,
   pickerGroups,
   priceTier,
   searchEntries,
@@ -71,7 +73,7 @@ describe("the picker's list", () => {
   test("the trigger drops a family name the mark already says", () => {
     const opus: WorkModelEntry = entry("anthropic", "claude-opus-5-5", "Claude Opus 5.5", true);
     expect(shortName(opus)).toBe("Opus 5.5");
-    expect(shortName(entry("open_ai", "gpt-6-sol", "GPT-6 Sol", true))).toBe("GPT-6 Sol");
+    expect(shortName(entry("open_ai", "gpt-6-sol", "GPT-6 Sol", true))).toBe("GPT-6 Sol · API");
   });
 });
 
@@ -111,4 +113,74 @@ describe("the picker's details", () => {
     expect(effortLevels(view, "nobody/none")).toEqual([]);
     expect(view.effort).toBe("high");
   });
+});
+
+describe("ChatGPT account models", () => {
+  const chatgpt = () =>
+    entry("open_ai", "gpt-example", "GPT Example · ChatGPT", false, ["lead", "page"], {
+      id: "chatgpt/gpt-example",
+      price: null,
+    });
+
+  test("native account models work without granting access to OpenAI API models", () => {
+    const view = models({});
+    view.entries.push(chatgpt());
+    expect(usable(view, "open_ai")).toBe(false);
+    expect(hasChatGptModels(view)).toBe(true);
+    const groups = pickerGroups(view, "lead");
+    expect(groups.ready.find((group) => group.provider === "open_ai")?.entries).toEqual([
+      chatgpt(),
+    ]);
+    expect(groups.needsKey).not.toContain("open_ai");
+  });
+
+  test("API key access and account models remain independent, and disconnect removes only the latter", () => {
+    const view = models({ keys: { open_ai: "valid" } });
+    view.entries.push(chatgpt());
+    expect(
+      pickerGroups(view, "lead").ready.find((group) => group.provider === "open_ai")?.entries,
+    ).toContainEqual(chatgpt());
+    view.entries = view.entries.filter((entry) => !entry.id.startsWith("chatgpt/"));
+    expect(hasChatGptModels(view)).toBe(false);
+    expect(usable(view, "open_ai")).toBe(true);
+    expect(
+      pickerGroups(view, "lead").ready.find((group) => group.provider === "open_ai")?.entries,
+    ).toHaveLength(3);
+  });
+
+  test("endpoint and more-model results cannot invent subscription eligibility", () => {
+    for (const keys of [{}, { open_ai: "valid" as const }]) {
+      const view = models({ keys });
+      expect(hasChatGptModels(view)).toBe(false);
+      expect(
+        pickerGroups(view, "lead", [chatgpt()]).ready.flatMap((group) => group.entries),
+      ).not.toContainEqual(chatgpt());
+    }
+  });
+
+  test("account models respect role admission and keep their billing identity in search", () => {
+    const view = models({});
+    view.entries.push(chatgpt());
+    const groups = pickerGroups(view, "page");
+    expect(searchEntries(groups.ready, "chatgpt")).toEqual([chatgpt()]);
+    expect(pickerGroups(view, "decision").ready).toEqual([]);
+  });
+});
+
+test("OpenAI billing labels distinguish identical models without mutating native identities", () => {
+  const api = entry("open_ai", "gpt-example", "GPT Example", false);
+  const subscription = { ...api, id: "chatgpt/gpt-example" };
+  expect(modelName(api)).toBe("GPT Example · API");
+  expect(modelName(subscription)).toBe("GPT Example · ChatGPT");
+  expect(modelName({ ...subscription, display_name: "GPT Example · ChatGPT" })).toBe(
+    "GPT Example · ChatGPT",
+  );
+  expect(modelName({ ...api, display_name: "GPT Example · API" })).toBe("GPT Example · API");
+  expect(api.display_name).toBe("GPT Example");
+  expect(api.id).toBe("openai/gpt-example");
+  const view = models({ keys: { open_ai: "valid" } });
+  view.entries.push(api, subscription);
+  const groups = pickerGroups(view, "lead");
+  expect(searchEntries(groups.ready, "gpt example api")).toEqual([api]);
+  expect(searchEntries(groups.ready, "gpt example chatgpt")).toEqual([subscription]);
 });

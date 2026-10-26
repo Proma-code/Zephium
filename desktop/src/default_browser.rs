@@ -28,8 +28,8 @@ fn status() -> DefaultBrowserStatus {
     };
     #[cfg(target_os = "windows")]
     return DefaultBrowserStatus {
-        is_default: windows::is_default(),
-        can_request: true,
+        is_default: !cfg!(feature = "windows-subscription-trial") && windows::is_default(),
+        can_request: !cfg!(feature = "windows-subscription-trial"),
     };
     #[cfg(target_os = "linux")]
     return DefaultBrowserStatus {
@@ -71,6 +71,10 @@ pub(crate) async fn default_browser_status(caller: WebviewWindow) -> Option<Defa
 pub(crate) async fn default_browser_request(caller: WebviewWindow) -> Option<DefaultBrowserStatus> {
     if !authorize(&caller, CallerPolicy::Main, "default_browser_request") {
         return None;
+    }
+    // The trial must never overwrite the installed browser's registration.
+    if cfg!(feature = "windows-subscription-trial") {
+        return Some(read_status().await);
     }
     static ASKING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
     let Ok(_permit) = ASKING.try_acquire() else {

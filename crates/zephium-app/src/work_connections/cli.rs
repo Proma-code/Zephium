@@ -25,15 +25,17 @@ pub enum Cli {
     Git,
     Codex,
     Claude,
+    OpenCode,
 }
 impl Cli {
-    pub const ALL: [Cli; 4] = [Cli::Gh, Cli::Git, Cli::Codex, Cli::Claude];
+    pub const ALL: [Cli; 5] = [Cli::Gh, Cli::Git, Cli::Codex, Cli::Claude, Cli::OpenCode];
     pub fn program(self) -> &'static str {
         match self {
             Cli::Gh => "gh",
             Cli::Git => "git",
             Cli::Codex => "codex",
             Cli::Claude => "claude",
+            Cli::OpenCode => "opencode",
         }
     }
     pub fn id(self) -> &'static str {
@@ -48,6 +50,9 @@ impl Cli {
             Cli::Git => Some(&["config", "--global", "user.name"]),
             Cli::Codex => Some(&["login", "status"]),
             Cli::Claude => Some(&["auth", "status"]),
+            // V1's display and V2's JSON differ. Installed is not authenticated;
+            // a future qualified broker must negotiate a versioned contract.
+            Cli::OpenCode => None,
         }
     }
 }
@@ -60,6 +65,8 @@ pub enum CliAuth {
     /// The tool has no account (git): ready to use.
     NotNeeded(Option<String>),
     Unknown,
+    /// Native execution is closed; installation and authentication were not checked.
+    Unavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -395,34 +402,37 @@ pub fn auth_of(cli: Cli, ok: bool, out: &str) -> CliAuth {
             let name = out.trim();
             CliAuth::NotNeeded((ok && !name.is_empty()).then(|| name.chars().take(64).collect()))
         }
-        Cli::Codex => {
-            if ok && out.contains("Logged in") {
-                CliAuth::SignedIn(if out.contains("ChatGPT") {
-                    Some("ChatGPT".into())
-                } else if out.contains("API key") {
-                    Some("API key".into())
-                } else {
-                    None
-                })
+        Cli::Codex | Cli::Claude => {
+            use zephium_provider_accounts::status::{claude_status, codex_status, AccountStatus};
+            match if cli == Cli::Codex {
+                codex_status(ok, out)
             } else {
-                CliAuth::SignedOut
+                claude_status(ok, out)
+            } {
+                AccountStatus::ChatGpt => CliAuth::SignedIn(Some("ChatGPT".into())),
+                AccountStatus::Claude => CliAuth::SignedIn(Some("Claude Code".into())),
+                AccountStatus::ApiCredential => CliAuth::SignedIn(Some("API key".into())),
+                AccountStatus::ExternalProvider => {
+                    CliAuth::SignedIn(Some("External provider".into()))
+                }
+                AccountStatus::SignedOut => CliAuth::SignedOut,
+                AccountStatus::Unknown => CliAuth::Unknown,
             }
         }
-        Cli::Claude => match serde_json::from_str::<Value>(out) {
-            Ok(value) if value["loggedIn"] == Value::Bool(true) => CliAuth::SignedIn(
-                value["email"]
-                    .as_str()
-                    .or_else(|| value["authMethod"].as_str())
-                    .map(str::to_owned),
-            ),
-            Ok(_) => CliAuth::SignedOut,
-            Err(_) => CliAuth::Unknown,
-        },
+        Cli::OpenCode => CliAuth::Unknown,
     }
 }
 
 /// One tool's status, found and asked afresh.
 pub async fn status(cli: Cli) -> CliStatus {
+    if ensure_available().is_err() {
+        return CliStatus {
+            cli,
+            path: None,
+            version: None,
+            auth: CliAuth::Unavailable,
+        };
+    }
     let path = tokio::task::spawn_blocking(move || locate(cli))
         .await
         .ok()
@@ -456,18 +466,43 @@ pub async fn status(cli: Cli) -> CliStatus {
 
 /// Every known tool, asked in parallel.
 pub async fn statuses() -> Vec<CliStatus> {
-    let (gh, git, codex, claude) = tokio::join!(
+    let (gh, git, codex, claude, opencode) = tokio::join!(
         status(Cli::Gh),
         status(Cli::Git),
         status(Cli::Codex),
-        status(Cli::Claude)
+        status(Cli::Claude),
+        status(Cli::OpenCode)
     );
-    vec![gh, git, codex, claude]
+    vec![gh, git, codex, claude, opencode]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn closed_gate_reports_unchecked_not_missing_for_every_cli() {
+        assert!(ensure_available().is_err());
+        let rows = statuses().await;
+        assert_eq!(rows.len(), Cli::ALL.len());
+        for (row, expected) in rows.iter().zip(Cli::ALL) {
+            assert_eq!(row.cli, expected);
+            assert_eq!(row.auth, CliAuth::Unavailable);
+            assert!(row.path.is_none());
+            assert!(row.version.is_none());
+            assert!(!row.usable());
+        }
+    }
+
+    #[test]
+    fn opencode_installation_is_not_subscription_evidence() {
+        assert_eq!(Cli::OpenCode.program(), "opencode");
+        assert!(Cli::OpenCode.status_args().is_none());
+        assert_eq!(
+            auth_of(Cli::OpenCode, true, "OpenAI oauth"),
+            CliAuth::Unknown
+        );
+    }
 
     #[cfg(unix)]
     #[test]
@@ -535,7 +570,7 @@ mod tests {
                     .is_none());
                 let status = status(Cli::Gh).await;
                 assert!(!status.usable());
-                assert_eq!(status.auth, CliAuth::Unknown);
+                assert_eq!(status.auth, CliAuth::Unavailable);
             });
         assert!(!marker.exists());
     }
@@ -567,7 +602,7 @@ mod tests {
                 true,
                 r#"{"loggedIn": true, "authMethod": "claude.ai", "email": "a@b.c"}"#
             ),
-            CliAuth::SignedIn(Some("a@b.c".into()))
+            CliAuth::SignedIn(Some("Claude Code".into()))
         );
         assert_eq!(
             auth_of(Cli::Claude, true, r#"{"loggedIn": false}"#),

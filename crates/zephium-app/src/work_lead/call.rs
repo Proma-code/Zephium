@@ -39,6 +39,12 @@ impl WorkLeadModels {
 pub(crate) enum CallFailure {
     /// Nothing was sent or nothing was charged; the note says why.
     Refused(WorkModelError),
+    /// ChatGPT reported a terminal refusal after output began. Usage is unknown,
+    /// so retain a local conservative reservation without inventing a bill.
+    ChatGptAfterOutput {
+        fault: ChatGptModelFault,
+        reservation: WorkUsage,
+    },
     /// The call may have been charged, with no usable answer.
     Lost,
     /// The run stopped or ran out of time while the call ran.
@@ -84,6 +90,25 @@ fn priced(price: &WorkModelPrice, fresh: u64, cached: u64, output: u64) -> u64 {
         part(fresh, price.input) + part(cached, price.cached_input) + part(output, price.output),
     )
     .unwrap_or(u64::MAX)
+}
+
+fn subscription_failure_after_output(
+    error: WorkModelError,
+    observed_output: bool,
+    remaining: WorkExecutionLimits,
+) -> Option<CallFailure> {
+    let WorkModelError::ChatGpt { fault } = error else {
+        return None;
+    };
+    observed_output.then_some(CallFailure::ChatGptAfterOutput {
+        fault,
+        reservation: WorkUsage {
+            model_tokens: remaining.model_tokens,
+            cost_micro_usd: remaining.cost_micro_usd,
+            operations: 1,
+            accounting: WorkUsageAccounting::ConservativeReservation,
+        },
+    })
 }
 
 /// Runs one call and charges the run. Transient refusals retry twice,
@@ -172,6 +197,19 @@ pub(crate) async fn call(
             && error != WorkModelError::Cancelled
         {
             return Err(CallFailure::Lost);
+        }
+        if let Some(failure @ CallFailure::ChatGptAfterOutput { reservation, .. }) =
+            subscription_failure_after_output(
+                error,
+                first_event.load(std::sync::atomic::Ordering::Relaxed) != 0,
+                run.remaining(),
+            )
+        {
+            // The provider can reject usage after streaming began. Keep the
+            // local reservation and the precise fault; do not retry or claim
+            // that the account was charged this conservative amount.
+            run.charge(reservation);
+            return Err(failure);
         }
         let wait = match error {
             WorkModelError::RateLimited { retry_after_ms } => rate_limit_wait(retry_after_ms),
@@ -280,6 +318,44 @@ pub(crate) fn clip(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamed_subscription_refusal_preserves_unknown_usage_and_exact_fault() {
+        let remaining = WorkExecutionLimits {
+            model_tokens: 1234,
+            cost_micro_usd: 5678,
+            operations: 9,
+            timeout_seconds: 60,
+            max_workers: 1,
+        };
+        for fault in [
+            ChatGptModelFault::UsageLimit,
+            ChatGptModelFault::Unavailable,
+            ChatGptModelFault::SignedOut,
+        ] {
+            let error = WorkModelError::ChatGpt { fault };
+            assert_eq!(
+                subscription_failure_after_output(error, false, remaining),
+                None
+            );
+            assert_eq!(
+                subscription_failure_after_output(error, true, remaining),
+                Some(CallFailure::ChatGptAfterOutput {
+                    fault,
+                    reservation: WorkUsage {
+                        model_tokens: 1234,
+                        cost_micro_usd: 5678,
+                        operations: 1,
+                        accounting: WorkUsageAccounting::ConservativeReservation
+                    },
+                })
+            );
+        }
+        assert_eq!(
+            subscription_failure_after_output(WorkModelError::Unauthorized, true, remaining),
+            None
+        );
+    }
 
     #[test]
     fn a_rate_limit_is_waited_out_or_handed_back_never_cut_short() {

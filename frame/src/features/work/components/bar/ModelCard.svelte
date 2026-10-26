@@ -11,7 +11,7 @@
 </script>
 
 <script lang="ts">
-  import { contextSize, dollars, effortName } from "$domain/ai";
+  import { contextSize, dollars, effortName, modelName } from "$domain/ai";
   import Icon from "$shared/ui/Icon";
   import ProviderMark from "$shared/ui/ProviderMark";
   import * as m from "$shared/i18n/messages";
@@ -48,7 +48,7 @@
     flagship: m.model_character_flagship,
   };
 
-  const name = $derived(subject.entry.display_name);
+  const name = $derived(modelName(subject.entry));
 
   /** What the model is like, then only what limits it. */
   const character = $derived.by(() => {

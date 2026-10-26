@@ -1,0 +1,204 @@
+{
+  "schema_version": 1,
+  "curated_on": "2026-10-25",
+  "scope": "Zephium Windows subscription accounts; local project adaptations",
+  "sources": {
+    "blueprint": {
+      "repository": "https://github.com/aiblueprinthq/ai-blueprint",
+      "commit": "a31461341770fe2fc88b0372fc9f49f15acda652",
+      "license": "MIT",
+      "license_file": ".agents/skills/licenses/blueprint-LICENSE",
+      "license_sha256": "f84a3bf018f380eeba8907a5090f4c6bea74121e42bd257535a78a25d6aa6c43"
+    },
+    "codexkit": {
+      "repository": "https://github.com/hoavdc/CodexKit",
+      "commit": "a41f58f34313fad3d150b97c4342e83558aae282",
+      "license": "MIT",
+      "license_file": ".agents/skills/licenses/codexkit-LICENSE",
+      "license_sha256": "e8e914d0e520dc92f475de4dd66bd837e563d83387d9a67dc59eb386706c06b3"
+    },
+    "ecc": {
+      "repository": "https://github.com/affaan-m/everything-claude-code",
+      "commit": "f3904009440af24f00617343910ee89714df8be3",
+      "license": "MIT",
+      "license_file": ".agents/skills/licenses/ecc-LICENSE",
+      "license_sha256": "326146379f01bb137c0a5d3c54770c1aa31076705c8b88a7f6b26a460f6221b2"
+    },
+    "antigravity": {
+      "repository": "https://github.com/sickn33/antigravity-awesome-skills",
+      "commit": "e8d346bcb691225fb6ae51a49c353bcedb2ef61d",
+      "license": "MIT",
+      "license_file": ".agents/skills/licenses/antigravity-LICENSE",
+      "license_sha256": "af98370a7edc0f00ec46979d049517833c9a7fa2ba74e3cf8cc42f7db557299d"
+    }
+  },
+  "skills": [
+    {
+      "name": "blueprint-feature-workflow",
+      "source": "blueprint",
+      "upstream_path": ".agents/skills/feature/SKILL.md",
+      "upstream_sha256": "2bac9f0866a873a3337fb5d1c6aed7ee3967f00deb16d1c6f6055236f3b797c7",
+      "installed_path": ".agents/skills/blueprint-feature-workflow/SKILL.md",
+      "adaptations": "Consolidates read feature/implement/check/audit workflow into local-only single-feature process; removes installer/dashboard/branch/commit/PR/merge automation and records in-progress adoption.",
+      "supporting_files": [],
+      "applied_evidence": [
+        "blueprint/project-plan.md",
+        "blueprint/build-plan.md",
+        "blueprint/context/current-feature.md",
+        "blueprint/verification.md"
+      ],
+      "additional_upstream_paths": [
+        ".agents/skills/implement/SKILL.md",
+        ".agents/skills/check/SKILL.md",
+        ".agents/skills/audit/SKILL.md"
+      ],
+      "additional_upstream_sha256": {
+        ".agents/skills/implement/SKILL.md": "4ed73180ec1fff161e8168e27197967fcb6dee2de979e6adc75b8301b839e56e",
+        ".agents/skills/check/SKILL.md": "3dfb8fedce5eab679dae94f337596ddc51bd63dba86b51b80fc94460d71fdf23",
+        ".agents/skills/audit/SKILL.md": "4559c7e3ac29999878995f824793085d4d1d650a99defc3d8b9eebd4ffa62784"
+      },
+      "installed_files": {
+        ".agents/skills/blueprint-feature-workflow/SKILL.md": "7e146aaa3625f20ce448258770c4bd70b59ea1d78fe2f90fa1adbf4c9618082c"
+      }
+    },
+    {
+      "name": "codexkit-high-signal-review",
+      "source": "codexkit",
+      "upstream_path": "skills/codexkit-high-signal-review/SKILL.md",
+      "upstream_sha256": "53ffe892cddaf9289138dcfe90ddec173b41b63c0bc4fc4108213f459df8d615",
+      "installed_path": ".agents/skills/codexkit-high-signal-review/SKILL.md",
+      "adaptations": "Normalized frontmatter; added project-scope guard; retained required severity reference. Optional examples/UI metadata not needed.",
+      "supporting_files": [
+        "references/severity-rubric.md"
+      ],
+      "applied_evidence": [
+        "blueprint/verification.md"
+      ],
+      "installed_files": {
+        ".agents/skills/codexkit-high-signal-review/SKILL.md": "78e9b0695719cb8818e84c94dbf739863537fc52a55dc3355850a75f73ce1c7a",
+        ".agents/skills/codexkit-high-signal-review/references/severity-rubric.md": "ae343e4ee4eaf9c27e3364b68fdfa32f0c1fa8c9841531b83de42a1001d1753e"
+      }
+    },
+    {
+      "name": "codexkit-test-hardening",
+      "source": "codexkit",
+      "upstream_path": "skills/codexkit-test-hardening/SKILL.md",
+      "upstream_sha256": "60967a923b4ba388c33c222ec1a51148b298d6c849251a1d1aeb038442cfb7c5",
+      "installed_path": ".agents/skills/codexkit-test-hardening/SKILL.md",
+      "adaptations": "Normalized frontmatter and added project guard. Reviewed but intentionally omitted unreferenced coverage-gap-finder.sh: auto-npx, failure swallowing, shell interpolation and unrelated coverage policy are unsuitable; not executed.",
+      "supporting_files": [],
+      "applied_evidence": [
+        "blueprint/verification.md (A2, A4, A6, A8)"
+      ],
+      "installed_files": {
+        ".agents/skills/codexkit-test-hardening/SKILL.md": "bd872055c1696d570d63e56aee97fb3435c5a3f723f4a701a2cd1a8c453dda54"
+      }
+    },
+    {
+      "name": "ecc-rust-patterns",
+      "source": "ecc",
+      "upstream_path": "skills/rust-patterns/SKILL.md",
+      "upstream_sha256": "51379df2bd92a482309e109e5a210210842594f660cceeb2d68d18e995108edf",
+      "installed_path": ".agents/skills/ecc-rust-patterns/SKILL.md",
+      "adaptations": "Namespaced entrypoint and project guard; removed misleading compile-equals-correct reminder; examples do not authorize cargo update or new dependencies.",
+      "supporting_files": [],
+      "applied_evidence": [
+        "blueprint/context/coding-standards.md",
+        "blueprint/context/current-feature.md (Data / contracts)"
+      ],
+      "installed_files": {
+        ".agents/skills/ecc-rust-patterns/SKILL.md": "10dc9804d0a2316284ac07ea4a1f04427c9339dd4b97315ddb47627c4061d3ff"
+      }
+    },
+    {
+      "name": "ecc-rust-testing",
+      "source": "ecc",
+      "upstream_path": "skills/rust-testing/SKILL.md",
+      "upstream_sha256": "02a9a40dcc42dd21d14730d29b13ee0a8b274694360585dc0fadb2602eb56ddf",
+      "installed_path": ".agents/skills/ecc-rust-testing/SKILL.md",
+      "adaptations": "Namespaced entrypoint and project guard. Coverage percentages and additional test libraries are upstream examples, not new project gates or dependency authority.",
+      "supporting_files": [],
+      "applied_evidence": [
+        "blueprint/verification.md (A1\u2013A6, existing cargo commands)"
+      ],
+      "installed_files": {
+        ".agents/skills/ecc-rust-testing/SKILL.md": "fa85c2abc99ee47008eb434cbfaf6e5c44db99f8dcdb2b3f84db4096e9172611"
+      }
+    },
+    {
+      "name": "ecc-verification-loop",
+      "source": "ecc",
+      "upstream_path": "skills/verification-loop/SKILL.md",
+      "upstream_sha256": "5b06be54d4852f60e6cf1b04c6e9a4748554334eb3e41af6c0959b544e6464ae",
+      "installed_path": ".agents/skills/ecc-verification-loop/SKILL.md",
+      "adaptations": "Replaced generic package-manager/secret-printing/PR snippets with actual Zephium commands and explicit blocked/not-run/native-evidence distinction.",
+      "supporting_files": [],
+      "applied_evidence": [
+        "blueprint/verification.md (evidence ledger and final aggregate commands)"
+      ],
+      "installed_files": {
+        ".agents/skills/ecc-verification-loop/SKILL.md": "926415782688c085de1b6ff28f86d5a015704b37ee727bfc20b9dcc4e4ff7965"
+      }
+    },
+    {
+      "name": "ecc-security-review",
+      "source": "ecc",
+      "upstream_path": "skills/security-review/SKILL.md",
+      "upstream_sha256": "b9eb6416eebc8dda046674f0a2dbb3be88aff526d182b60a0f55998d3d6d0d8d",
+      "installed_path": ".agents/skills/ecc-security-review/SKILL.md",
+      "adaptations": "Desktop-specific adaptation: excludes unrelated blockchain/cloud/SQL examples, unsafe generic logging suggestions and npm auto-upgrades. No cloud reference dependency is used.",
+      "supporting_files": [],
+      "applied_evidence": [
+        "blueprint/context/current-feature.md (Data / contracts)",
+        "blueprint/verification.md (A1\u2013A7)",
+        "blueprint/verification.md"
+      ],
+      "installed_files": {
+        ".agents/skills/ecc-security-review/SKILL.md": "387eb1a2d5acc3cae9aaf4a89cb1ac26ba13d5349d7f40eef0a67daf0f74fa77"
+      }
+    },
+    {
+      "name": "ecc-svelte-accessibility",
+      "source": "ecc",
+      "upstream_path": "skills/frontend-a11y/SKILL.md",
+      "upstream_sha256": "e00991a3f4d47fcf1529dd74a080afcf46137dc5061e70dc6e3da7b27f2ae3f3",
+      "installed_path": ".agents/skills/ecc-svelte-accessibility/SKILL.md",
+      "adaptations": "Adapted React/Next.js examples to Svelte 5 semantics and existing project primitives; no React or optional sibling-skill dependencies retained.",
+      "supporting_files": [],
+      "applied_evidence": [
+        "blueprint/verification.md (A8)",
+        "blueprint/context/current-feature.md (step 4)"
+      ],
+      "installed_files": {
+        ".agents/skills/ecc-svelte-accessibility/SKILL.md": "1f68c5395eff5e03cff8be970016d2825a26ac96cca120a514e67067cb4c6d5f"
+      }
+    },
+    {
+      "name": "ag-rust-async-patterns",
+      "source": "antigravity",
+      "upstream_path": "skills/rust-async-patterns/SKILL.md",
+      "upstream_sha256": "bd9734970b4ea016eb7176216abc73c0d5f918e1b4aa8ce033c002ac1a1ab621",
+      "installed_path": ".agents/skills/ag-rust-async-patterns/SKILL.md",
+      "adaptations": "Namespaced/normalized frontmatter; project guard added; preserved complete required playbook. Read playbook caveats: timeout drops futures but not external effects, task handles must be joined, partial success must be explicit.",
+      "supporting_files": [
+        "resources/implementation-playbook.md"
+      ],
+      "applied_evidence": [
+        "blueprint/context/current-feature.md (operation identity and cancellation)",
+        "blueprint/verification.md (A2, A4)"
+      ],
+      "installed_files": {
+        ".agents/skills/ag-rust-async-patterns/SKILL.md": "8148f7d2488d6dad026830355331f752cd012a4c1f78e5c96a38cb4ce3c716df",
+        ".agents/skills/ag-rust-async-patterns/references/project-cancellation.md": "3494d77760e5dd7ba29c21ce1e7ed0d1ac9c042d87faa0f3787fb8d783eee9df",
+        ".agents/skills/ag-rust-async-patterns/resources/implementation-playbook.md": "385069e3b0861da9f5475248178ddaae8cd0e91d30dc34f95f539863db3f17e5"
+      }
+    }
+  ],
+  "excluded_execution": "No third-party installer, hooks or supporting executable scripts installed or executed.",
+  "selection_notes": [
+    "SvelteKit omitted: Zephium frame is Svelte 5/Vite desktop UI, not SvelteKit SSR.",
+    "Generic REST/GraphQL API design omitted: native typed IPC and official OAuth contracts are authoritative.",
+    "Antigravity hunt-oauth and account-manager tooling omitted: attack/extraction workflows are not needed.",
+    "everything-claude-code and ECC bookmarks treated as one source family, not duplicated."
+  ]
+}

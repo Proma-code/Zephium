@@ -31,6 +31,7 @@ impl WindowsWorkStorage {
     ) -> Result<Self, PrivateFsError> {
         let application = match identifier {
             "app.zephium" => NativeApplication::Product,
+            "app.zephium.subscription-trial" => NativeApplication::SubscriptionTrial,
             "app.zephium.dev" => NativeApplication::Development,
             "app.zephium.review-qa" => NativeApplication::ReviewQa,
             "app.zephium.webext-qa" => NativeApplication::ExtensionQa,

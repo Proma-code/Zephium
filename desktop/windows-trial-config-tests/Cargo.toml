@@ -1,0 +1,15 @@
+[package]
+name = "zephium-windows-trial-config-tests"
+version = "0.0.0"
+edition = "2021"
+license = "MPL-2.0"
+publish = false
+
+[lib]
+path = "../windows_trial_config.rs"
+
+[dependencies]
+serde_json = "1"
+
+# Exercise the real build guard without a native WebView2/Tauri dependency.
+[workspace]

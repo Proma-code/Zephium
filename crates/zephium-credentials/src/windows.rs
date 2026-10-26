@@ -5,6 +5,7 @@ use windows_sys::Win32::Security::Credentials::*;
 use zeroize::{Zeroize, Zeroizing};
 
 fn wide(target: &str, filter: bool) -> Result<Vec<u16>, VaultError> {
+    let target = crate::namespace::native(target);
     if !target.starts_with("app.zephium.") || target.contains('\0') || target.contains('*') {
         return Err(VaultError::Invalid);
     }
@@ -163,6 +164,7 @@ pub fn delete(target: &str) -> Result<(), VaultError> {
 /// Enumerates only a Zephium namespace, returning target names, never secret copies.
 pub fn list(prefix: &str) -> Result<Vec<String>, VaultError> {
     let filter = wide(prefix, true)?;
+    let native_prefix = crate::namespace::native(prefix);
     let mut count = 0;
     let mut allocation = ptr::null_mut();
     // SAFETY: filter is terminated UTF-16; output pointers are live local storage.
@@ -213,8 +215,8 @@ pub fn list(prefix: &str) -> Result<Vec<String>, VaultError> {
         let target =
             String::from_utf16(unsafe { std::slice::from_raw_parts(record.TargetName, len) })
                 .map_err(|_| VaultError::Invalid)?;
-        if target.starts_with(prefix) {
-            targets.push(target);
+        if target.starts_with(native_prefix.as_ref()) {
+            targets.push(crate::namespace::logical(&target, prefix).into_owned());
         }
     }
     Ok(targets)
@@ -271,5 +273,30 @@ mod tests {
             assert_eq!(wide(name, false), Err(VaultError::Invalid));
         }
         assert_eq!(wide("app.zephium.test", true).unwrap().last(), Some(&0));
+    }
+
+    #[test]
+    fn native_target_and_enumeration_filters_never_reach_product_in_trial() {
+        let target = "app.zephium.agent-provider.openai";
+        let encoded = wide(target, false).unwrap();
+        let filter = wide("app.zephium.", true).unwrap();
+        let expected = if cfg!(feature = "windows-subscription-trial") {
+            "app.zephium.subscription-trial.agent-provider.openai"
+        } else {
+            target
+        };
+        assert_eq!(
+            String::from_utf16(&encoded[..encoded.len() - 1]).unwrap(),
+            expected
+        );
+        let expected_filter = if cfg!(feature = "windows-subscription-trial") {
+            "app.zephium.subscription-trial.*"
+        } else {
+            "app.zephium.*"
+        };
+        assert_eq!(
+            String::from_utf16(&filter[..filter.len() - 1]).unwrap(),
+            expected_filter
+        );
     }
 }

@@ -6,6 +6,9 @@
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+#[cfg(any(windows, test))]
+mod namespace;
+
 /// Content-free native vault failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VaultError {

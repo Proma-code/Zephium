@@ -7,6 +7,10 @@ import AiPageStage from "./AiPageStage.svelte";
 vi.mock("$domain/tabs", () => ({
   tabs: { profile: () => ({ id: "00000000000000000000000001", kind: "regular" }) },
 }));
+vi.mock("$shared/ipc/chatgpt-bindings", async () => {
+  const { chatgptView, mockChatGptBindings } = await import("$shared/testing/chatgpt");
+  return mockChatGptBindings({ chatgptAccount: async (profile) => chatgptView(profile) });
+});
 vi.mock("$shared/ipc/bindings", async () => {
   const { mockBindings } = await import("$shared/testing/bindings");
   const { models } = await import("$shared/testing/work-models");

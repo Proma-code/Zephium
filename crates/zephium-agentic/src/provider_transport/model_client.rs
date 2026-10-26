@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use sha2::{Digest as _, Sha256};
 use zephium_core::work::model::{
-    HostedRefusal, WorkModelClient, WorkModelEntry, WorkModelError, WorkModelEvent, WorkModelPrice,
-    WorkModelRef, WorkModelUsage,
+    ChatGptModelFault, HostedRefusal, WorkModelClient, WorkModelEntry, WorkModelError,
+    WorkModelEvent, WorkModelPrice, WorkModelRef, WorkModelUsage,
 };
 
 use super::*;
@@ -328,6 +328,16 @@ const fn failure_for(error: WorkModelError) -> AgentProviderFailure {
         WorkModelError::OverBudget | WorkModelError::PlanLimit => {
             AgentProviderFailureClass::Provider
         }
+        WorkModelError::ChatGpt { fault } => match fault {
+            ChatGptModelFault::SignedOut => AgentProviderFailureClass::Authentication,
+            ChatGptModelFault::NotEligible => AgentProviderFailureClass::Permission,
+            ChatGptModelFault::Unsupported => AgentProviderFailureClass::InvalidRequest,
+            // These are terminal for this attempt, not an invitation to retry
+            // a possibly billed request or to rotate credentials.
+            ChatGptModelFault::UsageLimit | ChatGptModelFault::Unavailable => {
+                AgentProviderFailureClass::Provider
+            }
+        },
         WorkModelError::Hosted { refusal, .. } => match refusal {
             HostedRefusal::PlanRequired | HostedRefusal::BillingReview => {
                 AgentProviderFailureClass::Permission

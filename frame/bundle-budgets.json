@@ -60,10 +60,6 @@
       "js": 49983,
       "css": 11741
     },
-    "lazy:features/notes/components/editor/NoteEditor.svelte": {
-      "js": 438979,
-      "css": 11897
-    },
     "lazy:features/notes/components/NoteHost.svelte": {
       "js": 23704,
       "css": 3598
@@ -76,6 +72,10 @@
       "js": 156957,
       "css": 20535
     },
+    "lazy:features/notes/components/editor/NoteEditor.svelte": {
+      "js": 438979,
+      "css": 11897
+    },
     "lazy:features/notes/index.ts": {
       "js": 388,
       "css": 0
@@ -87,6 +87,18 @@
     "lazy:features/search/components/NewTabSearch.svelte": {
       "js": 93954,
       "css": 8254
+    },
+    "lazy:features/settings/components/AiSubscriptions.svelte": {
+      "js": 6638,
+      "css": 1280
+    },
+    "lazy:features/settings/components/Settings.svelte": {
+      "js": 136678,
+      "css": 9051
+    },
+    "lazy:features/settings/components/SettingsIdentity.svelte": {
+      "js": 2317,
+      "css": 611
     },
     "lazy:features/settings/components/account/AccountAvatarCrop.svelte": {
       "js": 9428,
@@ -184,14 +196,6 @@
       "js": 13713,
       "css": 3760
     },
-    "lazy:features/settings/components/Settings.svelte": {
-      "js": 136678,
-      "css": 9051
-    },
-    "lazy:features/settings/components/SettingsIdentity.svelte": {
-      "js": 2317,
-      "css": 611
-    },
     "lazy:features/tabs/components/NavigationError.svelte": {
       "js": 2201,
       "css": 387
@@ -240,6 +244,10 @@
       "js": 131821,
       "css": 18841
     },
+    "lazy:features/tools/components/ToolSlot.svelte": {
+      "js": 7736,
+      "css": 369
+    },
     "lazy:features/tools/components/previews/BookmarksView.svelte": {
       "js": 10124,
       "css": 3814
@@ -268,10 +276,6 @@
       "js": 110947,
       "css": 7301
     },
-    "lazy:features/tools/components/ToolSlot.svelte": {
-      "js": 7736,
-      "css": 369
-    },
     "lazy:features/updates/components/UpdateCards.svelte": {
       "js": 13215,
       "css": 4690
@@ -287,6 +291,30 @@
     "lazy:features/work/components/AgentLine.svelte": {
       "js": 66417,
       "css": 26429
+    },
+    "lazy:features/work/components/WorkCanvas.svelte": {
+      "js": 442976,
+      "css": 123415
+    },
+    "lazy:features/work/components/WorkEnvironmentWorkspace.svelte": {
+      "js": 568343,
+      "css": 52610
+    },
+    "lazy:features/work/components/WorkFileInspector.svelte": {
+      "js": 7209,
+      "css": 1135
+    },
+    "lazy:features/work/components/WorkResultInspector.svelte": {
+      "js": 62648,
+      "css": 29168
+    },
+    "lazy:features/work/components/WorkSubjectInspector.svelte": {
+      "js": 13868,
+      "css": 4388
+    },
+    "lazy:features/work/components/bar/ModelChatGpt.svelte": {
+      "js": 12826,
+      "css": 818
     },
     "lazy:features/work/components/bar/ModelPicker.svelte": {
       "js": 171673,
@@ -395,26 +423,6 @@
     "lazy:features/work/components/start/WorkStart.svelte": {
       "js": 33172,
       "css": 6727
-    },
-    "lazy:features/work/components/WorkCanvas.svelte": {
-      "js": 442976,
-      "css": 123415
-    },
-    "lazy:features/work/components/WorkEnvironmentWorkspace.svelte": {
-      "js": 568343,
-      "css": 52610
-    },
-    "lazy:features/work/components/WorkFileInspector.svelte": {
-      "js": 7209,
-      "css": 1135
-    },
-    "lazy:features/work/components/WorkResultInspector.svelte": {
-      "js": 62648,
-      "css": 29168
-    },
-    "lazy:features/work/components/WorkSubjectInspector.svelte": {
-      "js": 13868,
-      "css": 4388
     },
     "lazy:features/work/lib/diagram-worker.ts": {
       "js": 15967,

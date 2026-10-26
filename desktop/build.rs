@@ -6,6 +6,7 @@ use tauri_utils::platform::Target;
 #[allow(dead_code)]
 mod foreground_probe_config;
 mod navigation_probe_config;
+mod windows_trial_config;
 
 const MAIN_LABEL: &str = "main";
 const LINUX_APP_ID: &str = "app.zephium";
@@ -115,6 +116,10 @@ fn validate_privileged_window_ownership() -> Result<(), Box<dyn Error>> {
         Err(env::VarError::NotPresent) => None,
         Err(error) => return Err(Box::new(error)),
     };
+    let windows_trial = env::var_os("CARGO_FEATURE_WINDOWS_SUBSCRIPTION_TRIAL").is_some();
+    if windows_trial && env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return Err("the subscription trial is Windows-only".into());
+    }
     let adblock_qa = env::var_os("CARGO_FEATURE_ADBLOCK_QA").is_some();
     if adblock_qa && env::var("OPT_LEVEL").as_deref() == Ok("0") {
         return Err("protection QA must be optimized: set CARGO_PROFILE_DEV_OPT_LEVEL=2".into());
@@ -266,6 +271,9 @@ fn validate_privileged_window_ownership() -> Result<(), Box<dyn Error>> {
             {
                 validate_linux_identity("effective", &config, &root)?;
             }
+        }
+        if matches!(target, Target::Windows) {
+            windows_trial_config::validate(&config, "windows", windows_trial)?;
         }
     }
     Ok(())

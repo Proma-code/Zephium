@@ -3,7 +3,7 @@ import { expect, test, vi } from "vitest";
 import { render } from "vitest-browser-svelte";
 import { page, userEvent } from "vitest/browser";
 import type { WorkLocalServerV1, WorkMoreModelsV1_Serialize } from "$shared/ipc/bindings";
-import { PROFILE, models } from "$shared/testing/work-models";
+import { PROFILE, entry, models } from "$shared/testing/work-models";
 import { emitNativeEvent } from "$shared/testing/native-events";
 import AiPage from "../components/sections/AiPage.svelte";
 
@@ -24,6 +24,10 @@ const native = vi.hoisted(() => ({
     fault: null,
   })),
 }));
+vi.mock("$shared/ipc/chatgpt-bindings", async () => {
+  const { chatgptView, mockChatGptBindings } = await import("$shared/testing/chatgpt");
+  return mockChatGptBindings({ chatgptAccount: async (profile) => chatgptView(profile) });
+});
 vi.mock("$shared/ipc/bindings", async () => {
   const { mockBindings } = await import("$shared/testing/bindings");
   return mockBindings({
@@ -223,4 +227,53 @@ test("a custom server is asked for its models once per address, even when it has
   emitNativeEvent("workModelsChanged", { version: 1 });
   await expect.poll(() => native.more.mock.calls.length).toBe(2);
   screen.unmount();
+});
+
+test("ChatGPT models can be chosen without enabling OpenAI API-key rows", async () => {
+  const view = models({});
+  view.entries.push(
+    entry("open_ai", "gpt-account", "GPT Account · ChatGPT", false, ["lead"], {
+      id: "chatgpt/gpt-account",
+      price: null,
+    }),
+  );
+  native.read.mockResolvedValue(view);
+  const screen = await render(AiPage);
+  await screen.getByRole("combobox", { name: "Work", exact: true }).click();
+  await expect.element(page.getByRole("option", { name: /GPT Account · ChatGPT/u })).toBeVisible();
+  await expect.element(page.getByRole("option", { name: /GPT-6 Sol/u })).not.toBeInTheDocument();
+});
+
+test("a disconnected ChatGPT choice stays visible instead of silently resetting", async () => {
+  native.read.mockResolvedValue(
+    models({
+      keys: { open_ai: "valid" },
+      chosen: "chatgpt/gpt-account",
+      lead: "openai/gpt-6-sol",
+    }),
+  );
+  const screen = await render(AiPage);
+  await expect
+    .element(screen.getByText("Saved ChatGPT model unavailable — connect your account"))
+    .toBeVisible();
+});
+
+test("secondary account guidance loads on demand and remains keyboard-dismissible", async () => {
+  native.read.mockResolvedValue(models({}));
+  const screen = await render(AiPage);
+  const summary = screen.getByText("Claude, Antigravity, and OpenCode options", { exact: true });
+  await expect
+    .element(screen.getByRole("heading", { name: "Other subscription tools" }))
+    .not.toBeInTheDocument();
+  summary.element().focus();
+  await userEvent.keyboard("{Enter}");
+  await expect
+    .element(screen.getByRole("heading", { name: "Other subscription tools" }))
+    .toBeVisible();
+  await userEvent.keyboard("{Enter}");
+  await expect
+    .element(screen.getByRole("heading", { name: "Other subscription tools" }))
+    .not.toBeInTheDocument();
+  await userEvent.keyboard("{Enter}");
+  await expect.element(screen.getByRole("heading", { name: "Google Antigravity" })).toBeVisible();
 });

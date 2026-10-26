@@ -1,5 +1,6 @@
 dist
 src/shared/ipc/bindings.ts
+src/shared/ipc/chatgpt-bindings.ts
 src/vite-env.d.ts
 
 src/shared/i18n

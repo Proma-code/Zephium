@@ -1,0 +1,10 @@
+[package]
+name = "zephium-provider-accounts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde_json.workspace = true
+url.workspace = true

@@ -98,8 +98,29 @@ pub trait WorkCloudSession: Send + Sync {
     fn sourced(&self, _request_id: &str, _source: &WorkCallSource) {}
 }
 
+/// The local, profile-scoped ChatGPT grant, distinct from BYOK and hosted AI.
+/// Implementations expose cached observations only; these methods run while the
+/// model state is locked and must not do I/O or call back into this module.
+pub trait WorkChatGptSession: Send + Sync {
+    /// Delete this profile's local protected account before the crash-resumable
+    /// profile-deletion journal can finalize. Called outside the model lock,
+    /// bounded by the actor's existing deletion deadline; failure is retryable.
+    fn erase_profile(&self, profile: ProfileId, deadline: Instant) -> bool;
+
+    /// Current catalog for this exact profile. Empty when disconnected.
+    fn entries(&self, profile: ProfileId) -> Vec<WorkModelEntry>;
+    /// A revocable client for an explicitly selected catalog model.
+    /// It must recheck the profile/grant and refresh credentials before dispatch.
+    fn client(
+        &self,
+        profile: ProfileId,
+        model: &str,
+    ) -> Result<Arc<dyn WorkModelClient>, WorkModelError>;
+}
+
 static SETTINGS: RwLock<Option<Arc<dyn WorkModelSettings>>> = RwLock::new(None);
 static CLOUD: RwLock<Option<Arc<dyn WorkCloudSession>>> = RwLock::new(None);
+static CHATGPT: RwLock<Option<Arc<dyn WorkChatGptSession>>> = RwLock::new(None);
 type Observer = Box<dyn Fn() + Send + Sync>;
 static OBSERVER: OnceLock<Observer> = OnceLock::new();
 
@@ -116,6 +137,81 @@ pub fn install_cloud_session(session: Arc<dyn WorkCloudSession>) {
         *slot = Some(session);
     }
     notify();
+}
+
+/// Installs the local ChatGPT session without changing any API key or selection.
+pub fn install_chatgpt_session(session: Arc<dyn WorkChatGptSession>) {
+    if let Ok(mut slot) = CHATGPT.write() {
+        *slot = Some(session);
+    }
+    notify();
+}
+
+/// Account or catalog changed. Explicit model choices survive disconnection.
+pub fn chatgpt_session_changed() {
+    notify();
+}
+
+/// Native account erasure participates in durable profile deletion. Other
+/// platforms without the Windows session port have no such credentials.
+pub(crate) fn erase_chatgpt_profile(profile: ProfileId, deadline: Instant) -> bool {
+    chatgpt().is_none_or(|session| session.erase_profile(profile, deadline))
+}
+
+#[cfg(test)]
+pub(crate) static CHATGPT_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+pub(crate) fn replace_chatgpt_for_test(
+    session: Option<Arc<dyn WorkChatGptSession>>,
+) -> Option<Arc<dyn WorkChatGptSession>> {
+    std::mem::replace(&mut *CHATGPT.write().unwrap(), session)
+}
+
+fn chatgpt() -> Option<Arc<dyn WorkChatGptSession>> {
+    CHATGPT.read().ok()?.clone()
+}
+
+fn is_chatgpt(entry: &WorkModelEntry) -> bool {
+    entry.id.starts_with("chatgpt/")
+}
+
+/// Whether an unresolved automatic helper may use another resolved model.
+/// An explicit inactive choice is never silently replaced, and a subscription
+/// is never opted into by another role's automatic fallback.
+pub fn helper_fallback_allowed(
+    profile: ProfileId,
+    role: WorkModelRole,
+    fallback: &WorkModelEntry,
+) -> bool {
+    role != WorkModelRole::Lead
+        && stored_choice(&state(), profile, role).is_none()
+        && !is_chatgpt(fallback)
+}
+
+/// Keep legacy BYOK capability fallback, but never cross a subscription route.
+pub fn model_fallback_allowed(selected: &WorkModelEntry, fallback: &WorkModelEntry) -> bool {
+    !is_chatgpt(selected) && !is_chatgpt(fallback)
+}
+
+/// A selected subscription does not authorize an extra paid API-key search.
+/// Local browser search remains available independently of this decision.
+pub fn paid_search_fallback_allowed(selected: &[&WorkModelEntry]) -> bool {
+    !selected.iter().any(|entry| is_chatgpt(entry))
+}
+
+fn chatgpt_entries(profile: ProfileId) -> Vec<WorkModelEntry> {
+    chatgpt()
+        .map(|session| session.entries(profile))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| {
+            entry.model.provider == P::OpenAi
+                && entry.model.wire == WorkModelWire::OpenAiResponses
+                && !entry.model.model.is_empty()
+                && entry.id == format!("chatgpt/{}", entry.model.model)
+        })
+        .collect()
 }
 
 /// Called after any change a picker or Settings shows (keys, choices, catalog).
@@ -640,6 +736,13 @@ fn family_entry(
 /// usable, else the lead's provider family, else the first keyed provider.
 fn effective(state: &State, profile: ProfileId, role: WorkModelRole) -> Option<WorkModelEntry> {
     if let Some(choice) = stored_choice(state, profile, role) {
+        if is_chatgpt(&choice) {
+            // A subscription choice is never replaced by a separately billed
+            // API key. Likewise, an API-key default never starts using a grant.
+            return chatgpt_entries(profile)
+                .into_iter()
+                .find(|entry| entry.id == choice.id);
+        }
         let exists = if choice.model.provider == P::Cloud {
             state
                 .cloud
@@ -655,7 +758,9 @@ fn effective(state: &State, profile: ProfileId, role: WorkModelRole) -> Option<W
     }
     if role != WorkModelRole::Lead {
         if let Some(lead) = effective(state, profile, WorkModelRole::Lead) {
-            return family_entry(state, lead.model.provider, role).or(Some(lead));
+            if !is_chatgpt(&lead) {
+                return family_entry(state, lead.model.provider, role).or(Some(lead));
+            }
         }
     }
     FALLBACK_ORDER
@@ -894,14 +999,28 @@ fn client(
     state: &State,
     entry: &WorkModelEntry,
 ) -> Result<Arc<dyn WorkModelClient>, WorkModelError> {
-    client_for(state, entry, None)
+    client_for(state, entry, None, None)
 }
 
 fn client_for(
     state: &State,
     entry: &WorkModelEntry,
     source: Option<WorkCallSource>,
+    profile: Option<ProfileId>,
 ) -> Result<Arc<dyn WorkModelClient>, WorkModelError> {
+    if is_chatgpt(entry) {
+        let signed_out = WorkModelError::ChatGpt {
+            fault: ChatGptModelFault::SignedOut,
+        };
+        let profile = profile.ok_or(signed_out)?;
+        let current = chatgpt_entries(profile)
+            .into_iter()
+            .find(|current| current.id == entry.id)
+            .ok_or(signed_out)?;
+        return chatgpt()
+            .ok_or(signed_out)?
+            .client(profile, &current.model.model);
+    }
     let provider = entry.model.provider;
     let (target, credential): (LeadTarget, Arc<dyn LeadCredential>) = match provider {
         P::Cloud => {
@@ -987,8 +1106,16 @@ pub async fn resolve_entry_for(
 ) -> Result<(WorkModelEntry, Arc<dyn WorkModelClient>), WorkModelError> {
     ensure_presence().await;
     let state = state();
-    let entry = effective(&state, profile, role).ok_or(WorkModelError::MissingKey)?;
-    let client = client_for(&state, &entry, source)?;
+    let entry = effective(&state, profile, role).ok_or_else(|| {
+        if stored_choice(&state, profile, role).is_some_and(|entry| is_chatgpt(&entry)) {
+            WorkModelError::ChatGpt {
+                fault: ChatGptModelFault::SignedOut,
+            }
+        } else {
+            WorkModelError::MissingKey
+        }
+    })?;
+    let client = client_for(&state, &entry, source, Some(profile))?;
     Ok((entry, client))
 }
 
@@ -1032,9 +1159,10 @@ pub async fn view(profile: ProfileId) -> WorkModelsView {
         .and_then(|lead| effort_for(&state, profile, &lead));
     let effective = ROLES.map(|role| effective(&state, profile, role).map(|entry| entry.id));
     let mut entries = entries(&state);
+    entries.extend(chatgpt_entries(profile));
     for role in ROLES {
         if let Some(choice) = stored_choice(&state, profile, role) {
-            if !entries.iter().any(|entry| entry.id == choice.id) {
+            if !is_chatgpt(&choice) && !entries.iter().any(|entry| entry.id == choice.id) {
                 entries.push(choice);
             }
         }
@@ -1093,6 +1221,7 @@ pub fn choose(
             let state = state();
             let entry = entries(&state)
                 .into_iter()
+                .chain(chatgpt_entries(profile))
                 .chain(state.listed.values().flatten().cloned())
                 .find(|entry| entry.id == id)
                 .ok_or(WorkModelError::BadRequest)?;
@@ -1443,6 +1572,7 @@ mod tests {
 
     #[tokio::test]
     async fn defaults_choices_failures_and_stale_results_stay_truthful() {
+        let _guard = CHATGPT_TEST_SERIAL.lock().await;
         install_settings(Arc::new(Memory(Mutex::new(HashMap::new()))));
         let profile = ProfileId::from(41_u128);
         with_keys(&[P::OpenAi]);
@@ -1722,6 +1852,148 @@ mod tests {
             super::view(tuned).await.effort,
             Some(WorkModelReasoning::Medium)
         );
+
+        // The local subscription remains a separate, explicitly chosen lane.
+        // Merely signing in never changes API-key or Automatic behavior.
+        struct Subscription {
+            profile: ProfileId,
+            entry: WorkModelEntry,
+        }
+        struct SubscriptionClient;
+        impl WorkModelClient for SubscriptionClient {
+            fn call<'a>(
+                &'a self,
+                _: WorkModelRequest,
+                _: &'a (dyn Fn(WorkModelEvent) + Send + Sync),
+            ) -> WorkModelFuture<'a> {
+                Box::pin(async { Err(WorkModelError::Cancelled) })
+            }
+        }
+        impl WorkChatGptSession for Subscription {
+            fn erase_profile(&self, _: ProfileId, _: Instant) -> bool {
+                true
+            }
+            fn entries(&self, profile: ProfileId) -> Vec<WorkModelEntry> {
+                if profile == self.profile {
+                    vec![self.entry.clone()]
+                } else {
+                    vec![]
+                }
+            }
+            fn client(
+                &self,
+                profile: ProfileId,
+                model: &str,
+            ) -> Result<Arc<dyn WorkModelClient>, WorkModelError> {
+                if profile == self.profile && model == self.entry.model.model {
+                    Ok(Arc::new(SubscriptionClient))
+                } else {
+                    Err(WorkModelError::MissingKey)
+                }
+            }
+        }
+        let subscriber = profile_id(45);
+        let mut subscribed = models::builtin()
+            .into_iter()
+            .find(|entry| entry.model.provider == P::OpenAi)
+            .unwrap();
+        let byok = subscribed.clone();
+        subscribed.id = "chatgpt/gpt-fixture".into();
+        subscribed.model.model = "gpt-fixture".into();
+        subscribed.model.wire = WorkModelWire::OpenAiResponses;
+        subscribed.display_name = "Fixture · ChatGPT".into();
+        with_keys(&[P::OpenAi]);
+        choose(subscriber, WorkModelRole::Lead, Some(&byok.id)).unwrap();
+        install_chatgpt_session(Arc::new(Subscription {
+            profile: subscriber,
+            entry: subscribed.clone(),
+        }));
+        assert_eq!(
+            effective(&state(), subscriber, WorkModelRole::Lead)
+                .unwrap()
+                .id,
+            byok.id,
+            "linking a subscription must preserve an explicit API-key choice"
+        );
+        choose(subscriber, WorkModelRole::Lead, None).unwrap();
+        with_keys(&[]);
+        assert!(effective(&state(), subscriber, WorkModelRole::Lead).is_none());
+        assert!(super::view(subscriber)
+            .await
+            .entries
+            .iter()
+            .any(|entry| entry.id == subscribed.id));
+        assert!(!super::view(profile_id(46))
+            .await
+            .entries
+            .iter()
+            .any(is_chatgpt));
+        assert_eq!(
+            choose(profile_id(46), WorkModelRole::Lead, Some(&subscribed.id)),
+            Err(WorkModelError::BadRequest)
+        );
+        choose(subscriber, WorkModelRole::Lead, Some(&subscribed.id)).unwrap();
+        assert_eq!(
+            effective(&state(), subscriber, WorkModelRole::Lead)
+                .unwrap()
+                .id,
+            subscribed.id
+        );
+        assert!(effective(&state(), subscriber, WorkModelRole::Page).is_none());
+        assert!(!helper_fallback_allowed(
+            subscriber,
+            WorkModelRole::Page,
+            &subscribed
+        ));
+        assert!(helper_fallback_allowed(
+            subscriber,
+            WorkModelRole::Page,
+            &byok
+        ));
+        choose(subscriber, WorkModelRole::Page, Some(&subscribed.id)).unwrap();
+        assert!(!helper_fallback_allowed(
+            subscriber,
+            WorkModelRole::Page,
+            &byok
+        ));
+        choose(subscriber, WorkModelRole::Page, None).unwrap();
+        assert_eq!(key_status(&state(), P::OpenAi), WorkKeyStatus::Missing);
+        assert!(resolve_entry(subscriber, WorkModelRole::Lead).await.is_ok());
+        state().presence.insert(P::OpenAi, true);
+        assert_eq!(
+            effective(&state(), subscriber, WorkModelRole::Lead)
+                .unwrap()
+                .id,
+            subscribed.id
+        );
+        *CHATGPT.write().unwrap() = None;
+        chatgpt_session_changed();
+        assert!(effective(&state(), subscriber, WorkModelRole::Lead).is_none());
+        assert_eq!(
+            stored_choice(&state(), subscriber, WorkModelRole::Lead)
+                .unwrap()
+                .id,
+            subscribed.id
+        );
+        assert!(!super::view(subscriber).await.entries.iter().any(is_chatgpt));
+        assert_eq!(key_status(&state(), P::OpenAi), WorkKeyStatus::Set);
+    }
+
+    #[test]
+    fn subscription_routes_cannot_fall_through_to_other_billing_paths() {
+        let byok = models::builtin()
+            .into_iter()
+            .find(|entry| entry.model.provider == P::OpenAi)
+            .unwrap();
+        let mut subscription = byok.clone();
+        subscription.id = format!("chatgpt/{}", subscription.model.model);
+        assert!(model_fallback_allowed(&byok, &byok));
+        assert!(!model_fallback_allowed(&subscription, &byok));
+        assert!(!model_fallback_allowed(&byok, &subscription));
+        assert!(!model_fallback_allowed(&subscription, &subscription));
+        assert!(paid_search_fallback_allowed(&[&byok]));
+        assert!(!paid_search_fallback_allowed(&[&byok, &subscription]));
+        assert!(!paid_search_fallback_allowed(&[&subscription, &byok]));
     }
 
     fn profile_id(id: u128) -> ProfileId {

@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "workflow": {
+    "stepReview": "feature",
+    "checkpointCommits": "disabled"
+  },
+  "git": {
+    "featureBranchPrefix": "windows/",
+    "fixBranchPrefix": "fix/",
+    "rollbackBranchPrefix": "rollback/"
+  },
+  "verification": {
+    "logicTests": "when-configured",
+    "uiEvidence": "when-available"
+  },
+  "review": {
+    "independentExecution": "manual"
+  },
+  "qualityGates": {
+    "regular": {
+      "audit": "always",
+      "independentReview": "when-sensitive",
+      "check": "when-behavioral",
+      "tryGuide": "when-testable"
+    },
+    "continuous": {
+      "audit": "manual",
+      "independentReview": "when-sensitive",
+      "check": "manual",
+      "tryGuide": "when-testable"
+    }
+  },
+  "continuous": {
+    "maxFeatures": null,
+    "maxRepairAttempts": 2,
+    "finalIntegrationAudit": false
+  }
+}

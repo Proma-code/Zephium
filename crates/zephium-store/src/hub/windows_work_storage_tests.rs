@@ -4,6 +4,7 @@ use super::*;
 fn application_selection_is_closed_and_sessions_do_not_alias_product() {
     for identifier in [
         "app.zephium",
+        "app.zephium.subscription-trial",
         "app.zephium.dev",
         "app.zephium.review-qa",
         "app.zephium.webext-qa",

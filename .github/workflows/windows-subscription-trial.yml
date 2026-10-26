@@ -1,0 +1,79 @@
+name: Windows subscription trial
+
+# Branch artifacts only: no PR trigger, tag, release, deployment or signing key.
+on:
+  push:
+    branches: [windows/subscription-accounts]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-subscription-trial-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows x64 isolated trial
+    if: github.repository == 'Proma-code/Zephium'
+    runs-on: windows-2025
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: windows-subscription-trial
+      - run: pnpm install --frozen-lockfile
+      - name: Isolation contract and build guard tests
+        run: |
+          node --test scripts/windows-trial.test.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --manifest-path desktop/windows-trial-config-tests/Cargo.toml
+      - name: Frame type checks, lint and unit tests
+        run: pnpm --dir frame run check
+      - name: Frame style contract
+        run: pnpm --dir frame run check:styles
+      - name: Native account protocol and trial Credential Manager tests
+        run: cargo test -p zephium-chatgpt -p zephium-provider-accounts -p zephium-credentials --locked --features zephium-credentials/windows-subscription-trial
+      - name: Subscription routing, accounting and profile-erasure journal regressions
+        run: |
+          cargo test -p zephium-app --features work-runtime,work-execution --locked work_models::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p zephium-app --features work-runtime,work-execution --locked work_lead::call::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p zephium-app --features work-runtime,work-execution --locked profile_deletion
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p zephium-ipc --locked chatgpt::tests
+      - name: Protected native trial identity test (no user profile)
+        run: cargo test -p zephium-private-fs --lib --locked subscription_trial_has_a_distinct_closed_native_storage_component
+      - name: Compile and lint the Windows trial including test targets
+        run: |
+          $env:TAURI_CONFIG = Get-Content desktop/tauri.windows-subscription-trial.conf.json -Raw
+          # The config packages this file; the release build regenerates notices.
+          python scripts/release/third_party_notices.py target/THIRD_PARTY_NOTICES.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy -p zephium-desktop --all-targets --locked --features windows-subscription-trial -- -D warnings
+      - name: Build unsigned isolated Windows installer
+        run: node scripts/windows-trial.mjs --build
+      - name: Verify generated installer identity and stage checksums
+        run: ./scripts/stage-windows-trial.ps1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Zephium-Subscription-Trial-Windows-x64-${{ github.sha }}
+          path: target/windows-subscription-trial-artifact/
+          if-no-files-found: error
+          retention-days: 14

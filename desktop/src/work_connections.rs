@@ -59,6 +59,8 @@ mod live {
             .into_iter()
             .map(|status| {
                 let (status_v1, account) = match (&status.path, &status.auth) {
+                    // A closed execution gate is not evidence that a tool is missing.
+                    (_, cli::CliAuth::Unavailable) => (WorkCliStatusV1::Unknown, None),
                     (None, _) => (WorkCliStatusV1::Missing, None),
                     (Some(_), cli::CliAuth::SignedIn(account)) => {
                         (WorkCliStatusV1::SignedIn, account.clone())

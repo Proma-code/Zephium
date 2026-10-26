@@ -1,6 +1,22 @@
 use super::*;
 
 #[test]
+fn subscription_trial_has_a_distinct_closed_native_storage_component() {
+    assert_eq!(
+        NativeApplication::SubscriptionTrial.component(),
+        "app.zephium.subscription-trial"
+    );
+    assert_ne!(
+        NativeApplication::SubscriptionTrial.component(),
+        NativeApplication::Product.component()
+    );
+    assert_ne!(
+        NativeApplication::SubscriptionTrial.component(),
+        NativeApplication::Development.component()
+    );
+}
+
+#[test]
 fn activation_is_gated_before_known_folder_or_directory_creation() {
     #[cfg(not(feature = "windows-namespace-validation"))]
     assert!(matches!(

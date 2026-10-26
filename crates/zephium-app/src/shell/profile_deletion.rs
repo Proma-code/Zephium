@@ -726,6 +726,13 @@ impl Shell {
             self.schedule_profile_deletion_retry(profile);
             return;
         }
+        // Keep the existing durable deletion journal until the separately owned
+        // native subscription record is erased. Failure is not a completed delete.
+        #[cfg(feature = "work-runtime")]
+        if !crate::work_models::erase_chatgpt_profile(profile, deadline) {
+            self.schedule_profile_deletion_retry(profile);
+            return;
+        }
         let outcome = self.store.finalize_profile_deletion(profile, deadline);
         match outcome {
             ProfileDeletionFinalizeOutcome::Completed => self.finish_profile_deletion_operation(

@@ -39,9 +39,18 @@ export function providerName(provider: WorkModelProvider): string {
   return names[provider];
 }
 
+/** Billing identity is presentation only; the native id remains the routing authority. */
+export function modelName(entry: WorkModelEntry): string {
+  if (entry.model.provider !== "open_ai") return entry.display_name;
+  const suffix = entry.id.startsWith("chatgpt/") ? " · ChatGPT" : " · API";
+  return entry.display_name.endsWith(suffix)
+    ? entry.display_name
+    : `${entry.display_name}${suffix}`;
+}
+
 /** The model's name as the trigger shows it: the mark beside it says the family. */
 export function shortName(entry: WorkModelEntry): string {
-  const name = entry.display_name;
+  const name = modelName(entry);
   for (const family of ["Claude ", "DeepSeek "]) {
     if (name.startsWith(family) && name.length > family.length) return name.slice(family.length);
   }
@@ -50,6 +59,13 @@ export function shortName(entry: WorkModelEntry): string {
 
 export function keyState(models: WorkModelsV1 | null, provider: WorkModelProvider): WorkKeyStateV1 {
   return models?.providers.find((row) => row.provider === provider)?.key ?? "missing";
+}
+
+/** Native-only account entries use their own IDs and never imply an API key. */
+export function hasChatGptModels(models: WorkModelsV1 | null): boolean {
+  return !!models?.entries.some(
+    (entry) => entry.model.provider === "open_ai" && entry.id.startsWith("chatgpt/"),
+  );
 }
 
 /** A provider can run calls now: its key is set and not refused. */
@@ -88,6 +104,11 @@ export function pickerGroups(
   endpoint: readonly WorkModelEntry[] = [],
 ) {
   const entries = [...(models?.entries ?? []), ...endpoint];
+  const accountEntries = new Set(
+    models?.entries
+      .filter((entry) => entry.model.provider === "open_ai" && entry.id.startsWith("chatgpt/"))
+      .map((entry) => entry.id) ?? [],
+  );
   const order: readonly WorkModelProvider[] = ["cloud", ...keyedProviders];
   const ready: ModelGroup[] = [];
   const needsKey: WorkModelProvider[] = [];
@@ -105,11 +126,13 @@ export function pickerGroups(
         return true;
       })
       .sort((a, b) => Number(b.recommended) - Number(a.recommended));
-    if (usable(models, provider)) {
-      if (offered.length) ready.push({ provider, entries: offered });
-    } else if (suggested.includes(provider)) {
+    const providerUsable = usable(models, provider);
+    const available = offered.filter((entry) =>
+      entry.id.startsWith("chatgpt/") ? accountEntries.has(entry.id) : providerUsable,
+    );
+    if (available.length) ready.push({ provider, entries: available });
+    if (!providerUsable && !available.length && suggested.includes(provider))
       needsKey.push(provider);
-    }
   }
   return { ready, needsKey };
 }
@@ -172,7 +195,7 @@ export function searchEntries(groups: readonly ModelGroup[], query: string): Wor
   return groups.flatMap((group) =>
     group.entries.filter((entry) => {
       const text =
-        `${entry.display_name} ${providerName(group.provider)} ${entry.model.model}`.toLocaleLowerCase();
+        `${modelName(entry)} ${providerName(group.provider)} ${entry.model.model}`.toLocaleLowerCase();
       return words.every((word) => text.includes(word));
     }),
   );

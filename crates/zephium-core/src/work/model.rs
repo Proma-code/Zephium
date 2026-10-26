@@ -248,6 +248,26 @@ pub enum WorkModelError {
         refusal: HostedRefusal,
         retry_after_ms: Option<u64>,
     },
+    /// A local ChatGPT subscription refusal, never an API-key billing fault.
+    /// These errors require an explicit retry or account/settings action.
+    ChatGpt {
+        fault: ChatGptModelFault,
+    },
+}
+
+/// Closed direct ChatGPT errors. No provider-authored text or account data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChatGptModelFault {
+    /// The selected local grant is missing, expired, or was refused.
+    SignedOut,
+    /// A ChatGPT plan-sharing limit was reached; its scope/reset are unknown.
+    UsageLimit,
+    /// Account or usage admission is temporarily unavailable.
+    Unavailable,
+    /// The account, workspace, region or grant policy does not permit this call.
+    NotEligible,
+    /// This route does not support the requested capability or body.
+    Unsupported,
 }
 
 /// Why Zephium Cloud refused, by its stable error codes. None of these is

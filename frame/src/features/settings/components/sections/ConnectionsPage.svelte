@@ -25,7 +25,7 @@
     };
   });
 
-  const TOOLS = ["gh", "git", "codex", "claude"] as const;
+  const TOOLS = ["gh", "git", "codex", "claude", "opencode"] as const;
   const servers = $derived(session?.servers ?? []);
   const taken = $derived(servers.map((row) => row.server.id));
   let adding = $state(false);

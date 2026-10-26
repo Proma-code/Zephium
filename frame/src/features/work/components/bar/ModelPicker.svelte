@@ -12,7 +12,9 @@
     favourites,
     keyState,
     keyedProviders,
+    hasChatGptModels,
     locked,
+    modelName,
     pickerGroups,
     providerName,
     requiredPlan,
@@ -49,7 +51,7 @@
     profile: string;
     /** Which of the person's models it chooses: Work's lead, or the sidebar assistant's page model. */
     role?: "lead" | "page";
-    /** Opens Settings → Models, where keys are added. */
+    /** Opens Settings → Models, where keys and accounts are managed. */
     onsettings?: () => void;
   } = $props();
 
@@ -68,11 +70,6 @@
     return () => accountSession.release();
   });
   const account = $derived(accountSession.account());
-  /** Hosted models this server offers to someone not yet signed in. */
-  const hostedOffer = $derived(
-    !!account?.available && !account.signed_in && account.hosted_models === true,
-  );
-
   let open = $state(false);
   let trigger = $state<HTMLElement | null>(null);
   let material = $state<"opaque" | undefined>();
@@ -83,6 +80,7 @@
   const models = $derived(session?.models ?? null);
   const current = $derived(entryOf(models, models?.effective[role]));
   const chosen = $derived(models?.effective[role] ?? null);
+  const savedAccountChoice = $derived(models?.chosen[role]?.startsWith("chatgpt/") ?? false);
   const groups = $derived(pickerGroups(models, role, session?.endpoint ?? []));
   const tierOf = $derived(tiers(groups.ready));
 
@@ -107,7 +105,8 @@
           own.push({ provider, standing: "ready" });
         else if (account?.available && account.hosted_models === true)
           own.push({ provider, standing: "sign_in" });
-      } else if (usable(models, provider)) ready.push({ provider, standing: "ready" });
+      } else if (usable(models, provider) || (provider === "open_ai" && hasChatGptModels(models)))
+        ready.push({ provider, standing: "ready" });
       else
         rest.push({
           provider,
@@ -141,12 +140,25 @@
     if (picked === "favourites" && hasStars) return "favourites";
     return (
       seats.find((row) => row.provider === picked)?.provider ??
-      seats.find((row) => row.provider === current?.model.provider)?.provider ??
+      seats.find(
+        (row) =>
+          row.provider === (current?.model.provider ?? (savedAccountChoice ? "open_ai" : null)),
+      )?.provider ??
       seats[0]?.provider ??
       null
     );
   });
   const seat = $derived(seats.find((row) => row.provider === shown) ?? null);
+  /** A connection filter, never a new provider or a model/billing selection. */
+  let sourcePick = $state<"api" | "chatgpt" | null>(null);
+  const source = $derived(
+    sourcePick ??
+      (current?.id.startsWith("chatgpt/") ||
+      savedAccountChoice ||
+      (!usable(models, "open_ai") && hasChatGptModels(models))
+        ? "chatgpt"
+        : "api"),
+  );
 
   let searchOpen = $state(false);
   let query = $state("");
@@ -166,6 +178,11 @@
         items: group.entries
           .filter((entry) =>
             matched ? matched.has(entry.id) : shown !== "favourites" || starred.has(entry.id),
+          )
+          .filter((entry) =>
+            spanning || group.provider !== "open_ai"
+              ? true
+              : entry.id.startsWith("chatgpt/") === (source === "chatgpt"),
           )
           .map((entry) => ({ id: entry.id, entry })),
       }))
@@ -218,7 +235,7 @@
       });
     return () => (live = false);
   });
-  /** No model can run yet: the one thing to do is add a key, so the control is that, not a menu. */
+  /** No model can run yet: the picker offers supported connection methods, not only API keys. */
   const keyless = $derived(!!models && leadMissing);
 
   /** The card shows the effort control until it is put away: by Escape, a click elsewhere, or a rest. */
@@ -280,6 +297,7 @@
     active = null;
     intent = null;
     picked = null;
+    sourcePick = null;
     clearTimeout(fold);
     effortOpen = false;
     changed = false;
@@ -497,7 +515,13 @@
         const item = focus ?? items[0];
         event.preventDefault();
         if (item) void choose(item.entry);
-        else if (!searching && seat && seat.standing !== "ready") step(seat);
+        else if (
+          !searching &&
+          seat &&
+          seat.standing !== "ready" &&
+          (shown !== "open_ai" || source === "api")
+        )
+          step(seat);
         return;
       }
     }
@@ -560,8 +584,8 @@
   const triggerLabel = $derived(
     current
       ? effort
-        ? m.model_trigger_effort({ model: current.display_name, effort: effortName(effort) })
-        : m.work_model_trigger({ model: current.display_name })
+        ? m.model_trigger_effort({ model: modelName(current), effort: effortName(effort) })
+        : m.work_model_trigger({ model: modelName(current) })
       : m.work_model_label(),
   );
   const title = $derived(
@@ -569,257 +593,292 @@
   );
 </script>
 
-{#if keyless}
-  <button type="button" class="model-trigger add-key ui-shine ui-shine-press" onclick={settings}>
-    <span class="trigger-mark" aria-hidden="true"><Icon icon={Key01Icon} size={14} /></span>
-    <span class="trigger-name"
-      >{hostedOffer ? m.work_model_start() : m.work_model_add_model_key()}</span
-    >
-  </button>
-{:else}<Popover.Root {open} onOpenChange={(next) => void opened(next)}>
-    <Popover.Trigger
-      bind:ref={trigger}
-      class="model-trigger ui-shine ui-shine-press"
-      aria-label={triggerLabel}
-      disabled={!models}
-    >
-      {#if current}
-        <span class="trigger-mark" aria-hidden="true"
-          ><ProviderMark provider={current.model.provider} size={15} /></span
-        >
-        <span class="trigger-name">{shortName(current)}</span>
-        {#if effort && levels.length > 1}<span class="trigger-level"
-            ><span class="trigger-dot" aria-hidden="true">·</span>{effortName(effort)}</span
-          >{/if}
-      {:else}
-        <span class="trigger-name empty">{m.work_model_none()}</span>
-      {/if}
-    </Popover.Trigger>
-    <Popover.Portal>
-      <Popover.Content
-        class="ui-menu model-menu ui-shine-sheet"
-        data-menu-material={material}
-        style={`--sheet: ${sheetHeight}px`}
-        side="top"
-        align="end"
-        customAnchor={trigger?.closest<HTMLElement>(".surface") ?? undefined}
-        sideOffset={10}
-        collisionPadding={12}
-        aria-label={m.work_model_label()}
-        onOpenAutoFocus={(event) => {
-          event.preventDefault();
-          (list ?? main)?.focus({ preventScroll: true });
-        }}
-        onCloseAutoFocus={returned}
-        onEscapeKeydown={escape}
-        onkeydown={keys}
+<Popover.Root {open} onOpenChange={(next) => void opened(next)}>
+  <Popover.Trigger
+    bind:ref={trigger}
+    class="model-trigger ui-shine ui-shine-press"
+    aria-label={keyless ? m.model_connect() : triggerLabel}
+    disabled={!models}
+  >
+    {#if keyless}
+      <span class="trigger-mark" aria-hidden="true"><Icon icon={Key01Icon} size={14} /></span>
+      <span class="trigger-name empty">{m.model_connect()}</span>
+    {:else if current}
+      <span class="trigger-mark" aria-hidden="true"
+        ><ProviderMark provider={current.model.provider} size={15} /></span
       >
-        <ModelRail
-          {seats}
-          current={shown}
-          {hits}
-          panel="{uid}-pane"
-          onpick={(view) => void pick(view)}
-        />
-        <div
-          class="main"
-          id="{uid}-pane"
-          role="tabpanel"
-          tabindex="-1"
-          bind:this={main}
-          aria-label={searching ? m.model_search() : title}
-        >
-          <div class="head" data-search={searchOpen ? "" : undefined}>
-            <h2 class="title">{title}</h2>
-            <div class="tools">
-              <button
-                type="button"
-                class="tool fade"
-                aria-label={m.model_favourites()}
-                title={m.model_favourites()}
-                aria-pressed={shown === "favourites"}
-                onpointerdown={(event) => event.preventDefault()}
-                onclick={() => void toggleFavourites()}
-                ><Icon icon={StarIcon} size={15} strokeWidth={1.8} /></button
-              >
-              <button
-                type="button"
-                class="tool fade"
-                aria-label={m.model_search()}
-                aria-expanded={searchOpen}
-                aria-controls="{uid}-find"
-                onpointerdown={(event) => event.preventDefault()}
-                onclick={() => (searchOpen ? closeSearch() : void openSearch())}
-                ><Icon icon={Search01Icon} size={15} strokeWidth={1.9} /></button
-              >
-              <button
-                type="button"
-                class="tool"
-                aria-label={m.model_settings()}
-                title={m.model_settings()}
-                onpointerdown={(event) => event.preventDefault()}
-                onclick={settings}
-                ><Icon icon={Settings02Icon} size={15} strokeWidth={1.8} /></button
-              >
-            </div>
-            <div class="find" id="{uid}-find" inert={!searchOpen}>
-              <span class="find-icon" aria-hidden="true"
-                ><Icon icon={Search01Icon} size={14} strokeWidth={2} /></span
-              >
-              <input
-                bind:this={field}
-                bind:value={query}
-                type="text"
-                role="combobox"
-                spellcheck="false"
-                autocomplete="off"
-                placeholder={m.model_search()}
-                aria-label={m.model_search()}
-                aria-expanded="true"
-                aria-controls="{uid}-list"
-                aria-autocomplete="list"
-                aria-activedescendant={active && items.some((item) => item.id === active)
-                  ? slot(active)
-                  : undefined}
-                oninput={retyped}
-              />
-              {#if searching}<button
-                  type="button"
-                  class="find-clear"
-                  aria-label={m.model_search_clear()}
-                  onpointerdown={(event) => event.preventDefault()}
-                  onclick={() => {
-                    query = "";
-                    active = home;
-                    field?.focus();
-                  }}><Icon icon={Cancel01Icon} size={10} strokeWidth={2.6} /></button
-                >{/if}
-            </div>
+      <span class="trigger-name">{shortName(current)}</span>
+      {#if effort && levels.length > 1}<span class="trigger-level"
+          ><span class="trigger-dot" aria-hidden="true">·</span>{effortName(effort)}</span
+        >{/if}
+    {:else}
+      <span class="trigger-name empty">{m.work_model_none()}</span>
+    {/if}
+  </Popover.Trigger>
+  <Popover.Portal>
+    <Popover.Content
+      class="ui-menu model-menu ui-shine-sheet"
+      data-menu-material={material}
+      style={`--sheet: ${sheetHeight}px`}
+      side="top"
+      align="end"
+      customAnchor={trigger?.closest<HTMLElement>(".surface") ?? undefined}
+      sideOffset={10}
+      collisionPadding={12}
+      aria-label={m.work_model_label()}
+      onOpenAutoFocus={(event) => {
+        event.preventDefault();
+        (list ?? main)?.focus({ preventScroll: true });
+      }}
+      onCloseAutoFocus={returned}
+      onEscapeKeydown={escape}
+      onkeydown={keys}
+    >
+      <ModelRail
+        {seats}
+        current={shown}
+        {hits}
+        panel="{uid}-pane"
+        onpick={(view) => void pick(view)}
+      />
+      <div
+        class="main"
+        id="{uid}-pane"
+        role="tabpanel"
+        tabindex="-1"
+        bind:this={main}
+        aria-label={searching ? m.model_search() : title}
+      >
+        <div class="head" data-search={searchOpen ? "" : undefined}>
+          <h2 class="title">{title}</h2>
+          <div class="tools">
+            <button
+              type="button"
+              class="tool fade"
+              aria-label={m.model_favourites()}
+              title={m.model_favourites()}
+              aria-pressed={shown === "favourites"}
+              onpointerdown={(event) => event.preventDefault()}
+              onclick={() => void toggleFavourites()}
+              ><Icon icon={StarIcon} size={15} strokeWidth={1.8} /></button
+            >
+            <button
+              type="button"
+              class="tool fade"
+              aria-label={m.model_search()}
+              aria-expanded={searchOpen}
+              aria-controls="{uid}-find"
+              onpointerdown={(event) => event.preventDefault()}
+              onclick={() => (searchOpen ? closeSearch() : void openSearch())}
+              ><Icon icon={Search01Icon} size={15} strokeWidth={1.9} /></button
+            >
+            <button
+              type="button"
+              class="tool"
+              aria-label={m.model_settings()}
+              title={m.model_settings()}
+              onpointerdown={(event) => event.preventDefault()}
+              onclick={settings}><Icon icon={Settings02Icon} size={15} strokeWidth={1.8} /></button
+            >
           </div>
-          {#if card}
-            <ModelCard
-              subject={card}
-              expanded={effortOpen}
-              region="{uid}-effort"
-              bind:pill
-              ontoggle={toggleEffort}
-              onEffort={chose}
-              onstir={stirred}
-            />
-          {/if}
-          {#if seat && seat.standing !== "ready" && !searching}
-            <ModelAsk
-              provider={seat.provider}
-              name={nameOf(seat.provider)}
-              standing={seat.standing}
-              onact={() => step(seat)}
-            />
-          {:else}
-            <!-- svelte-ignore a11y_click_events_have_key_events -->
-            <div
-              class="list"
-              id="{uid}-list"
-              role="listbox"
-              aria-label={searching ? m.model_search() : title}
-              aria-activedescendant={!searchOpen &&
-              active &&
-              items.some((item) => item.id === active)
+          <div class="find" id="{uid}-find" inert={!searchOpen}>
+            <span class="find-icon" aria-hidden="true"
+              ><Icon icon={Search01Icon} size={14} strokeWidth={2} /></span
+            >
+            <input
+              bind:this={field}
+              bind:value={query}
+              type="text"
+              role="combobox"
+              spellcheck="false"
+              autocomplete="off"
+              placeholder={m.model_search()}
+              aria-label={m.model_search()}
+              aria-expanded="true"
+              aria-controls="{uid}-list"
+              aria-autocomplete="list"
+              aria-activedescendant={active && items.some((item) => item.id === active)
                 ? slot(active)
                 : undefined}
-              tabindex="-1"
-              bind:this={list}
-              onpointermove={pointed}
-              onpointerleave={() => (active = home)}
-              onpointerdown={(event) => event.preventDefault()}
-              onclick={clicked}
-            >
-              {#if plate}<span
-                  class="plate"
-                  data-glide={plate.glide ? "" : undefined}
-                  aria-hidden="true"
-                  style:transform="translateY({plate.y}px)"
-                  style:block-size="{plate.h}px"
-                ></span>{/if}
-              {#each sections as section (section.key)}
-                <div
-                  class="section"
-                  role={spanning ? "group" : undefined}
-                  aria-labelledby={spanning ? `${uid}-${section.key}` : undefined}
-                >
-                  {#if spanning}<div class="label" id="{uid}-{section.key}">
-                      <span class="label-mark" aria-hidden="true"
-                        ><ProviderMark provider={section.provider} size={12} /></span
-                      ><span>{section.label}</span>
-                    </div>{/if}
-                  {#each section.items as item (item.id)}
-                    {@const closed = locked(models, item.entry.id)}
-                    {@const needed = closed ? requiredPlan(models, item.entry.id) : null}
-                    {@const starry = starred.has(item.id)}
-                    <div
-                      class="option"
-                      id={slot(item.id)}
-                      role="option"
-                      data-id={item.id}
-                      data-active={item.id === active ? "" : undefined}
-                      data-walk={item.id === active && walked ? "" : undefined}
-                      aria-selected={item.id === chosen}
-                      aria-label={closed
-                        ? needed
-                          ? m.work_model_upgrade_plan_label({
-                              model: item.entry.display_name,
-                              plan: planName(needed) ?? needed,
-                            })
-                          : m.work_model_upgrade_label({ model: item.entry.display_name })
-                        : undefined}
-                      aria-disabled={(!closed && !!session?.busy && session.busy !== "effort") ||
-                        undefined}
-                    >
-                      <span class="option-name">{item.entry.display_name}</span>
-                      {#if closed}<span class="upgrade" data-plan={needed ?? undefined}
-                          >{needed ? (planName(needed) ?? needed) : m.work_model_upgrade()}</span
-                        >{/if}
-                      <span class="slot">
-                        <span class="check" aria-hidden="true"
-                          >{#if item.id === chosen}<Icon
-                              icon={Tick02Icon}
-                              size={14}
-                              strokeWidth={2.2}
-                            />{/if}</span
-                        >
-                        <button
-                          type="button"
-                          class="star"
-                          data-on={starry ? "" : undefined}
-                          tabindex="-1"
-                          aria-pressed={starry}
-                          aria-label={starry
-                            ? m.model_unfavourite({ model: item.entry.display_name })
-                            : m.model_favourite({ model: item.entry.display_name })}
-                          ><Icon icon={StarIcon} size={14} strokeWidth={1.8} /></button
-                        >
-                      </span>
-                    </div>
-                  {/each}
-                </div>
-              {/each}
-              {#if searching && !items.length}<p class="empty">
-                  {m.model_no_match({ query: query.trim() })}
-                </p>{:else if !searching && !items.length}<p class="empty">
-                  {shown === "favourites" ? m.model_favourites_empty() : m.model_empty()}
-                </p>{/if}
-            </div>
-          {/if}
-          {#if searchOff}<p class="note">{m.work_model_no_search()}</p>{/if}
-          {#if session?.fault?.action === `choose:${role}`}<p class="note failure" role="alert">
-              {m.work_model_failed()}
-            </p>{/if}
-          {#if session?.fault?.action === "effort"}<p class="note failure" role="alert">
-              {m.model_effort_failed()}
-            </p>{/if}
+              oninput={retyped}
+            />
+            {#if searching}<button
+                type="button"
+                class="find-clear"
+                aria-label={m.model_search_clear()}
+                onpointerdown={(event) => event.preventDefault()}
+                onclick={() => {
+                  query = "";
+                  active = home;
+                  field?.focus();
+                }}><Icon icon={Cancel01Icon} size={10} strokeWidth={2.6} /></button
+              >{/if}
+          </div>
         </div>
-      </Popover.Content>
-    </Popover.Portal>
-  </Popover.Root>{/if}
+        {#if card}
+          <ModelCard
+            subject={card}
+            expanded={effortOpen}
+            region="{uid}-effort"
+            bind:pill
+            ontoggle={toggleEffort}
+            onEffort={chose}
+            onstir={stirred}
+          />
+        {/if}
+        {#if shown === "open_ai" && !spanning}
+          <div class="sources" role="group" aria-label={m.model_connection_sources()}>
+            <button
+              type="button"
+              aria-pressed={source === "api"}
+              onclick={() => {
+                sourcePick = "api";
+                active = null;
+              }}>{m.model_source_api()}</button
+            >
+            <button
+              type="button"
+              aria-pressed={source === "chatgpt"}
+              onclick={() => {
+                sourcePick = "chatgpt";
+                active = null;
+              }}>{m.model_source_chatgpt()}</button
+            >
+          </div>
+          <p class="source-note">{m.model_sources_note()}</p>
+          {#if savedAccountChoice && !hasChatGptModels(models)}
+            <p class="note" role="status">{m.ai_chatgpt_choice_unavailable()}</p>
+          {/if}
+          {#if source === "chatgpt" && open}
+            {#await import("./ModelChatGpt.svelte")}
+              <p class="note" role="status">{m.model_chatgpt_loading()}</p>
+            {:then connection}
+              <connection.default {profile} hasModels={hasChatGptModels(models)} />
+            {:catch}
+              <p class="note failure" role="alert">{m.model_chatgpt_load_failed()}</p>
+            {/await}
+          {/if}
+        {/if}
+        {#if shown === "open_ai" && !spanning && source === "chatgpt" && !hasChatGptModels(models)}
+          <!-- The native account view above explains the missing catalog. -->
+        {:else if shown === "open_ai" && !spanning && source === "api" && !usable(models, "open_ai")}
+          <ModelAsk
+            provider="open_ai"
+            name={nameOf("open_ai")}
+            standing={keyState(models, "open_ai") === "invalid" ? "refused" : "key"}
+            onact={settings}
+          />
+        {:else if seat && seat.standing !== "ready" && !searching}
+          <ModelAsk
+            provider={seat.provider}
+            name={nameOf(seat.provider)}
+            standing={seat.standing}
+            onact={() => step(seat)}
+          />
+        {:else}
+          <!-- svelte-ignore a11y_click_events_have_key_events -->
+          <div
+            class="list"
+            id="{uid}-list"
+            role="listbox"
+            aria-label={searching ? m.model_search() : title}
+            aria-activedescendant={!searchOpen && active && items.some((item) => item.id === active)
+              ? slot(active)
+              : undefined}
+            tabindex="-1"
+            bind:this={list}
+            onpointermove={pointed}
+            onpointerleave={() => (active = home)}
+            onpointerdown={(event) => event.preventDefault()}
+            onclick={clicked}
+          >
+            {#if plate}<span
+                class="plate"
+                data-glide={plate.glide ? "" : undefined}
+                aria-hidden="true"
+                style:transform="translateY({plate.y}px)"
+                style:block-size="{plate.h}px"
+              ></span>{/if}
+            {#each sections as section (section.key)}
+              <div
+                class="section"
+                role={spanning ? "group" : undefined}
+                aria-labelledby={spanning ? `${uid}-${section.key}` : undefined}
+              >
+                {#if spanning}<div class="label" id="{uid}-{section.key}">
+                    <span class="label-mark" aria-hidden="true"
+                      ><ProviderMark provider={section.provider} size={12} /></span
+                    ><span>{section.label}</span>
+                  </div>{/if}
+                {#each section.items as item (item.id)}
+                  {@const closed = locked(models, item.entry.id)}
+                  {@const needed = closed ? requiredPlan(models, item.entry.id) : null}
+                  {@const starry = starred.has(item.id)}
+                  <div
+                    class="option"
+                    id={slot(item.id)}
+                    role="option"
+                    data-id={item.id}
+                    data-active={item.id === active ? "" : undefined}
+                    data-walk={item.id === active && walked ? "" : undefined}
+                    aria-selected={item.id === chosen}
+                    aria-label={closed
+                      ? needed
+                        ? m.work_model_upgrade_plan_label({
+                            model: modelName(item.entry),
+                            plan: planName(needed) ?? needed,
+                          })
+                        : m.work_model_upgrade_label({ model: modelName(item.entry) })
+                      : undefined}
+                    aria-disabled={(!closed && !!session?.busy && session.busy !== "effort") ||
+                      undefined}
+                  >
+                    <span class="option-name">{modelName(item.entry)}</span>
+                    {#if closed}<span class="upgrade" data-plan={needed ?? undefined}
+                        >{needed ? (planName(needed) ?? needed) : m.work_model_upgrade()}</span
+                      >{/if}
+                    <span class="slot">
+                      <span class="check" aria-hidden="true"
+                        >{#if item.id === chosen}<Icon
+                            icon={Tick02Icon}
+                            size={14}
+                            strokeWidth={2.2}
+                          />{/if}</span
+                      >
+                      <button
+                        type="button"
+                        class="star"
+                        data-on={starry ? "" : undefined}
+                        tabindex="-1"
+                        aria-pressed={starry}
+                        aria-label={starry
+                          ? m.model_unfavourite({ model: modelName(item.entry) })
+                          : m.model_favourite({ model: modelName(item.entry) })}
+                        ><Icon icon={StarIcon} size={14} strokeWidth={1.8} /></button
+                      >
+                    </span>
+                  </div>
+                {/each}
+              </div>
+            {/each}
+            {#if searching && !items.length}<p class="empty">
+                {m.model_no_match({ query: query.trim() })}
+              </p>{:else if !searching && !items.length}<p class="empty">
+                {shown === "favourites" ? m.model_favourites_empty() : m.model_empty()}
+              </p>{/if}
+          </div>
+        {/if}
+        {#if searchOff}<p class="note">{m.work_model_no_search()}</p>{/if}
+        {#if session?.fault?.action === `choose:${role}`}<p class="note failure" role="alert">
+            {m.work_model_failed()}
+          </p>{/if}
+        {#if session?.fault?.action === "effort"}<p class="note failure" role="alert">
+            {m.model_effort_failed()}
+          </p>{/if}
+      </div>
+    </Popover.Content>
+  </Popover.Portal>
+</Popover.Root>
 
 <svelte:window
   onpointerup={() => {
@@ -863,13 +922,6 @@
 
   :global(.model-trigger:disabled) {
     opacity: 0;
-  }
-
-  .add-key {
-    align-items: center;
-    gap: 7px;
-    padding-inline: 10px 12px;
-    color: var(--color-label-secondary);
   }
 
   .trigger-mark {
@@ -933,6 +985,52 @@
     min-inline-size: 0;
     min-block-size: 0;
     outline: none;
+  }
+
+  .sources {
+    display: flex;
+    flex: none;
+    gap: 4px;
+    margin: 10px 14px 0;
+    padding: 3px;
+    border-radius: var(--radius-control);
+    background: var(--color-fill);
+  }
+
+  .sources button {
+    flex: 1;
+    min-block-size: 28px;
+    padding: 4px 8px;
+    border: 0;
+    border-radius: var(--radius-control);
+    background: transparent;
+    color: var(--color-muted);
+    font: inherit;
+    font-size: var(--text-label);
+    cursor: default;
+  }
+
+  .sources button:hover {
+    color: var(--color-text);
+    background: var(--color-fill-hover);
+  }
+
+  .sources button[aria-pressed="true"] {
+    color: var(--color-text);
+    background: var(--row-active);
+  }
+
+  .sources button:focus-visible {
+    outline: 2px solid var(--color-ring);
+    outline-offset: -2px;
+  }
+
+  .source-note {
+    flex: none;
+    margin: 6px 14px 0;
+    color: var(--color-muted);
+    font-size: var(--text-caption);
+    line-height: 1.4;
   }
 
   /* One row, 28px: the place's name and two small tools. The search field slides over the name. */

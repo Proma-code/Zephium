@@ -6,7 +6,9 @@
     ModelsSession,
     entryOf,
     keyedProviders,
+    hasChatGptModels,
     locked,
+    modelName,
     pickerGroups,
     providerName,
     usable,
@@ -17,6 +19,7 @@
   import SettingsRow from "$shared/ui/SettingsRow";
   import AiProviderRow from "../AiProviderRow.svelte";
   import AiVoiceRow from "../AiVoiceRow.svelte";
+  import ChatGptAccount from "../ChatGptAccount.svelte";
   import AiZephiumRow from "../AiZephiumRow.svelte";
   import WorkDecisions from "../WorkDecisions.svelte";
 
@@ -41,6 +44,7 @@
   });
   const AUTO = "auto";
   let expanded = $state(false);
+  let otherAccountsOpen = $state(false);
   const roles: {
     role: Exclude<WorkModelRole, "decision">;
     title: () => string;
@@ -52,7 +56,9 @@
   ];
   const anyUsable = $derived(
     !!models &&
-      (usable(models, "cloud") || keyedProviders.some((provider) => usable(models, provider))),
+      (hasChatGptModels(models) ||
+        usable(models, "cloud") ||
+        keyedProviders.some((provider) => usable(models, provider))),
   );
 
   function label(entry: WorkModelEntry) {
@@ -65,8 +71,11 @@
       .filter(Boolean)
       .join(" · ");
     const name =
-      provider === "anthropic" || provider === "deep_seek" || provider === "cloud"
-        ? entry.display_name
+      provider === "anthropic" ||
+      provider === "deep_seek" ||
+      provider === "cloud" ||
+      provider === "open_ai"
+        ? modelName(entry)
         : `${entry.display_name} · ${providerName(provider)}`;
     return note ? `${name} · ${note}` : name;
   }
@@ -75,14 +84,20 @@
     const effective = entryOf(models, models?.effective[role]);
     const automatic = {
       value: AUTO,
-      label: effective ? m.ai_role_auto({ model: effective.display_name }) : m.ai_role_auto_none(),
+      label: effective ? m.ai_role_auto({ model: modelName(effective) }) : m.ai_role_auto_none(),
     };
     const offered = pickerGroups(models, role, [
       ...(session?.endpoint ?? []),
       ...(expanded ? (session?.more ?? []) : []),
     ]).ready.flatMap((group) => group.entries);
+    const chosen = models?.chosen[role];
+    const missingAccountChoice =
+      chosen?.startsWith("chatgpt/") && !offered.some((entry) => entry.id === chosen)
+        ? [{ value: chosen, label: m.ai_chatgpt_choice_unavailable(), disabled: true }]
+        : [];
     return [
       automatic,
+      ...missingAccountChoice,
       ...offered.map((entry) =>
         locked(models, entry.id)
           ? { value: entry.id, label: m.ai_model_locked({ model: label(entry) }), disabled: true }
@@ -98,6 +113,19 @@
   {#if !anyUsable}<p class="ai-note">{m.ai_byok_start()}</p>{/if}
 
   <AiZephiumRow />
+  <ChatGptAccount profile={profile.id} />
+  <details class="other-accounts" bind:open={otherAccountsOpen}>
+    <summary>{m.ai_subscriptions_expand()}</summary>
+    {#if otherAccountsOpen}
+      {#await import("../AiSubscriptions.svelte")}
+        <p class="ai-note" role="status">{m.ai_subscriptions_loading()}</p>
+      {:then otherAccounts}
+        <otherAccounts.default />
+      {:catch}
+        <p class="ai-note" role="alert">{m.ai_subscriptions_load_failed()}</p>
+      {/await}
+    {/if}
+  </details>
 
   <SettingsGroup title={m.ai_keys_group()} description={m.ai_keys_note()}>
     {#if session}{#each keyedProviders as provider (provider)}<AiProviderRow
@@ -150,5 +178,59 @@
 
   .more {
     padding: 12px 14px;
+  }
+
+  .other-accounts {
+    margin-block: 8px 34px;
+  }
+
+  /* Match AccountServer's existing advanced-settings disclosure. */
+  summary {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding-block: 4px;
+    padding-inline: 16px;
+    color: var(--color-muted);
+    font-size: var(--text-label);
+    font-weight: 500;
+    list-style: none;
+    cursor: default;
+  }
+
+  summary::-webkit-details-marker {
+    display: none;
+  }
+
+  summary::before {
+    inline-size: 0;
+    block-size: 0;
+    border-block: 4px solid transparent;
+    border-inline-start: 5px solid currentcolor;
+    content: "";
+    transition: rotate var(--motion-fast) var(--ease-out);
+  }
+
+  .other-accounts[open] summary::before {
+    rotate: 90deg;
+  }
+
+  summary:hover {
+    color: var(--color-text);
+  }
+
+  summary:focus-visible {
+    outline: 2px solid var(--color-ring);
+    outline-offset: 2px;
+  }
+
+  .other-accounts[open] summary {
+    margin-block-end: 10px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    summary::before {
+      transition: none;
+    }
   }
 </style>

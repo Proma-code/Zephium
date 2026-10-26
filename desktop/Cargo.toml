@@ -7,6 +7,8 @@ license.workspace = true
 
 [features]
 default = ["work-product", "macos-page-permission-prompts"]
+# Optimized but explicitly isolated Windows trial, never a production update.
+windows-subscription-trial = ["dep:zephium-credentials", "zephium-credentials/windows-subscription-trial"]
 # Dormant until an explicit Work intent. Native adapters are target-specific;
 # durable contracts and orchestration also compile on Windows.
 work-product = [
@@ -162,6 +164,9 @@ tauri = { workspace = true, features = ["unstable"] }
 windows = { version = "0.61", features = ["Win32_Graphics_Gdi"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+zephium-credentials = { workspace = true, optional = true }
+zephium-chatgpt.workspace = true
+zeroize = "=1.9.0"
 zephium-work-composition = { workspace = true, optional = true }
 zephium-blocker = { workspace = true, features = ["runtime"] }
 raw-window-handle.workspace = true

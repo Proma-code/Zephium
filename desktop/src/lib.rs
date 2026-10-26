@@ -70,6 +70,7 @@ mod account;
 mod blocker_service;
 mod browser_credentials;
 mod browser_import;
+mod chatgpt;
 mod content_fullscreen;
 mod default_browser;
 mod diagnostics;
@@ -877,6 +878,7 @@ impl ShutdownCoordinator {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.terminal_started.store(true, Ordering::Release);
         drop(admission);
+        chatgpt::stop();
     }
 
     fn try_startup_admission(&self, admit: impl FnOnce() -> bool) -> bool {
@@ -935,6 +937,10 @@ impl ShutdownCoordinator {
             let operations = work.operations.clone();
             let coordinator = self.clone();
             tauri::async_runtime::spawn(async move {
+                if !chatgpt::drained().await {
+                    coordinator.terminal_failure.store(true, Ordering::Release);
+                    diagnostic!("shutdown: ChatGPT account mutation cleanup was not proven");
+                }
                 if !operations.shutdown().await {
                     coordinator.terminal_failure.store(true, Ordering::Release);
                     diagnostic!("shutdown: Work operation cleanup was not proven");
@@ -5760,6 +5766,7 @@ fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
     if code == Some(tauri::RESTART_EXIT_CODE)
         && !coordinator.terminal_failure.load(Ordering::Acquire)
     {
+        chatgpt::stop();
         return;
     };
     if exit_request_is_authorized(
@@ -5872,6 +5879,14 @@ pub fn run() {
     };
 
     let specta = specta_builder();
+    let existing_handler = specta.invoke_handler();
+    let account_handler = tauri::generate_handler![
+        chatgpt::chatgpt_account,
+        chatgpt::chatgpt_sign_in,
+        chatgpt::chatgpt_cancel,
+        chatgpt::chatgpt_sign_out,
+        chatgpt::chatgpt_refresh_models,
+    ];
     #[cfg(target_os = "windows")]
     let attempted_privileged_environments = Arc::new(AtomicU8::new(0));
     #[cfg(target_os = "windows")]
@@ -5882,7 +5897,6 @@ pub fn run() {
         .plugin(navigation_lock())
         .register_asynchronous_uri_scheme_protocol(media::SCHEME, media::serve)
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         // Must register first: a second launch (file association, dock, a
         // stale instance holding the global hotkey and the profile dbs)
         // focuses the running window and exits.
@@ -5890,6 +5904,8 @@ pub fn run() {
             external_links::bring_forward(app);
             external_links::hand_off(app, argv.into_iter().skip(1), true);
         }));
+    #[cfg(not(feature = "windows-subscription-trial"))]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
     // global-hotkey is X11-only on Linux. Initializing its Tauri plugin on a
     // native Wayland session can report success while receiving no keys (or
     // fail startup when Xwayland is absent). Linux selects an actual GDK
@@ -5897,7 +5913,13 @@ pub fn run() {
     #[cfg(not(target_os = "linux"))]
     let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
     let app = builder
-        .invoke_handler(specta.invoke_handler())
+        .invoke_handler(move |invoke| {
+            if zephium_ipc::chatgpt::ChatGptCommand::owns(invoke.message.command()) {
+                account_handler(invoke)
+            } else {
+                existing_handler(invoke)
+            }
+        })
         // This state must predate the setup hook: every environmental failure
         // is contained inside that native Ready callback and converted into a
         // correlated event-loop exit instead of escaping as Tauri's panic.
@@ -6021,6 +6043,7 @@ pub fn run() {
                 menu_text::set_language(store.app_setting("ui.language").as_deref());
                 updates::schedule_native_checks(app.handle());
                 work_models::install(app.handle());
+                chatgpt::install(app.handle());
                 account::install(app.handle());
 
                 #[cfg(target_os = "windows")]
@@ -6487,6 +6510,7 @@ pub fn run() {
                     }
                 }
                 Projection::Profiles(view) => {
+                    chatgpt::profiles_changed(&view);
                     emit_to_privileged(&emit_handle, MAIN_LABEL, "zephium:profiles", &view)
                 }
 

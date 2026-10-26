@@ -7,8 +7,8 @@ use super::*;
 use zephium_app::work_lead::{LeadModel, WorkLeadModels, WorkLeadService};
 use zephium_core::work::model::WorkModelRole;
 
-/// The models for each role; a helper role without its own model uses the
-/// lead's. `None` when no lead model resolves, and the run is refused.
+/// Models for each role. Only an automatic helper can fall back to another
+/// BYOK model; explicit inactive choices and subscription routes fail closed.
 pub(crate) async fn models(
     profile: ProfileId,
     work: Option<zephium_core::work::WorkId>,
@@ -29,12 +29,30 @@ pub(crate) async fn models(
         }
     };
     let lead = resolve(WorkModelRole::Lead).await?;
-    let page = resolve(WorkModelRole::Page)
-        .await
-        .unwrap_or_else(|| lead.clone());
-    let light = resolve(WorkModelRole::Light)
-        .await
-        .unwrap_or_else(|| page.clone());
+    let page = match resolve(WorkModelRole::Page).await {
+        Some(page) => page,
+        None if zephium_app::work_models::helper_fallback_allowed(
+            profile,
+            WorkModelRole::Page,
+            &lead.entry,
+        ) =>
+        {
+            lead.clone()
+        }
+        None => return None,
+    };
+    let light = match resolve(WorkModelRole::Light).await {
+        Some(light) => light,
+        None if zephium_app::work_models::helper_fallback_allowed(
+            profile,
+            WorkModelRole::Light,
+            &page.entry,
+        ) =>
+        {
+            page.clone()
+        }
+        None => return None,
+    };
     Some(WorkLeadModels { lead, page, light })
 }
 
@@ -112,6 +130,15 @@ async fn provider_search(
 > {
     use zephium_agentic::{AgentProviderTransport, AgentProviderTransportConfig};
     use zephium_core::work::search::{WorkSearchFallbackV1, WorkSearchProvider};
+    // Linking a subscription never authorizes spending a preserved API key
+    // on a hidden search route. The browser-search backend still works.
+    if !zephium_app::work_models::paid_search_fallback_allowed(&[
+        &models.lead.entry,
+        &models.page.entry,
+        &models.light.entry,
+    ]) {
+        return Ok(None);
+    }
     for model in [&models.light, &models.lead, &models.page] {
         if let Ok(search) =
             zephium_agentic::ModelNativeSearch::try_new(model.entry.clone(), model.client.clone())
@@ -159,12 +186,20 @@ async fn provider_search(
     )))
 }
 
-/// The page agent runs on the page model the person chose; a page model that
-/// cannot call tools leaves the page to the lead model.
+/// The page agent runs on its chosen model. Legacy BYOK capability fallback
+/// must not replace a subscription route or opt another role into one.
 fn page_model(
     models: &WorkLeadModels,
 ) -> Result<zephium_agentic::AgentProviderModelClient, WorkError> {
-    for model in [&models.page, &models.lead] {
+    for (index, model) in [&models.page, &models.lead].into_iter().enumerate() {
+        if index > 0
+            && !zephium_app::work_models::model_fallback_allowed(
+                &models.page.entry,
+                &models.lead.entry,
+            )
+        {
+            break;
+        }
         if let Ok(page) =
             zephium_agentic::AgentProviderModelClient::try_new(&model.entry, model.client.clone())
         {
@@ -242,11 +277,21 @@ impl WorkProviders {
         let page = page_model(&models)?;
         // Typed decisions the recommended backend leaves open go to the light
         // model; one that cannot call tools leaves them to the page model.
-        let light = zephium_agentic::AgentProviderModelClient::try_new(
+        let light = match zephium_agentic::AgentProviderModelClient::try_new(
             &models.light.entry,
             models.light.client.clone(),
-        )
-        .ok();
+        ) {
+            Ok(light) => Some(light),
+            Err(_)
+                if zephium_app::work_models::model_fallback_allowed(
+                    &models.light.entry,
+                    &models.page.entry,
+                ) =>
+            {
+                None
+            }
+            Err(_) => return Err(WorkError::Unavailable),
+        };
         let callback = shell.callback_handle();
         let work = command.work;
         let started = std::time::Instant::now();

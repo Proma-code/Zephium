@@ -339,6 +339,17 @@ where
                     let _ = self.run.begin(step, vec![]).await;
                     return Err(WorkError::OutcomeUnknown);
                 }
+                Err(failure @ CallFailure::ChatGptAfterOutput { .. }) => {
+                    self.record_turn(
+                        None,
+                        WorkStepStatus::Failed,
+                        None,
+                        failure,
+                        self.models.lead.entry.model.provider,
+                    )
+                    .await;
+                    return Ok(WorkAttemptStatus::Failed);
+                }
                 Err(CallFailure::Refused(error)) => {
                     failed_calls += 1;
                     self.record_turn(
@@ -356,6 +367,7 @@ where
                             | WorkModelError::OverBudget
                             | WorkModelError::PlanLimit
                             | WorkModelError::Hosted { .. }
+                            | WorkModelError::ChatGpt { .. }
                     );
                     if fatal {
                         return Ok(WorkAttemptStatus::Failed);
@@ -1603,6 +1615,14 @@ where
         failure: CallFailure,
         provider: WorkModelProvider,
     ) {
+        let partial_usage_unknown = matches!(failure, CallFailure::ChatGptAfterOutput { .. });
+        let (failure, usage) = match failure {
+            CallFailure::ChatGptAfterOutput { fault, reservation } => (
+                CallFailure::Refused(WorkModelError::ChatGpt { fault }),
+                Some(reservation),
+            ),
+            failure => (failure, usage),
+        };
         let mut step = self.run.step(WorkStepKindV1::Turn, status, part);
         step.usage = Some(usage.unwrap_or_default());
         let hosted = provider == WorkModelProvider::Cloud;
@@ -1612,6 +1632,7 @@ where
         };
         step.note = Some(
             match failure {
+                CallFailure::Refused(WorkModelError::ChatGpt { fault }) => chatgpt_note(fault),
                 CallFailure::Refused(WorkModelError::OverBudget) if hosted => {
                     "Zephium AI's included usage is spent; upgrade, buy extra usage or use your own key"
                 }
@@ -1671,6 +1692,11 @@ where
             }
             .into(),
         );
+        if partial_usage_unknown {
+            if let Some(note) = step.note.as_mut() {
+                note.push_str(" Usage for the partial response is unknown; the local budget keeps a conservative reservation, not a confirmed charge.");
+            }
+        }
         let _ = self.run.begin(step, vec![]).await;
     }
     /// Ends a run that could not reach its own finish as a result: what it
@@ -2087,6 +2113,7 @@ const STUB: &str = "[Used; dropped to keep the conversation small.";
 /// Why the model stopped, as the closing reply says it.
 fn model_stop(error: WorkModelError) -> &'static str {
     match error {
+        WorkModelError::ChatGpt { fault } => chatgpt_note(fault),
         WorkModelError::RateLimited { .. } => {
             "The model provider kept limiting requests, so I stopped."
         }
@@ -2103,9 +2130,22 @@ fn model_stop(error: WorkModelError) -> &'static str {
     }
 }
 
+fn chatgpt_note(fault: ChatGptModelFault) -> &'static str {
+    match fault {
+        ChatGptModelFault::SignedOut => "The selected ChatGPT connection is unavailable; reconnect it in Settings → AI. Your API keys are unchanged.",
+        ChatGptModelFault::UsageLimit => "ChatGPT plan usage is limited for this app or account. Check ChatGPT Settings → Usage before trying again; the reset time is not known.",
+        ChatGptModelFault::Unavailable => "ChatGPT could not confirm account or usage availability. Your connection is kept; try again later.",
+        ChatGptModelFault::NotEligible => "ChatGPT plan usage is not permitted for this account, workspace, region or grant. Check the connection and ChatGPT settings.",
+        ChatGptModelFault::Unsupported => "The direct ChatGPT route does not support this model request or capability. Choose another supported model or change the request.",
+    }
+}
+
 /// A refused model call in the words the person acts on.
 fn model_fault(error: WorkModelError, hosted: bool) -> Option<WorkModelFaultV1> {
     Some(match error {
+        // The exact note above is truthful; API-key and Zephium-plan UI actions
+        // would misdirect a locally authorized ChatGPT account.
+        WorkModelError::ChatGpt { .. } => return None,
         WorkModelError::MissingKey if hosted => WorkModelFaultV1::SignedOut,
         WorkModelError::MissingKey => WorkModelFaultV1::MissingKey,
         WorkModelError::Unauthorized if hosted => WorkModelFaultV1::SignedOut,
@@ -2303,6 +2343,25 @@ mod compact_tests {
             model_fault(WorkModelError::PlanLimit, false),
             Some(WorkModelFaultV1::PlanLimit)
         );
+    }
+
+    #[test]
+    fn chatgpt_refusals_do_not_offer_api_key_or_hosted_billing_actions() {
+        for fault in [
+            ChatGptModelFault::SignedOut,
+            ChatGptModelFault::UsageLimit,
+            ChatGptModelFault::Unavailable,
+            ChatGptModelFault::NotEligible,
+            ChatGptModelFault::Unsupported,
+        ] {
+            let error = WorkModelError::ChatGpt { fault };
+            assert_eq!(model_fault(error, false), None);
+            assert_eq!(model_fault(error, true), None);
+            assert!(model_stop(error).contains("ChatGPT"));
+        }
+        assert!(chatgpt_note(ChatGptModelFault::UsageLimit).contains("reset time is not known"));
+        assert!(chatgpt_note(ChatGptModelFault::Unavailable).contains("connection is kept"));
+        assert!(chatgpt_note(ChatGptModelFault::SignedOut).contains("API keys are unchanged"));
     }
 
     #[test]
