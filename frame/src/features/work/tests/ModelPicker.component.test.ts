@@ -1199,6 +1199,7 @@ test.each([true, false])(
 );
 
 test("profile replacement discards queued effort without applying it to the new connection", async () => {
+  native.ready.mockImplementation(ready(true));
   const nextProfile = "00000000000000000000000002";
   const id = "openai/gpt-6-luna";
   const previous = view(id);
