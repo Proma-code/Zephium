@@ -4,6 +4,7 @@ import {
   contextSize,
   dollars,
   effortLevels,
+  modelEffort,
   hasChatGptModels,
   hasGatewayModels,
   hasGoModels,
@@ -324,4 +325,28 @@ describe("model context provenance", () => {
     expect(model.context_window).toBe(32768);
     expect(model.max_output).toBe(8192);
   });
+});
+
+test("selected-model effort does not depend on a hosted account or a Work lead", () => {
+  const value = models({});
+  const id = "chatgpt/example";
+  value.efforts.push({ id, levels: ["low", "medium", "high", "xhigh", "max"], effort: "medium" });
+  value.effective.page = id;
+  expect(value.effort).toBeNull();
+  expect(value.effective.lead).toBeNull();
+  expect(value.cloud.signed_in).toBe(false);
+  expect(modelEffort(value, id)).toBe("medium");
+  value.effort = "max";
+  expect(modelEffort(value, id)).toBe("medium");
+});
+
+test("missing or inconsistent entry effort is not guessed from a different model", () => {
+  const value = models({ lead: "openai/gpt-6-luna", effort: "max" });
+  const id = "chatgpt/example";
+  value.efforts.push({ id, levels: ["low", "medium", "high"], effort: null });
+  expect(modelEffort(value, id)).toBeNull();
+  value.efforts[value.efforts.length - 1]!.effort = "max";
+  expect(modelEffort(value, id)).toBeNull();
+  expect(modelEffort(value, "chatgpt/missing")).toBeNull();
+  expect(modelEffort(null, id)).toBeNull();
 });

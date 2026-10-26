@@ -33,6 +33,7 @@ struct PageState {
     marks: Vec<(String, Vec<(u8, u16)>)>,
     cleared: Vec<String>,
     reads: u64,
+    read_tabs: Vec<String>,
     picks: Vec<Pick>,
     outline: Option<Outline>,
     glows: Vec<(String, Glow)>,
@@ -61,6 +62,7 @@ impl PagePort for FakePage {
     ) -> BoxFuture<'a, Result<Readout, ReadFailure>> {
         let mut state = self.lock();
         state.reads += 1;
+        state.read_tabs.push(tab.to_owned());
         let read = state.reads;
         let readout = state
             .readouts
@@ -162,11 +164,14 @@ impl Diagnostics for Notes {
 /// One scripted model call: text deltas, then tool calls or the end.
 #[derive(Clone, Default)]
 struct Turn {
+    /// Fixed offline wire fixture, decoded by the actual ChatGPT adapter.
+    wire_response: Option<Vec<u8>>,
     deltas: Vec<String>,
     tools: Vec<(String, Value)>,
     hang: bool,
     error: Option<WorkModelError>,
     exhausted: bool,
+    usage_unavailable: bool,
 }
 
 fn say(text: &str) -> Turn {
@@ -188,6 +193,7 @@ fn tool(name: &str, arguments: Value) -> Turn {
 }
 
 struct FakeClient {
+    encoded: Arc<Mutex<Vec<Vec<u8>>>>,
     turns: Mutex<VecDeque<Turn>>,
     requests: Arc<Mutex<Vec<WorkModelRequest>>>,
     dropped: Arc<AtomicBool>,
@@ -206,11 +212,18 @@ impl WorkModelClient for FakeClient {
         request: WorkModelRequest,
         events: &'a (dyn Fn(WorkModelEvent) + Send + Sync),
     ) -> WorkModelFuture<'a> {
-        self.requests.lock().unwrap().push(request);
+        self.requests.lock().unwrap().push(request.clone());
+        let encoded = self.encoded.clone();
         let turn = self.turns.lock().unwrap().pop_front().unwrap_or_default();
         let flag = DropFlag(self.dropped.clone());
         Box::pin(async move {
             let _flag = flag;
+            if let Some(response) = turn.wire_response {
+                let (body, outcome) =
+                    zephium_chatgpt::inference::fixture_call(&request, &response, events)?;
+                encoded.lock().unwrap().push(body);
+                return Ok(outcome);
+            }
             let mut assistant = Vec::new();
             for delta in &turn.deltas {
                 events(WorkModelEvent::Text(delta.clone()));
@@ -238,11 +251,15 @@ impl WorkModelClient for FakeClient {
                 } else {
                     WorkModelStop::ToolUse
                 },
-                usage: WorkModelUsage {
-                    input_tokens: 1_000,
-                    output_tokens: 100,
-                    cost_micros: Some(4_000),
-                    ..WorkModelUsage::default()
+                usage: if turn.usage_unavailable {
+                    WorkModelUsage::unavailable()
+                } else {
+                    WorkModelUsage {
+                        input_tokens: 1_000,
+                        output_tokens: 100,
+                        cost_micros: Some(4_000),
+                        ..WorkModelUsage::default()
+                    }
                 },
                 assistant,
             })
@@ -275,6 +292,7 @@ fn entry(tools: bool) -> WorkModelEntry {
 }
 
 struct FakeModels {
+    effort: WorkModelReasoning,
     entry: WorkModelEntry,
     client: Arc<FakeClient>,
 }
@@ -282,10 +300,11 @@ struct FakeModels {
 impl ModelSource for FakeModels {
     fn entry<'a>(&'a self, _profile: &'a ProfileId) -> BoxFuture<'a, Option<ModelChoice>> {
         let entry = self.entry.clone();
+        let effort = self.effort;
         Box::pin(async move {
             Some(ModelChoice {
                 entry,
-                effort: Some(WorkModelReasoning::High),
+                effort: Some(effort),
             })
         })
     }
@@ -296,10 +315,11 @@ impl ModelSource for FakeModels {
     ) -> BoxFuture<'a, Result<ResolvedModel, WorkModelError>> {
         let entry = self.entry.clone();
         let client: Arc<dyn WorkModelClient> = self.client.clone();
+        let effort = self.effort;
         Box::pin(async move {
             Ok(ResolvedModel {
                 entry,
-                effort: Some(WorkModelReasoning::XHigh),
+                effort: Some(effort),
                 client,
             })
         })
@@ -576,6 +596,14 @@ fn harness_with(turns: Vec<Turn>, tools: bool) -> Harness {
 }
 
 fn harness_entry(turns: Vec<Turn>, model: WorkModelEntry) -> Harness {
+    harness_entry_effort(turns, model, WorkModelReasoning::XHigh)
+}
+
+fn harness_entry_effort(
+    turns: Vec<Turn>,
+    model: WorkModelEntry,
+    effort: WorkModelReasoning,
+) -> Harness {
     let page = Arc::new(FakePage::default());
     {
         let mut state = page.lock();
@@ -597,6 +625,7 @@ fn harness_entry(turns: Vec<Turn>, model: WorkModelEntry) -> Harness {
         );
     }
     let client = Arc::new(FakeClient {
+        encoded: Arc::new(Mutex::new(Vec::new())),
         turns: Mutex::new(turns.into()),
         requests: Arc::new(Mutex::new(Vec::new())),
         dropped: Arc::new(AtomicBool::new(false)),
@@ -612,6 +641,7 @@ fn harness_entry(turns: Vec<Turn>, model: WorkModelEntry) -> Harness {
         page: page.clone(),
         tabs: tabs.clone(),
         models: Arc::new(FakeModels {
+            effort,
             entry: model,
             client: client.clone(),
         }),
@@ -793,8 +823,8 @@ async fn an_answer_streams_with_cites_from_the_page_and_is_stored() {
     let request = &h.requests()[0];
     assert_eq!(
         request.reasoning,
-        Some(WorkModelReasoning::High),
-        "the sidebar holds effort at high"
+        Some(WorkModelReasoning::XHigh),
+        "the sidebar preserves the explicitly selected supported effort"
     );
     assert!(
         request.max_output_tokens >= 8_000,
@@ -1510,15 +1540,218 @@ async fn protected_source_limits_end_without_retry_fallback_tools_or_claimed_cos
         assert_eq!(state, PageAssistReplyStateV1::Failed);
         assert_eq!(
             fault,
-            Some(PageAssistFaultV1::Model {
-                fault: WorkModelFaultV1::RateLimited,
-                retry_after_ms: None
+            Some(match error {
+                WorkModelError::ChatGpt { fault } => PageAssistFaultV1::ChatGpt { fault },
+                _ => PageAssistFaultV1::Model {
+                    fault: WorkModelFaultV1::RateLimited,
+                    retry_after_ms: None,
+                },
             })
         );
         assert!(
             cost.is_none(),
             "a failure is not a zero or confirmed charge"
         );
+        assert_eq!(h.client.requests.lock().unwrap().len(), 1);
+        assert_eq!(h.client.turns.lock().unwrap().len(), 1);
+        assert!(h.work.0.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn real_page_prompt_and_tools_complete_through_offline_chatgpt_wire_without_effort_clamping()
+{
+    fn validate_schema(schema: &Value) {
+        match schema["type"].as_str().unwrap() {
+            "object" => {
+                assert_eq!(schema["additionalProperties"], false);
+                let properties = schema["properties"].as_object().unwrap();
+                if let Some(required) = schema["required"].as_array() {
+                    let mut unique = std::collections::HashSet::new();
+                    for key in required {
+                        let key = key.as_str().unwrap();
+                        assert!(unique.insert(key));
+                        assert!(properties.contains_key(key));
+                    }
+                }
+                for property in properties.values() {
+                    validate_schema(property);
+                }
+            }
+            "array" => {
+                validate_schema(&schema["items"]);
+                if let Some(maximum) = schema.get("maxItems") {
+                    assert!(maximum.as_u64().is_some());
+                }
+            }
+            "string" => {
+                if let Some(values) = schema["enum"].as_array() {
+                    assert!(!values.is_empty());
+                    assert!(values.iter().all(Value::is_string));
+                }
+            }
+            "boolean" => {}
+            other => panic!("unexpected fixed schema type: {other}"),
+        }
+    }
+    let response = [
+        json!({"type":"response.output_text.delta", "delta":"مرحبا من الاختبار"}),
+        json!({"type":"response.completed", "response": {
+            "status":"completed",
+            "usage":{"input_tokens":100,"output_tokens":10},
+            "output":[{"type":"message","role":"assistant","content":[
+                {"type":"output_text","text":"مرحبا من الاختبار","annotations":[]}
+            ]}]
+        }}),
+    ]
+    .into_iter()
+    .map(|event| format!("data: {event}\n\n"))
+    .collect::<String>()
+    .into_bytes();
+    for effort in [
+        WorkModelReasoning::Medium,
+        WorkModelReasoning::High,
+        WorkModelReasoning::XHigh,
+        WorkModelReasoning::Max,
+    ] {
+        let model = zephium_chatgpt::inference::Model {
+            slug: "gpt-6.1-sol".into(),
+            display_name: "GPT-6.1 Sol".into(),
+        }
+        .entry();
+        let h = harness_entry_effort(
+            vec![Turn {
+                wire_response: Some(response.clone()),
+                ..Turn::default()
+            }],
+            model,
+            effort,
+        );
+        h.ask("مرحبا", false).await.unwrap();
+        h.settle().await;
+        let PageAssistMessageV1::Reply {
+            state, fault, cost, ..
+        } = h.reply().await
+        else {
+            panic!()
+        };
+        assert_eq!(state, PageAssistReplyStateV1::Done);
+        assert_eq!(fault, None);
+        assert_eq!(text_of(&h.blocks().await), "مرحبا من الاختبار");
+        assert!(matches!(
+            cost,
+            Some(PageAssistCostV1::Byok { usd: None, .. })
+        ));
+        assert_eq!(
+            h.service
+                .status(SPACE, Some(TAB))
+                .await
+                .model
+                .unwrap()
+                .effort
+                .as_deref(),
+            Some(super::effort_name(effort))
+        );
+        assert_eq!(h.requests().len(), 1);
+        let encoded = h.client.encoded.lock().unwrap();
+        assert_eq!(encoded.len(), 1);
+        let body: Value = serde_json::from_slice(&encoded[0]).unwrap();
+        assert_eq!(body["model"], "gpt-6.1-sol");
+        assert_eq!(body["reasoning"]["effort"], super::effort_name(effort));
+        assert_eq!(body["instructions"], zephium_page_assist::prompt::SYSTEM);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        let namespace = &body["tools"][0];
+        assert_eq!(namespace["type"], "namespace");
+        assert_eq!(namespace["name"], "zephium");
+        let functions = namespace["tools"].as_array().unwrap();
+        assert_eq!(functions.len(), 9);
+        for (actual, expected) in functions.iter().zip(tools::definitions()) {
+            assert_eq!(actual["type"], "function");
+            assert_eq!(actual["name"], expected.name);
+            assert_eq!(actual["description"], expected.description);
+            assert_eq!(actual["parameters"], expected.schema);
+            validate_schema(&actual["parameters"]);
+            // Explicit non-strict JSON Schema permits optional object properties.
+            assert_eq!(actual["strict"], false);
+            assert_eq!(actual["parameters"]["type"], "object");
+            assert_eq!(actual["parameters"]["additionalProperties"], false);
+            let properties = actual["parameters"]["properties"].as_object().unwrap();
+            if let Some(required) = actual["parameters"]["required"].as_array() {
+                assert!(required
+                    .iter()
+                    .all(|key| properties.contains_key(key.as_str().unwrap())));
+            }
+        }
+        assert!(body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "user"
+                && message["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|part| part["type"] == "input_text"
+                        && part["text"].as_str().unwrap().contains("مرحبا"))));
+    }
+}
+
+#[tokio::test]
+async fn chatgpt_diagnostics_survive_the_real_reply_without_retry_tools_or_claimed_cost() {
+    use zephium_core::work::model::{
+        ChatGptFailureIssue as Issue, ChatGptFailureStage as Stage, ChatGptModelFault,
+    };
+    let cases = [
+        (Stage::Request, None, Issue::InvalidRequest),
+        (Stage::Credential, None, Issue::SignedOut),
+        (Stage::Credential, None, Issue::Cancelled),
+        (Stage::Send, None, Issue::Cancelled),
+        (Stage::Send, None, Issue::Unavailable),
+        (Stage::Send, None, Issue::Timeout),
+        (Stage::Http, Some(401), Issue::SignedOut),
+        (Stage::Http, Some(403), Issue::NotEligible),
+        (Stage::Http, Some(429), Issue::UsageLimit),
+        (Stage::Http, Some(503), Issue::Unavailable),
+        (Stage::Http, Some(400), Issue::Unsupported),
+        (Stage::Stream, Some(200), Issue::Timeout),
+        (Stage::Stream, Some(200), Issue::Protocol),
+        (Stage::Stream, Some(200), Issue::Incomplete),
+        (Stage::Complete, Some(200), Issue::UsageUnavailable),
+    ];
+    for (stage, status, issue) in cases {
+        let fault = ChatGptModelFault::Diagnostic {
+            stage,
+            status,
+            issue,
+            field: None,
+        };
+        let h = harness_entry(
+            vec![
+                Turn {
+                    error: Some(WorkModelError::ChatGpt { fault }),
+                    ..Turn::default()
+                },
+                say("must not retry"),
+            ],
+            protected_entries().remove(0),
+        );
+        h.ask("Hi", false).await.unwrap();
+        h.settle().await;
+        let PageAssistMessageV1::Reply {
+            state,
+            fault: projected,
+            cost,
+            ..
+        } = h.reply().await
+        else {
+            panic!()
+        };
+        assert_eq!(state, PageAssistReplyStateV1::Failed);
+        assert_eq!(projected, Some(PageAssistFaultV1::ChatGpt { fault }));
+        assert!(cost.is_none());
         assert_eq!(h.client.requests.lock().unwrap().len(), 1);
         assert_eq!(h.client.turns.lock().unwrap().len(), 1);
         assert!(h.work.0.lock().unwrap().is_empty());
@@ -1574,4 +1807,340 @@ async fn protected_source_completed_reply_has_unknown_external_cost_not_free_or_
             Some(PageAssistCostV1::Byok { usd: None, .. })
         ));
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn chatgpt_outer_page_timeout_preserves_unknown_outcome_without_retry() {
+    use zephium_core::work::model::{ChatGptFailureIssue, ChatGptFailureStage, ChatGptModelFault};
+    let h = harness_entry(
+        vec![
+            Turn {
+                hang: true,
+                ..Turn::default()
+            },
+            say("must not retry"),
+        ],
+        protected_entries().remove(0),
+    );
+    h.ask("Hi", false).await.unwrap();
+    while h.requests().is_empty() {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(91)).await;
+    h.settle().await;
+    let PageAssistMessageV1::Reply {
+        state, fault, cost, ..
+    } = h.reply().await
+    else {
+        panic!()
+    };
+    let expected = ChatGptModelFault::Diagnostic {
+        stage: ChatGptFailureStage::Send,
+        status: None,
+        issue: ChatGptFailureIssue::Timeout,
+        field: None,
+    };
+    assert_eq!(state, PageAssistReplyStateV1::Failed);
+    assert_eq!(fault, Some(PageAssistFaultV1::ChatGpt { fault: expected }));
+    assert!(expected.unknown_outcome());
+    assert!(cost.is_none());
+    assert!(h.client.dropped.load(Ordering::Acquire));
+    assert_eq!(h.requests().len(), 1);
+    assert_eq!(h.client.turns.lock().unwrap().len(), 1);
+    assert!(h.work.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn completed_chatgpt_plain_text_without_usage_is_not_an_inference_failure() {
+    for usage in [None, Some(Value::Null)] {
+        for with_delta in [false, true] {
+            let mut completed = json!({"status":"completed", "output":[{
+                "type":"message", "role":"assistant", "content":[{
+                    "type":"output_text", "text":"مرحبا من الاختبار", "annotations":[]
+                }]
+            }]});
+            if let Some(value) = usage.clone() {
+                completed["usage"] = value;
+            }
+            let mut events = Vec::new();
+            if with_delta {
+                events
+                    .push(json!({"type":"response.output_text.delta", "delta":"مرحبا من الاختبار"}));
+            }
+            events.push(json!({"type":"response.completed", "response": completed}));
+            let response = events
+                .into_iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>()
+                .into_bytes();
+            let h = harness_entry_effort(
+                vec![
+                    Turn {
+                        wire_response: Some(response),
+                        ..Turn::default()
+                    },
+                    say("must not retry"),
+                ],
+                zephium_chatgpt::inference::Model {
+                    slug: "gpt-6.1-sol".into(),
+                    display_name: "GPT-6.1 Sol".into(),
+                }
+                .entry(),
+                WorkModelReasoning::High,
+            );
+            h.ask("مرحبا", false).await.unwrap();
+            h.settle().await;
+            let PageAssistMessageV1::Reply {
+                state, fault, cost, ..
+            } = h.reply().await
+            else {
+                panic!()
+            };
+            assert_eq!(state, PageAssistReplyStateV1::Done);
+            assert_eq!(fault, None);
+            assert_eq!(text_of(&h.blocks().await), "مرحبا من الاختبار");
+            assert!(
+                cost.is_none(),
+                "missing usage is not a zero-token or priced outcome"
+            );
+            let notes = h.notes.0.lock().unwrap();
+            assert!(notes.iter().any(|line| line.contains("usage=unavailable")));
+            assert!(!notes
+                .iter()
+                .any(|line| line.contains(" call ") && line.contains(" in=")));
+            assert_eq!(h.requests().len(), 1);
+            assert_eq!(h.client.turns.lock().unwrap().len(), 1);
+            assert!(h.work.0.lock().unwrap().is_empty());
+        }
+    }
+}
+
+fn chatgpt_wire_turn(output: Value, usage: Option<Value>) -> Turn {
+    let mut response = json!({"status":"completed", "output":output});
+    if let Some(usage) = usage {
+        response["usage"] = usage;
+    }
+    Turn {
+        wire_response: Some(
+            format!(
+                "data: {}\n\n",
+                json!({"type":"response.completed", "response":response})
+            )
+            .into_bytes(),
+        ),
+        ..Turn::default()
+    }
+}
+
+fn chatgpt_wire_tool(id: &str, name: &str, arguments: Value) -> Value {
+    json!({"type":"function_call", "call_id":id, "namespace":"zephium",
+        "name":name, "arguments":arguments.to_string()})
+}
+
+fn chatgpt_wire_text(text: &str) -> Value {
+    json!([{"type":"message", "role":"assistant", "content":[{
+        "type":"output_text", "text":text, "annotations":[]
+    }]}])
+}
+
+fn chatgpt_page_entry() -> WorkModelEntry {
+    zephium_chatgpt::inference::Model {
+        slug: "gpt-6.1-sol".into(),
+        display_name: "GPT-6.1 Sol".into(),
+    }
+    .entry()
+}
+
+#[tokio::test]
+async fn unknown_chatgpt_usage_preserves_the_original_page_tool_round_trip() {
+    for first_usage in [None, Some(Value::Null)] {
+        for final_usage in [
+            None,
+            Some(Value::Null),
+            Some(json!({"input_tokens":100,"output_tokens":10})),
+        ] {
+            let h = harness_entry(
+                vec![
+                    chatgpt_wire_turn(
+                        json!([
+                            chatgpt_wire_tool("list-1", "list_tabs", json!({})),
+                            chatgpt_wire_tool("read-1", "read_page", json!({"tab":"t2"}))
+                        ]),
+                        first_usage.clone(),
+                    ),
+                    chatgpt_wire_turn(
+                        chatgpt_wire_text("The guide says brew install kite."),
+                        final_usage,
+                    ),
+                    say("must not call again"),
+                ],
+                chatgpt_page_entry(),
+            );
+            h.ask("Read the guide in my other tab", false)
+                .await
+                .unwrap();
+            h.settle().await;
+            let PageAssistMessageV1::Reply {
+                state, fault, cost, ..
+            } = h.reply().await
+            else {
+                panic!()
+            };
+            assert_eq!(state, PageAssistReplyStateV1::Done);
+            assert_eq!(fault, None);
+            assert!(
+                cost.is_none(),
+                "one unknown call makes aggregate usage unknown"
+            );
+            assert_eq!(
+                text_of(&h.blocks().await),
+                "The guide says brew install kite."
+            );
+            assert_eq!(
+                h.page.lock().read_tabs,
+                vec![TAB.to_owned(), "tab-2".to_owned()],
+                "the current-page context and original second-tab read path must run"
+            );
+            assert!(h.page.lock().acted.is_empty());
+            assert!(h.work.0.lock().unwrap().is_empty());
+            assert_eq!(h.requests().len(), 2);
+            assert_eq!(h.client.turns.lock().unwrap().len(), 1);
+            let encoded = h.client.encoded.lock().unwrap();
+            assert_eq!(encoded.len(), 2);
+            let body: Value = serde_json::from_slice(&encoded[1]).unwrap();
+            let input = body["input"].as_array().unwrap();
+            assert!(input.iter().any(|item| item["type"] == "function_call"
+                && item["call_id"] == "read-1"
+                && item["namespace"] == "zephium"));
+            let results: Vec<_> = input
+                .iter()
+                .filter(|item| item["type"] == "function_call_output")
+                .collect();
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[1]["call_id"], "read-1");
+            assert!(results[1]["output"]
+                .as_str()
+                .unwrap()
+                .contains("Install with brew install kite."));
+            let notes = h.notes.0.lock().unwrap();
+            assert!(notes
+                .iter()
+                .any(|note| note.contains("tool name=read_page ok=true")));
+            assert!(notes.iter().any(|note| note.contains("usage=unavailable")));
+        }
+    }
+}
+
+#[tokio::test]
+async fn unknown_chatgpt_usage_does_not_bypass_page_read_authority() {
+    let h = harness_entry(
+        vec![
+            chatgpt_wire_turn(
+                json!([
+                    chatgpt_wire_tool("list-1", "list_tabs", json!({})),
+                    chatgpt_wire_tool("read-1", "read_page", json!({"tab":"t2"}))
+                ]),
+                None,
+            ),
+            chatgpt_wire_turn(chatgpt_wire_text("That sensitive tab was not read."), None),
+        ],
+        chatgpt_page_entry(),
+    );
+    h.page.lock().facts.get_mut("tab-2").unwrap().url = Some("https://chase.com/accounts".into());
+    h.ask("Read my other tab", false).await.unwrap();
+    h.settle().await;
+    assert_eq!(h.state().await, PageAssistReplyStateV1::Done);
+    assert_eq!(h.page.lock().read_tabs, vec![TAB.to_owned()]);
+    let requests = h.requests();
+    let results = requests[1]
+        .messages
+        .iter()
+        .find_map(|message| match message {
+            WorkModelMessage::ToolResults(results) => Some(results),
+            _ => None,
+        })
+        .unwrap();
+    assert!(results[1].is_error && results[1].content.contains("sensitive"));
+    assert_eq!(requests.len(), 2);
+}
+
+#[tokio::test]
+async fn unknown_chatgpt_usage_keeps_page_call_and_tool_caps() {
+    let calls: Vec<_> = (0..41)
+        .map(|index| chatgpt_wire_tool(&format!("list-{index}"), "list_tabs", json!({})))
+        .collect();
+    let mut turns = vec![chatgpt_wire_turn(json!(calls), None)];
+    turns.extend((0..14).map(|index| {
+        chatgpt_wire_turn(
+            json!([chatgpt_wire_tool(
+                &format!("extra-{index}"),
+                "list_tabs",
+                json!({})
+            )]),
+            None,
+        )
+    }));
+    turns.push(chatgpt_wire_turn(
+        chatgpt_wire_text("I reached the page step limit."),
+        None,
+    ));
+    turns.push(say("must not call again"));
+    let h = harness_entry(turns, chatgpt_page_entry());
+    h.ask("List my tabs repeatedly", false).await.unwrap();
+    h.settle().await;
+    assert_eq!(h.state().await, PageAssistReplyStateV1::Done);
+    let requests = h.requests();
+    assert_eq!(requests.len(), 16);
+    assert!(h.request_text(15).contains("Stop using tools now."));
+    let results = requests[1]
+        .messages
+        .iter()
+        .find_map(|message| match message {
+            WorkModelMessage::ToolResults(results) => Some(results),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(results.len(), 41);
+    assert!(results[..40].iter().all(|result| !result.is_error));
+    assert!(results[40].is_error && results[40].content.contains("Too many tool calls"));
+    assert_eq!(h.client.turns.lock().unwrap().len(), 1);
+    assert!(matches!(
+        h.reply().await,
+        PageAssistMessageV1::Reply { cost: None, .. }
+    ));
+}
+
+#[tokio::test]
+async fn unknown_chatgpt_usage_keeps_cancellation_of_the_following_call() {
+    let h = harness_entry(
+        vec![
+            chatgpt_wire_turn(
+                json!([chatgpt_wire_tool("list-1", "list_tabs", json!({}))]),
+                None,
+            ),
+            Turn {
+                hang: true,
+                ..Turn::default()
+            },
+            say("must not call again"),
+        ],
+        chatgpt_page_entry(),
+    );
+    h.ask("List tabs, then wait", false).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while h.requests().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(h.service.stop(SPACE));
+    h.settle().await;
+    assert_eq!(h.state().await, PageAssistReplyStateV1::Cancelled);
+    assert!(matches!(
+        h.reply().await,
+        PageAssistMessageV1::Reply { cost: None, .. }
+    ));
+    assert_eq!(h.requests().len(), 2);
+    assert_eq!(h.client.turns.lock().unwrap().len(), 1);
 }

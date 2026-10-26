@@ -149,9 +149,26 @@ export function models(options: {
     ? [entry("cloud", "claude-sonnet-5-5", "Claude Sonnet 5.5", true, ["lead", "page"])]
     : [];
   const efforts = [...cloud, ...builtin]
-    .map((item) => ({ id: item.id, levels: levels(item) }))
+    .map((item) => {
+      const supported = levels(item);
+      const requested = options.effort;
+      const effort = requested
+        ? supported.reduce<WorkModelReasoning | null>(
+            (nearest, candidate) =>
+              nearest === null ||
+              Math.abs(ALL.indexOf(candidate) - ALL.indexOf(requested)) <=
+                Math.abs(ALL.indexOf(nearest) - ALL.indexOf(requested))
+                ? candidate
+                : nearest,
+            null,
+          )
+        : supported.includes("medium")
+          ? ("medium" as const)
+          : (supported.find((level) => level !== "low") ?? null);
+      return { id: item.id, levels: supported, effort };
+    })
     .filter((row) => row.levels.length);
-  const lead = efforts.find((row) => row.id === options.lead)?.levels;
+  const lead = efforts.find((row) => row.id === options.lead);
   return {
     version: 1,
     profile: PROFILE,
@@ -184,9 +201,6 @@ export function models(options: {
     },
     fault: null,
     efforts,
-    effort: lead?.length
-      ? (options.effort ??
-        (lead.includes("medium") ? "medium" : (lead.find((level) => level !== "low") ?? null)))
-      : null,
+    effort: lead?.effort ?? null,
   };
 }

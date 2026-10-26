@@ -244,6 +244,7 @@ impl<'a> ModelDecisionCall<'a> {
                 tokio::time::Instant::from_std(deadline),
                 self.model.client().call(request, &events),
             ) => match outcome {
+                Ok(Ok(outcome)) if !outcome.usage.is_reported() => Err(DecisionCallFailure::Unavailable),
                 Ok(Ok(outcome)) => Ok(outcome),
                 Ok(Err(WorkModelError::RateLimited { .. })) => Err(DecisionCallFailure::RateLimited),
                 Ok(Err(WorkModelError::Overloaded)) => Err(DecisionCallFailure::Overloaded),

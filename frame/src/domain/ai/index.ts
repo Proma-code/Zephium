@@ -4,6 +4,7 @@ export { favourites, toggleFavourite } from "./favourites.svelte";
 export {
   dollars,
   effortLevels,
+  modelEffort,
   entryOf,
   keyState,
   hasChatGptModels,

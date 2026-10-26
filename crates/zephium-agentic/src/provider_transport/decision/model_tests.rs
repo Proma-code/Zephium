@@ -196,3 +196,31 @@ async fn another_tool_or_no_answer_is_invalid_but_charged_exactly() {
         assert_eq!(output.receipt.input_tokens(), 700);
     }
 }
+
+#[tokio::test]
+async fn unavailable_usage_retains_reservation_without_decision_or_numeric_diagnostic() {
+    let (output, policy, _) = decide(|projection| {
+        let mut response = reply(
+            vec![WorkModelPart::ToolCall(WorkModelToolCall {
+                id: "call_1".into(),
+                name: DECISION_TOOL.into(),
+                arguments: fixture_answers(projection.request()),
+            })],
+            900,
+        );
+        response.usage = WorkModelUsage::unavailable();
+        response
+    })
+    .await;
+    assert_eq!(
+        output.call.response.err(),
+        Some(DecisionCallFailure::Unavailable)
+    );
+    assert!(!output.call.exact_usage);
+    assert_eq!(output.call.diagnostic.input_tokens, None);
+    assert_eq!(
+        output.receipt.usage_accounting(),
+        AgentModelUsageAccounting::ReservationCeiling
+    );
+    assert_eq!(policy.pending_model_calls(), 0);
+}

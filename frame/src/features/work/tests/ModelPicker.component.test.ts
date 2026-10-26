@@ -807,7 +807,7 @@ test("disconnecting ChatGPT keeps the API catalog and does not select a billing 
   expect(native.choose).not.toHaveBeenCalled();
 });
 
-test("subscription quota stays unknown and the official usage link cannot masquerade as a model choice", async () => {
+test("subscription quota stays unknown with no external button masquerading as an in-app check", async () => {
   native.ready.mockImplementation(ready(true));
   native.read.mockResolvedValue(bothConnections());
   native.choose.mockClear();
@@ -815,14 +815,9 @@ test("subscription quota stays unknown and the official usage link cannot masque
   const screen = await render(ModelPicker, { profile: PROFILE });
   await screen.getByRole("button", { name: /Model: GPT-6 Luna/u }).click();
   await page.getByRole("button", { name: "ChatGPT", exact: true }).click();
-  await expect.element(page.getByText("Quota not provided by this connection.")).toBeVisible();
+  await expect.element(page.getByText("Quota unavailable")).toBeVisible();
   expect(native.openUrl).not.toHaveBeenCalled();
-  await page.getByRole("button", { name: "ChatGPT usage" }).click();
-  await expect.element(page.getByRole("alert")).toHaveTextContent("Could not confirm");
-  expect(native.openUrl).toHaveBeenCalledExactlyOnceWith(
-    "https://chatgpt.com/settings/usage",
-    true,
-  );
+  await expect.element(page.getByRole("button", { name: /usage|quota/iu })).not.toBeInTheDocument();
   expect(native.choose).not.toHaveBeenCalled();
   expect(chatgpt.signIn).not.toHaveBeenCalled();
 });
@@ -876,7 +871,7 @@ test("connected account controls remain compact enough to show model choices bes
   await expect.element(page.getByRole("alert")).toHaveTextContent("usage limit");
   await expect.element(page.getByRole("button", { name: "Refresh models" })).toBeVisible();
   await expect.element(page.getByRole("button", { name: "Disconnect ChatGPT" })).toBeVisible();
-  await expect.element(page.getByRole("button", { name: "ChatGPT usage" })).toBeVisible();
+  await expect.element(page.getByRole("button", { name: /usage|quota/iu })).not.toBeInTheDocument();
   const list = page.getByRole("listbox").element() as HTMLElement;
   await expect.poll(() => list.getBoundingClientRect().height).toBeGreaterThanOrEqual(102);
   expect(list.querySelectorAll('[role="option"]')).toHaveLength(3);
@@ -1153,3 +1148,115 @@ test.each([
     await expect.element(card).toHaveAccessibleName("Example");
   },
 );
+
+test.each([true, false])(
+  "Page-only ChatGPT effort stays available with signed-out Zephium (service available: %s)",
+  async (available) => {
+    await page.viewport(1000, 800);
+    const id = "chatgpt/gpt-6.1-sol";
+    const state = models({});
+    state.entries.push(
+      entry("open_ai", "gpt-6.1-sol", "GPT-6.1 Sol", false, ["page"], {
+        id,
+        price: null,
+      }),
+    );
+    state.effective.page = id;
+    state.chosen.page = id;
+    state.efforts.push({ id, levels: ["low", "medium", "high", "xhigh", "max"], effort: "medium" });
+    expect(state.effort).toBeNull();
+    expect(state.effective.lead).toBeNull();
+    native.read.mockResolvedValue(state);
+    native.account.mockResolvedValue({
+      account: accountFixture({ available, signed_in: false }),
+      fault: null,
+      retry_after: null,
+    });
+    chatgpt.read.mockResolvedValue(chatgptView(PROFILE, { state: "connected", models: 1 }));
+    native.effort.mockImplementation(async (_profile: string, effort: WorkModelReasoning) => ({
+      ...state,
+      efforts: state.efforts.map((row) => (row.id === id ? { ...row, effort } : row)),
+      effort: null,
+    }));
+    const commandsBefore = native.command.mock.calls.length;
+    const choicesBefore = native.choose.mock.calls.length;
+    const screen = await render(ModelPicker, { profile: PROFILE, role: "page" });
+    await screen
+      .getByRole("button", { name: "Model: GPT-6.1 Sol, Medium effort", exact: true })
+      .click();
+    await screen.getByRole("button", { name: "Effort: Medium", exact: true }).click();
+    const slider = screen.getByRole("slider", { name: "Effort", exact: true });
+    await expect.element(slider).toHaveAttribute("aria-valuemax", "4");
+    await userEvent.keyboard("{End}");
+    await expect.element(slider).toHaveAttribute("aria-valuetext", "Max");
+    expect(native.effort).toHaveBeenLastCalledWith(PROFILE, "max");
+    await expect
+      .element(screen.getByRole("button", { name: "Model: GPT-6.1 Sol, Max effort", exact: true }))
+      .toBeVisible();
+    expect(native.command).toHaveBeenCalledTimes(commandsBefore);
+    expect(native.choose).toHaveBeenCalledTimes(choicesBefore);
+  },
+);
+
+test("profile replacement discards queued effort without applying it to the new connection", async () => {
+  const nextProfile = "00000000000000000000000002";
+  const id = "openai/gpt-6-luna";
+  const previous = view(id);
+  const next = { ...view(id), profile: nextProfile };
+  let finish!: (value: typeof previous) => void;
+  native.effort.mockReset();
+  native.effort
+    .mockReturnValueOnce(
+      new Promise<typeof previous>((resolve) => {
+        finish = resolve;
+      }),
+    )
+    .mockImplementation(async (profile: string, effort: WorkModelReasoning) => ({
+      ...next,
+      profile,
+      effort,
+      efforts: next.efforts.map((row) => (row.id === id ? { ...row, effort } : row)),
+    }));
+  native.read.mockImplementation(async (profile: string) =>
+    profile === PROFILE ? previous : next,
+  );
+  native.account.mockResolvedValue({
+    account: accountFixture({ signed_in: false }),
+    fault: null,
+    retry_after: null,
+  });
+  const screen = await render(ModelPicker, { profile: PROFILE });
+  await screen
+    .getByRole("button", { name: "Model: GPT-6 Luna, Medium effort", exact: true })
+    .click();
+  await screen.getByRole("button", { name: "Effort: Medium", exact: true }).click();
+  await userEvent.keyboard("{ArrowRight}");
+  await expect.poll(() => native.effort.mock.calls.length).toBe(1);
+  await userEvent.keyboard("{ArrowRight}");
+  await expect
+    .element(screen.getByRole("slider", { name: "Effort", exact: true }))
+    .toHaveAttribute("aria-valuetext", "Extra high");
+  await screen.rerender({ profile: nextProfile });
+  await expect
+    .element(screen.getByRole("button", { name: "Model: GPT-6 Luna, Medium effort", exact: true }))
+    .toBeVisible();
+  finish({
+    ...previous,
+    effort: "high",
+    efforts: previous.efforts.map((row) => (row.id === id ? { ...row, effort: "high" } : row)),
+  });
+  await expect
+    .element(screen.getByRole("button", { name: "Model: GPT-6 Luna, Medium effort", exact: true }))
+    .toBeVisible();
+  expect(native.effort).toHaveBeenCalledExactlyOnceWith(PROFILE, "high");
+  const slider = screen.getByRole("slider", { name: "Effort", exact: true });
+  if (!slider.query())
+    await screen.getByRole("button", { name: "Effort: Medium", exact: true }).click();
+  (slider.element() as HTMLElement).focus();
+  await userEvent.keyboard("{End}");
+  await expect.poll(() => native.effort.mock.calls.length).toBe(2);
+  expect(native.effort).toHaveBeenLastCalledWith(nextProfile, "max");
+  await expect
+    .element(screen.getByRole("button", { name: "Model: GPT-6 Luna, Max effort", exact: true }))
+    .toBeVisible();
+});

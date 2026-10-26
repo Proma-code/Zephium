@@ -1,6 +1,7 @@
 import "$styles/global.css";
 import { beforeEach, expect, test, vi } from "vitest";
 import { render } from "vitest-browser-svelte";
+import { userEvent } from "vitest/browser";
 import type { ChatGptViewV1 } from "$shared/ipc/chatgpt-bindings";
 import { chatgptView } from "$shared/testing/chatgpt";
 import ChatGptAccount from "../components/ChatGptAccount.svelte";
@@ -71,9 +72,7 @@ test("connected account models can refresh without changing model selection", as
   native.read.mockResolvedValue(connected());
   const screen = await render(ChatGptAccount, { profile });
   await expect.element(screen.getByText("Connected as reader@example.com")).toBeVisible();
-  await expect
-    .element(screen.getByText("2 account models available.", { exact: false }))
-    .toBeVisible();
+  await expect.element(screen.getByText("2 models available.", { exact: false })).toBeVisible();
   await screen.getByRole("button", { name: "Refresh models" }).click();
   expect(native.models).toHaveBeenCalledExactlyOnceWith(profile);
   expect(native.signIn).not.toHaveBeenCalled();
@@ -122,4 +121,29 @@ test("closing a pending owned sign-in cancels only that profile and ignores late
     .element(next.getByText("reader@example.com", { exact: false }))
     .not.toBeInTheDocument();
   expect(native.cancel).toHaveBeenCalledExactlyOnceWith(profile, native.signIn.mock.calls[0]![1]);
+});
+
+test("connected settings keep secondary details collapsed and never offer an external quota check", async () => {
+  native.read.mockResolvedValue(connected());
+  const screen = await render(ChatGptAccount, { profile });
+  await expect.element(screen.getByText("2 models available.")).toBeVisible();
+  await expect.element(screen.getByText("Quota unavailable", { exact: true })).toBeVisible();
+  await expect
+    .element(screen.getByRole("button", { name: /usage|quota/iu }))
+    .not.toBeInTheDocument();
+  const explanation = screen.getByText(
+    "Choose a ChatGPT model for each role. API keys and billing stay separate.",
+  );
+  await expect.element(explanation).not.toBeVisible();
+  const summary = screen.getByText("Connection details", { exact: true });
+  (summary.element() as HTMLElement).focus();
+  await userEvent.keyboard("{Enter}");
+  await expect.element(explanation).toBeVisible();
+  await expect
+    .element(screen.getByText("OpenAI does not provide remaining quota through this connection."))
+    .toBeVisible();
+  await screen.getByText("Connection details", { exact: true }).click();
+  await expect.element(explanation).not.toBeVisible();
+  expect(native.signIn).not.toHaveBeenCalled();
+  expect(native.models).not.toHaveBeenCalled();
 });

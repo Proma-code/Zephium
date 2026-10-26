@@ -531,6 +531,9 @@ impl ModelClientReplyContract {
     ) -> Result<ModelClientReply, AgentProviderProtocolError> {
         let budget = config.stream_budget();
         let reported = outcome.usage;
+        if !reported.is_reported() {
+            return Err(AgentProviderProtocolError::Usage);
+        }
         let cached = reported.cached_input_tokens.min(reported.input_tokens);
         let usage = AgentProviderUsage::try_new(
             reported.input_tokens,

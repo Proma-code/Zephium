@@ -44,6 +44,8 @@ zephium-agent-runtime = { workspace = true, optional = true }
 zephium-core = { workspace = true, optional = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+zephium-chatgpt = { workspace = true, features = ["test-fixtures"] }
 serde_json.workspace = true
 zephium-core.workspace = true
 zephium-ipc.workspace = true

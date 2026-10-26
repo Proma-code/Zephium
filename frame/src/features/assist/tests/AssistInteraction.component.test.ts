@@ -2,7 +2,11 @@ import { beforeEach, expect, test, vi } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-svelte";
 import "$styles/global.css";
-import type { PageAssistPickResponseV1, PageAssistStatusV1 } from "$shared/ipc/bindings";
+import type {
+  PageAssistAskResponseV1,
+  PageAssistPickResponseV1,
+  PageAssistStatusV1,
+} from "$shared/ipc/bindings";
 import { PROFILE } from "$shared/testing/work-models";
 import { emitNativeEvent } from "$shared/testing/native-events";
 import PanelStage from "./PanelStage.svelte";
@@ -24,7 +28,7 @@ import {
 const native = vi.hoisted(() => ({
   status: null as PageAssistStatusV1 | null,
   statusCalls: 0,
-  ask: vi.fn(async () => ({ reply: 2, fault: null })),
+  ask: vi.fn(async (): Promise<PageAssistAskResponseV1> => ({ reply: 2, fault: null })),
   stop: vi.fn(async () => true),
   focus: vi.fn(async () => true),
   decide: vi.fn(async () => true),
@@ -359,4 +363,31 @@ test("a gap in the events reads the conversation again; closing the panel lets t
   await expect.poll(() => native.statusCalls).toBe(before + 1);
   screen.unmount();
   expect(native.close).toHaveBeenCalledWith(SPACE);
+});
+
+test("an immediate ChatGPT refusal preserves the draft and exposes its finite diagnostic", async () => {
+  native.ask.mockResolvedValueOnce({
+    reply: null,
+    fault: {
+      reason: "chat_gpt",
+      fault: {
+        diagnostic: { field: null, stage: "credential", status: null, issue: "signed_out" },
+      },
+    },
+  });
+  const { screen, field } = await open(status());
+  await field.fill("Keep this message");
+  await userEvent.keyboard("{Enter}");
+  await expect
+    .element(screen.getByText("CHATGPT/CREDENTIAL/-/SIGNED_OUT", { exact: true }))
+    .toBeVisible();
+  await expect.element(screen.getByText("Sign in to ChatGPT again in AI settings.")).toBeVisible();
+  await expect
+    .element(screen.getByRole("button", { name: "Copy error code", exact: true }))
+    .toBeEnabled();
+  await expect
+    .element(screen.getByRole("button", { name: "Try again", exact: true }))
+    .not.toBeInTheDocument();
+  await expect.element(field).toHaveValue("Keep this message");
+  expect(native.ask).toHaveBeenCalledTimes(1);
 });

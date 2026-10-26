@@ -237,6 +237,7 @@ fn script(
             output_tokens: 500,
             reasoning_tokens: 0,
             cost_micros: None,
+            ..WorkModelUsage::default()
         },
     })
 }

@@ -62,6 +62,26 @@ impl Kind {
             },
         }
     }
+    fn usage_unavailable(self) -> WorkModelError {
+        match self {
+            Self::ChatGpt => WorkModelError::ChatGpt {
+                fault: ChatGptModelFault::Diagnostic {
+                    stage: ChatGptFailureStage::Complete,
+                    status: None,
+                    issue: ChatGptFailureIssue::UsageUnavailable,
+                    field: None,
+                },
+            },
+            Self::Gateway => WorkModelError::Gateway {
+                fault: GatewayModelFault::UsageUnavailable,
+                usage_unknown: true,
+            },
+            Self::Go => WorkModelError::OpenCodeGo {
+                fault: OpenCodeGoModelFault::UsageUnavailable,
+                usage_unknown: true,
+            },
+        }
+    }
     fn terminal(self, error: WorkModelError) -> WorkModelError {
         match (self, error) {
             (Self::ChatGpt, error @ WorkModelError::ChatGpt { .. })
@@ -184,6 +204,13 @@ impl WorkModelClient for GuardedClient {
             // Upstream charges already dispatched cannot be rolled back here.
             *terminal = Some(self.kind.uncertain());
             match self.inner.call(request, events).await {
+                Ok(outcome) if !outcome.usage.is_reported() => {
+                    // Work's normal plain-text path nudges another call. Stop
+                    // this source for the run before any such continuation.
+                    let error = self.kind.usage_unavailable();
+                    *terminal = Some(error);
+                    Err(error)
+                }
                 Ok(outcome) => {
                     // This is still the same exclusive owner: no other failure
                     // can be overwritten by its successful completion.

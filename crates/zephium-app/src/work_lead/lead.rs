@@ -2171,15 +2171,21 @@ pub(super) fn model_stop(error: WorkModelError) -> &'static str {
     }
 }
 
-const UNKNOWN_OUTCOME_NOTE: &str = " The request did not finish with a confirmed result. Usage is unknown; the local budget keeps a conservative reservation, not a confirmed charge.";
+const UNKNOWN_OUTCOME_NOTE: &str =
+    " Usage is unknown; the local budget keeps a conservative reservation, not a confirmed charge.";
 
 fn chatgpt_note(fault: ChatGptModelFault) -> &'static str {
-    match fault {
-        ChatGptModelFault::SignedOut => "The selected ChatGPT connection is unavailable; reconnect it in Settings → AI. Your API keys are unchanged.",
-        ChatGptModelFault::UsageLimit => "ChatGPT plan usage is limited for this app or account. Check ChatGPT Settings → Usage before trying again; the reset time is not known.",
-        ChatGptModelFault::Unavailable => "ChatGPT could not confirm account or usage availability. Your connection is kept; try again later.",
-        ChatGptModelFault::NotEligible => "ChatGPT plan usage is not permitted for this account, workspace, region or grant. Check the connection and ChatGPT settings.",
-        ChatGptModelFault::Unsupported => "The direct ChatGPT route does not support this model request or capability. Choose another supported model or change the request.",
+    match fault.issue() {
+        ChatGptFailureIssue::SignedOut => "The selected ChatGPT connection is unavailable; reconnect it in Settings → AI. Your API keys are unchanged.",
+        ChatGptFailureIssue::UsageLimit => "ChatGPT plan usage is limited for this app or account. Check ChatGPT Settings → Usage before trying again; the reset time is not known.",
+        ChatGptFailureIssue::Unavailable => "ChatGPT could not confirm account or usage availability. Your connection is kept; try again later.",
+        ChatGptFailureIssue::NotEligible => "ChatGPT plan usage is not permitted for this account, workspace, region or grant. Check the connection and ChatGPT settings.",
+        ChatGptFailureIssue::Unsupported => "The direct ChatGPT route does not support this model request or capability. Choose another supported model or change the request.",
+        ChatGptFailureIssue::InvalidRequest => "Zephium could not prepare this ChatGPT request. Try a supported model or change the request.",
+        ChatGptFailureIssue::Timeout => "The ChatGPT request timed out before a confirmed result. The request was not automatically retried.",
+        ChatGptFailureIssue::Protocol | ChatGptFailureIssue::Incomplete => "The ChatGPT response did not finish with a valid confirmed result. The request was not automatically retried.",
+        ChatGptFailureIssue::Cancelled => "The ChatGPT request was cancelled. It was not automatically retried.",
+        ChatGptFailureIssue::UsageUnavailable => "ChatGPT returned a completed response, but token usage is unknown. Execution paused without running tools or sending another request.",
     }
 }
 
@@ -2431,9 +2437,25 @@ mod compact_tests {
             UNKNOWN_OUTCOME_NOTE
         );
         assert!(note.contains("ChatGPT"));
-        assert!(note.contains("did not finish with a confirmed result"));
+        assert!(note.contains("Usage is unknown"));
         assert!(note.contains("not a confirmed charge"));
         assert!(!note.contains("partial response"));
+    }
+
+    #[test]
+    fn completed_unknown_usage_note_preserves_completion_and_accounting_uncertainty() {
+        let fault = ChatGptModelFault::Diagnostic {
+            stage: ChatGptFailureStage::Complete,
+            status: None,
+            issue: ChatGptFailureIssue::UsageUnavailable,
+            field: None,
+        };
+        let note = format!("{}{}", chatgpt_note(fault), UNKNOWN_OUTCOME_NOTE);
+        assert!(note.contains("returned a completed response"));
+        assert!(note.contains("Execution paused"));
+        assert!(note.contains("not a confirmed charge"));
+        assert!(!note.contains("did not finish"));
+        assert!(!note.contains("invalid"));
     }
 
     #[test]

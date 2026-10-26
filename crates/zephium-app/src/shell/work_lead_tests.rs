@@ -268,6 +268,7 @@ impl WorkModelClient for Script {
                     output_tokens: 200,
                     reasoning_tokens: 0,
                     cost_micros: None,
+                    ..WorkModelUsage::default()
                 },
                 assistant,
             })
@@ -888,6 +889,7 @@ impl WorkModelClient for Honest {
                     output_tokens: 100,
                     reasoning_tokens: 0,
                     cost_micros: None,
+                    ..WorkModelUsage::default()
                 },
                 assistant,
             })
@@ -1016,6 +1018,7 @@ impl WorkModelClient for Connected {
                     output_tokens: 100,
                     reasoning_tokens: 0,
                     cost_micros: None,
+                    ..WorkModelUsage::default()
                 },
                 assistant,
             })
@@ -1250,6 +1253,7 @@ impl WorkModelClient for Drafting {
                     output_tokens: 100,
                     reasoning_tokens: 0,
                     cost_micros: None,
+                    ..WorkModelUsage::default()
                 },
                 assistant,
             })
@@ -1387,6 +1391,7 @@ impl WorkModelClient for Routing {
                     output_tokens: 100,
                     reasoning_tokens: 0,
                     cost_micros: None,
+                    ..WorkModelUsage::default()
                 },
                 assistant,
             })
@@ -1589,6 +1594,7 @@ impl WorkModelClient for Turns {
                     output_tokens: 100,
                     reasoning_tokens: 0,
                     cost_micros: None,
+                    ..WorkModelUsage::default()
                 },
                 assistant: (self.0)(turn, &results(&request)),
             })
@@ -2294,6 +2300,7 @@ impl WorkModelClient for FolderHandoffModel {
                     output_tokens: 20,
                     reasoning_tokens: 0,
                     cost_micros: Some(1),
+                    ..WorkModelUsage::default()
                 },
                 assistant,
             })
@@ -2719,6 +2726,7 @@ impl WorkModelClient for FailedSiteAdvice {
                     output_tokens: 10,
                     reasoning_tokens: 0,
                     cost_micros: None,
+                    ..WorkModelUsage::default()
                 },
             })
         })
@@ -3431,6 +3439,7 @@ impl WorkModelClient for NativeRecordFinish {
                     output_tokens: 100,
                     reasoning_tokens: 0,
                     cost_micros: None,
+                    ..WorkModelUsage::default()
                 },
                 assistant: vec![output],
             })
@@ -3638,6 +3647,7 @@ impl WorkModelClient for FailedCatalogThenDetail {
                     output_tokens: 100,
                     reasoning_tokens: 0,
                     cost_micros: None,
+                    ..WorkModelUsage::default()
                 },
             })
         })

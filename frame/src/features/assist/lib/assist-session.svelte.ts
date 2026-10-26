@@ -60,6 +60,7 @@ export class AssistSession {
   past = $state.raw<PageAssistPastV1[] | null>(null);
 
   private generation = 0;
+  private sendGeneration = 0;
   private queue: PageAssistChangedV1[] | null = null;
   private stopListening: (() => void) | null = null;
   private active = false;
@@ -111,6 +112,7 @@ export class AssistSession {
   /** The Space and the tab in front. A new Space starts from its own snapshot. */
   follow(space: string | null, tab: string | null) {
     if (space !== this.space) {
+      this.invalidateSend();
       if (this.space) void quietly(commands.pageAssistClose(this.space), false);
       this.generation++;
       this.space = space;
@@ -131,6 +133,7 @@ export class AssistSession {
       return;
     }
     if (tab === this.tab) return;
+    this.invalidateSend();
     this.tab = tab;
     this.pageOff = false;
     this.selectionOn = false;
@@ -171,6 +174,7 @@ export class AssistSession {
     this.unavailable = !status.conversation.id && status.availability === "unavailable";
     this.status = status;
     if (status.conversation.id !== this.conversation.id) {
+      this.invalidateSend();
       this.arrivals = {};
       this.picking = null;
     }
@@ -247,7 +251,15 @@ export class AssistSession {
   async ask(text: string, suggestion: PageAssistSuggestionV1 | null = null): Promise<boolean> {
     const words = text.trim().slice(0, MESSAGE_LIMIT);
     const space = this.space;
-    if (!space || (!words && !suggestion) || this.busy || !this.talks || this.sending) return false;
+    if (
+      !this.active ||
+      !space ||
+      (!words && !suggestion) ||
+      this.busy ||
+      !this.talks ||
+      this.sending
+    )
+      return false;
     return this.send(space, words, suggestion, this.attachments(), true);
   }
 
@@ -255,7 +267,7 @@ export class AssistSession {
   async retry(reply: number): Promise<boolean> {
     const space = this.space;
     const asked = askedBy(this.conversation, reply);
-    if (!space || !asked || this.busy || this.sending) return false;
+    if (!this.active || !space || !asked || this.busy || this.sending) return false;
     const attachments = asked.attachments.flatMap<PageAssistAttachV1>((attachment) =>
       attachment.kind === "page"
         ? [{ kind: "page", tab: attachment.tab }]
@@ -266,6 +278,11 @@ export class AssistSession {
     return this.send(space, asked.text, asked.suggestion, attachments, false);
   }
 
+  private invalidateSend() {
+    this.sendGeneration++;
+    this.sending = false;
+  }
+
   private async send(
     space: string,
     text: string,
@@ -273,16 +290,24 @@ export class AssistSession {
     attachments: PageAssistAttachV1[],
     composed: boolean,
   ): Promise<boolean> {
+    const generation = ++this.sendGeneration;
+    const conversation = this.conversation.id;
+    const owns = () =>
+      this.active &&
+      generation === this.sendGeneration &&
+      this.space === space &&
+      this.conversation.id === conversation;
     this.sending = true;
     this.notice = null;
     try {
       const response = await commands.pageAssistAsk({
         space,
-        conversation: this.conversation.id,
+        conversation,
         text,
         suggestion,
         attachments,
       });
+      if (!owns()) return false;
       if (response.reply === null) {
         this.notice = response.fault ?? { reason: "unavailable" };
         if (response.fault?.reason === "invalid") this.refresh();
@@ -296,10 +321,10 @@ export class AssistSession {
       }
       return true;
     } catch {
-      this.notice = { reason: "unavailable" };
+      if (owns()) this.notice = { reason: "unavailable" };
       return false;
     } finally {
-      this.sending = false;
+      if (owns()) this.sending = false;
     }
   }
 
@@ -444,6 +469,7 @@ export class AssistSession {
   }
 
   dispose() {
+    this.invalidateSend();
     this.cancelPick();
     if (this.space) void quietly(commands.pageAssistClose(this.space), false);
     this.active = false;
@@ -455,5 +481,11 @@ export class AssistSession {
     this.tab = null;
     this.conversation = EMPTY;
     this.status = null;
+    this.picks = [];
+    this.others = [];
+    this.arrivals = {};
+    this.styles = null;
+    this.past = null;
+    this.reset();
   }
 }

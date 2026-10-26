@@ -385,6 +385,7 @@ impl WorkModelClient for FetchModel {
                     output_tokens: 10,
                     reasoning_tokens: 0,
                     cost_micros: None,
+                    ..WorkModelUsage::default()
                 },
                 assistant: vec![WorkModelPart::ToolCall(WorkModelToolCall {
                     id: "page".into(),

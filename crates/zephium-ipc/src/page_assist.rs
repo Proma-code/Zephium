@@ -113,6 +113,10 @@ pub enum PageAssistFaultV1 {
         fault: WorkModelFaultV1,
         retry_after_ms: Option<u32>,
     },
+    /// The selected ChatGPT connection failed; only closed native diagnostics cross.
+    ChatGpt {
+        fault: zephium_core::work::model::ChatGptModelFault,
+    },
     Unavailable,
 }
 
@@ -694,6 +698,22 @@ mod tests {
         .unwrap();
         assert_eq!(fault["reason"], "model");
         assert_eq!(fault["fault"], "daily_limit");
+        let fault = serde_json::to_value(PageAssistFaultV1::ChatGpt {
+            fault: zephium_core::work::model::ChatGptModelFault::Diagnostic {
+                stage: zephium_core::work::model::ChatGptFailureStage::Http,
+                status: Some(401),
+                issue: zephium_core::work::model::ChatGptFailureIssue::SignedOut,
+                field: None,
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            fault,
+            serde_json::json!({
+                "reason": "chat_gpt",
+                "fault": {"diagnostic": {"stage": "http", "status": 401, "issue": "signed_out", "field": null}}
+            })
+        );
         let state =
             serde_json::to_value(PageAssistHandoffStateV1::Started { work: "w".into() }).unwrap();
         assert_eq!(state["state"], "started");

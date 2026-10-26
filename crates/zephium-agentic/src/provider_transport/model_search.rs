@@ -107,6 +107,9 @@ impl ModelNativeSearch {
 
     /// What the call cost, never above what was reserved for it.
     fn settle(&self, usage: WorkModelUsage, ceiling: WorkUsage) -> WorkUsage {
+        if !usage.is_reported() {
+            return ceiling;
+        }
         let tokens = usage
             .input_tokens
             .saturating_add(usage.output_tokens)
@@ -308,6 +311,9 @@ impl WorkPublicSearchProvider for ModelNativeSearch {
                 Ok(Err(_)) => return Err(WorkPublicSearchError::Rejected(ceiling)),
                 Ok(Ok(outcome)) => outcome,
             };
+            if !outcome.usage.is_reported() {
+                return Err(WorkPublicSearchError::Rejected(ceiling));
+            }
             let usage = self.settle(outcome.usage, ceiling);
             let collected = collected
                 .into_inner()

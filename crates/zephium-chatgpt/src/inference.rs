@@ -95,6 +95,7 @@ impl InferenceClient {
         let http = reqwest::Client::builder()
             .https_only(true)
             .no_proxy()
+            .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .timeout(CALL_TIMEOUT)
@@ -124,6 +125,12 @@ impl InferenceClient {
         parse_models(&body)
     }
 
+    /// Validate the exact bounded payload without credentials, I/O or inference.
+    /// Useful for checking a product's real tools and messages before dispatch.
+    pub fn validate_request(request: &WorkModelRequest) -> Result<(), WorkModelError> {
+        encode_request(request).map(|_| ())
+    }
+
     /// One preview-compatible Responses call. No request is automatically retried.
     /// Only a completed terminal response can return a successful outcome.
     pub async fn call(
@@ -132,27 +139,32 @@ impl InferenceClient {
         request: WorkModelRequest,
         events: &(dyn Fn(WorkModelEvent) + Send + Sync),
     ) -> Result<WorkModelOutcome, WorkModelError> {
-        let body = request_body(&request)?;
-        let encoded = serde_json::to_vec(&body).map_err(|_| WorkModelError::BadRequest)?;
-        if encoded.len() > MAX_REQUEST_BYTES {
-            return Err(WorkModelError::BadRequest);
-        }
+        let encoded = encode_request(&request)?;
+        let authorization = bearer(tokens)
+            .map_err(|error| diagnose(ChatGptFailureStage::Credential, None, error))?;
+        // These integers contain only native stages/status, never request data.
+        let stage = std::sync::atomic::AtomicU8::new(0);
+        let observed_status = std::sync::atomic::AtomicU16::new(0);
         let future = async {
             let mut response = self
                 .http
                 .post(RESPONSES)
-                .header(AUTHORIZATION, bearer(tokens)?)
+                .header(AUTHORIZATION, authorization)
                 .header(ACCEPT, "text/event-stream")
                 .header(CONTENT_TYPE, "application/json")
                 .body(encoded)
                 .send()
                 .await
-                // A lost response may have been billed. The outer Work runtime
-                // treats Protocol as unknown outcome rather than replaying it.
-                .map_err(|_| WorkModelError::Protocol)?;
+                .map_err(|error| {
+                    transport_error(ChatGptFailureStage::Send, None, error.is_timeout())
+                })?;
             let status = response.status().as_u16();
+            observed_status.store(status, std::sync::atomic::Ordering::Relaxed);
+            stage.store(1, std::sync::atomic::Ordering::Relaxed);
             if status != 200 {
-                let body = bounded_body(&mut response, MAX_CATALOG_BYTES, true).await?;
+                let body = bounded_body(&mut response, MAX_CATALOG_BYTES, true)
+                    .await
+                    .map_err(|error| diagnose(ChatGptFailureStage::Http, Some(status), error))?;
                 return Err(http_error(status, &body));
             }
             if !response
@@ -166,28 +178,138 @@ impl InferenceClient {
                         .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"))
                 })
             {
-                return Err(WorkModelError::Protocol);
+                return Err(diagnostic(
+                    ChatGptFailureStage::Stream,
+                    Some(status),
+                    ChatGptFailureIssue::Protocol,
+                ));
             }
+            stage.store(2, std::sync::atomic::Ordering::Relaxed);
             let mut decoder = StreamDecoder::new(&request);
             loop {
                 let chunk = tokio::time::timeout(IDLE_TIMEOUT, response.chunk())
                     .await
-                    .map_err(|_| WorkModelError::Protocol)?
-                    .map_err(|_| WorkModelError::Protocol)?;
-                match chunk {
-                    Some(chunk) => {
-                        if let Some(outcome) = decoder.push(&chunk, events)? {
-                            return Ok(outcome);
-                        }
+                    .map_err(|_| transport_error(ChatGptFailureStage::Stream, Some(status), true))?
+                    .map_err(|error| {
+                        transport_error(
+                            ChatGptFailureStage::Stream,
+                            Some(status),
+                            error.is_timeout(),
+                        )
+                    })?;
+                let decoded = match chunk {
+                    Some(chunk) => decoder.push(&chunk, events),
+                    None => {
+                        return decoder.finish(events).map_err(|error| {
+                            diagnose(ChatGptFailureStage::Stream, Some(status), error)
+                        })
                     }
-                    None => return decoder.finish(events),
+                };
+                if let Some(outcome) = decoded
+                    .map_err(|error| diagnose(ChatGptFailureStage::Stream, Some(status), error))?
+                {
+                    return Ok(outcome);
                 }
             }
         };
         tokio::time::timeout(CALL_TIMEOUT, future)
             .await
-            .map_err(|_| WorkModelError::Protocol)?
+            .map_err(|_| {
+                let stage = match stage.load(std::sync::atomic::Ordering::Relaxed) {
+                    0 => ChatGptFailureStage::Send,
+                    1 => ChatGptFailureStage::Http,
+                    _ => ChatGptFailureStage::Stream,
+                };
+                diagnostic(
+                    stage,
+                    Some(observed_status.load(std::sync::atomic::Ordering::Relaxed)),
+                    ChatGptFailureIssue::Timeout,
+                )
+            })?
     }
+}
+
+/// Exercise both exact production wire halves with an in-memory response only.
+/// This feature has no credentials, networking, endpoint override or retries.
+#[cfg(feature = "test-fixtures")]
+pub fn fixture_call(
+    request: &WorkModelRequest,
+    response: &[u8],
+    events: &(dyn Fn(WorkModelEvent) + Send + Sync),
+) -> Result<(Vec<u8>, WorkModelOutcome), WorkModelError> {
+    let encoded = encode_request(request)?;
+    let mut decoder = StreamDecoder::new(request);
+    let decoded = match decoder.push(response, events) {
+        Ok(Some(outcome)) => Ok(outcome),
+        Ok(None) => decoder.finish(events),
+        Err(error) => Err(error),
+    };
+    decoded
+        .map(|outcome| (encoded, outcome))
+        .map_err(|error| diagnose(ChatGptFailureStage::Stream, Some(200), error))
+}
+
+fn encode_request(request: &WorkModelRequest) -> Result<Vec<u8>, WorkModelError> {
+    let encode = || {
+        let body = request_body(request)?;
+        let encoded = serde_json::to_vec(&body).map_err(|_| WorkModelError::BadRequest)?;
+        if encoded.len() > MAX_REQUEST_BYTES {
+            return Err(WorkModelError::BadRequest);
+        }
+        Ok(encoded)
+    };
+    encode().map_err(|error| diagnose(ChatGptFailureStage::Request, None, error))
+}
+
+fn diagnostic(
+    stage: ChatGptFailureStage,
+    status: Option<u16>,
+    issue: ChatGptFailureIssue,
+) -> WorkModelError {
+    chatgpt_error(ChatGptModelFault::Diagnostic {
+        stage,
+        status: status.filter(|status| (100..=599).contains(status)),
+        issue,
+        field: None,
+    })
+}
+
+/// Attach native evidence without retaining any provider-authored payload.
+pub(crate) fn diagnose(
+    stage: ChatGptFailureStage,
+    status: Option<u16>,
+    error: WorkModelError,
+) -> WorkModelError {
+    let issue = match error {
+        WorkModelError::ChatGpt {
+            fault: ChatGptModelFault::Diagnostic { .. },
+        } => return error,
+        WorkModelError::ChatGpt { fault } => fault.issue(),
+        WorkModelError::BadRequest | WorkModelError::ContextTooLong => {
+            ChatGptFailureIssue::InvalidRequest
+        }
+        WorkModelError::Unauthorized | WorkModelError::MissingKey => ChatGptFailureIssue::SignedOut,
+        WorkModelError::Network => ChatGptFailureIssue::Unavailable,
+        WorkModelError::Cancelled => ChatGptFailureIssue::Cancelled,
+        _ => ChatGptFailureIssue::Protocol,
+    };
+    diagnostic(stage, status, issue)
+}
+
+fn transport_error(
+    stage: ChatGptFailureStage,
+    status: Option<u16>,
+    timeout: bool,
+) -> WorkModelError {
+    diagnostic(
+        stage,
+        status,
+        if timeout {
+            ChatGptFailureIssue::Timeout
+        } else {
+            ChatGptFailureIssue::Unavailable
+        },
+    )
 }
 
 fn bearer(tokens: &Tokens) -> Result<HeaderValue, WorkModelError> {
@@ -495,22 +617,100 @@ fn provider_error(code: &str) -> Option<WorkModelError> {
 
 fn http_error(status: u16, body: &[u8]) -> WorkModelError {
     let value = serde_json::from_slice::<Value>(body).ok();
-    if let Some(error) = value
+    let field = (status == 400)
+        .then(|| value.as_ref()?.pointer("/error/param"))
+        .flatten()
+        .filter(|param| !param.is_null())
+        .map(|param| {
+            param
+                .as_str()
+                .map(parameter_field)
+                .unwrap_or(ChatGptFailureField::Unknown)
+        });
+    let error = value
         .as_ref()
         .and_then(|value| value.pointer("/error/code"))
         .and_then(Value::as_str)
         .and_then(provider_error)
-    {
-        return error;
+        .unwrap_or_else(|| match status {
+            401 => chatgpt_error(ChatGptModelFault::SignedOut),
+            403 => chatgpt_error(ChatGptModelFault::NotEligible),
+            429 => chatgpt_error(ChatGptModelFault::UsageLimit),
+            503 => chatgpt_error(ChatGptModelFault::Unavailable),
+            400 | 404 | 413 | 422 => chatgpt_error(ChatGptModelFault::Unsupported),
+            _ => WorkModelError::Protocol,
+        });
+    let error = diagnose(ChatGptFailureStage::Http, Some(status), error);
+    match error {
+        WorkModelError::ChatGpt {
+            fault:
+                ChatGptModelFault::Diagnostic {
+                    stage,
+                    status,
+                    issue,
+                    ..
+                },
+        } => chatgpt_error(ChatGptModelFault::Diagnostic {
+            stage,
+            status,
+            issue,
+            field,
+        }),
+        _ => error,
     }
-    match status {
-        401 => chatgpt_error(ChatGptModelFault::SignedOut),
-        403 => chatgpt_error(ChatGptModelFault::NotEligible),
-        429 => chatgpt_error(ChatGptModelFault::UsageLimit),
-        503 => chatgpt_error(ChatGptModelFault::Unavailable),
-        400 | 404 | 413 | 422 => chatgpt_error(ChatGptModelFault::Unsupported),
-        _ => WorkModelError::Protocol,
+}
+
+// Only category membership is retained. A path is ASCII, <=256 bytes, and
+// follows root ('.' identifier | '.' digits | '[' digits ']')*. No JSON quotes,
+// slashes, whitespace, controls, unparsed suffixes or substring matching.
+fn parameter_field(param: &str) -> ChatGptFailureField {
+    if param.len() > 256 || !param.is_ascii() {
+        return ChatGptFailureField::Unknown;
     }
+    match param {
+        "model" => ChatGptFailureField::Model,
+        "store" => ChatGptFailureField::Store,
+        "stream" => ChatGptFailureField::Stream,
+        _ if parameter_path(param, "reasoning") => ChatGptFailureField::Reasoning,
+        _ if parameter_path(param, "tools") => ChatGptFailureField::Tools,
+        _ if parameter_path(param, "input") => ChatGptFailureField::Input,
+        _ => ChatGptFailureField::Unknown,
+    }
+}
+
+fn parameter_path(param: &str, root: &str) -> bool {
+    let Some(mut rest) = param.strip_prefix(root) else {
+        return false;
+    };
+    while !rest.is_empty() {
+        if let Some(path) = rest.strip_prefix('.') {
+            let end = path.find(['.', '[']).unwrap_or(path.len());
+            let part = &path[..end];
+            let numeric =
+                !part.is_empty() && part.len() <= 6 && part.bytes().all(|b| b.is_ascii_digit());
+            let identifier = part
+                .as_bytes()
+                .first()
+                .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+                && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+            if !numeric && !identifier {
+                return false;
+            }
+            rest = &path[end..];
+        } else if let Some(path) = rest.strip_prefix('[') {
+            let Some(end) = path.find(']') else {
+                return false;
+            };
+            let index = &path[..end];
+            if index.is_empty() || index.len() > 6 || !index.bytes().all(|b| b.is_ascii_digit()) {
+                return false;
+            }
+            rest = &path[end + 1..];
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 struct StreamDecoder {
@@ -590,7 +790,13 @@ impl StreamDecoder {
                 return Ok(outcome);
             }
         }
-        self.dispatch(sink)?.ok_or(WorkModelError::Protocol)
+        self.dispatch(sink)?.ok_or_else(|| {
+            diagnostic(
+                ChatGptFailureStage::Stream,
+                Some(200),
+                ChatGptFailureIssue::Incomplete,
+            )
+        })
     }
 
     fn line_end(
@@ -664,13 +870,20 @@ impl StreamDecoder {
             }
             "response.completed" => {
                 return completed(
-                    value.get("response").ok_or(WorkModelError::Protocol)?,
+                    value.get("response").ok_or_else(|| {
+                        diagnostic(
+                            ChatGptFailureStage::Complete,
+                            Some(200),
+                            ChatGptFailureIssue::Protocol,
+                        )
+                    })?,
                     &self.allowed,
                     self.requires_tool,
                     self.text_bytes == 0,
                     sink,
                 )
                 .map(Some)
+                .map_err(|error| diagnose(ChatGptFailureStage::Complete, Some(200), error))
             }
             "response.failed" | "error" => {
                 let code = value
@@ -679,9 +892,19 @@ impl StreamDecoder {
                     .or_else(|| value.get("code"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                return Err(provider_error(code).unwrap_or(WorkModelError::Protocol));
+                return Err(diagnose(
+                    ChatGptFailureStage::Stream,
+                    Some(200),
+                    provider_error(code).unwrap_or(WorkModelError::Protocol),
+                ));
             }
-            "response.incomplete" => return Err(WorkModelError::Protocol),
+            "response.incomplete" => {
+                return Err(diagnostic(
+                    ChatGptFailureStage::Stream,
+                    Some(200),
+                    ChatGptFailureIssue::Incomplete,
+                ))
+            }
             _ => {}
         }
         Ok(None)
@@ -705,26 +928,7 @@ fn completed(
     if output.len() > MAX_TOOLS {
         return Err(WorkModelError::Protocol);
     }
-    let usage = response.get("usage").ok_or(WorkModelError::Protocol)?;
-    let input_tokens = usage
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .ok_or(WorkModelError::Protocol)?;
-    let output_tokens = usage
-        .get("output_tokens")
-        .and_then(Value::as_u64)
-        .ok_or(WorkModelError::Protocol)?;
-    let cached_input_tokens = usage
-        .pointer("/input_tokens_details/cached_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let reasoning_tokens = usage
-        .pointer("/output_tokens_details/reasoning_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    if cached_input_tokens > input_tokens || reasoning_tokens > output_tokens {
-        return Err(WorkModelError::Protocol);
-    }
+    let usage = response_usage(response.get("usage"))?;
     let mut assistant = Vec::new();
     let mut emitted = Vec::new();
     let mut seen_calls = HashSet::new();
@@ -808,9 +1012,16 @@ fn completed(
     if requires_tool && seen_calls.is_empty() && !refused {
         return Err(WorkModelError::Protocol);
     }
-    // Tool calls are observable only after the whole terminal response validates.
+    let usage = usage.unwrap_or_else(WorkModelUsage::unavailable);
+    // Completion and measurement are independent: Page may consume a validated
+    // tool outcome under its existing bounded loop even when usage is absent.
+    // Work, however, may execute ToolCall callbacks before inspecting the
+    // outcome. Withhold only those callbacks until measurement is known; its
+    // source guard will then stop the run conservatively on unavailable usage.
     for event in emitted {
-        sink(event);
+        if usage.is_reported() || !matches!(event, WorkModelEvent::ToolCall(_)) {
+            sink(event);
+        }
     }
     Ok(WorkModelOutcome {
         stop: if !seen_calls.is_empty() {
@@ -820,15 +1031,58 @@ fn completed(
         } else {
             WorkModelStop::EndTurn
         },
-        usage: WorkModelUsage {
-            input_tokens,
-            output_tokens,
-            cached_input_tokens,
-            reasoning_tokens,
-            ..WorkModelUsage::default()
-        },
+        usage,
         assistant,
     })
+}
+
+// The official Response schema permits absent/null usage. Completion and
+// measurement are separate facts; malformed *present* usage is not absence.
+fn response_usage(value: Option<&Value>) -> Result<Option<WorkModelUsage>, WorkModelError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    if !value.is_object() {
+        return Err(WorkModelError::Protocol);
+    }
+    let input_tokens = value
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .ok_or(WorkModelError::Protocol)?;
+    let output_tokens = value
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .ok_or(WorkModelError::Protocol)?;
+    let detail = |object: &str, key: &str| -> Result<u64, WorkModelError> {
+        match value.get(object) {
+            None | Some(Value::Null) => Ok(0),
+            Some(details) if details.is_object() => match details.get(key) {
+                None => Ok(0),
+                Some(count) => count.as_u64().ok_or(WorkModelError::Protocol),
+            },
+            _ => Err(WorkModelError::Protocol),
+        }
+    };
+    let cached_input_tokens = detail("input_tokens_details", "cached_tokens")?;
+    let reasoning_tokens = detail("output_tokens_details", "reasoning_tokens")?;
+    let total = input_tokens
+        .checked_add(output_tokens)
+        .ok_or(WorkModelError::Protocol)?;
+    if cached_input_tokens > input_tokens
+        || reasoning_tokens > output_tokens
+        || value
+            .get("total_tokens")
+            .is_some_and(|value| value.as_u64() != Some(total))
+    {
+        return Err(WorkModelError::Protocol);
+    }
+    Ok(Some(WorkModelUsage {
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+        reasoning_tokens,
+        ..WorkModelUsage::default()
+    }))
 }
 
 #[cfg(test)]
@@ -1026,14 +1280,22 @@ mod tests {
             decoder
                 .push(frame(text_response()).as_bytes(), &|_| {})
                 .err(),
-            Some(WorkModelError::Protocol)
+            Some(diagnostic(
+                ChatGptFailureStage::Complete,
+                Some(200),
+                ChatGptFailureIssue::Protocol
+            ))
         );
         let mut decoder = StreamDecoder::new(&request);
         let mut other = tool_response();
         other["response"]["output"][0]["name"] = json!("other");
         assert_eq!(
             decoder.push(frame(other).as_bytes(), &|_| {}).err(),
-            Some(WorkModelError::Protocol)
+            Some(diagnostic(
+                ChatGptFailureStage::Complete,
+                Some(200),
+                ChatGptFailureIssue::Protocol
+            ))
         );
         request.tool_choice = WorkModelToolChoice::Named("not_offered".into());
         assert_eq!(
@@ -1078,14 +1340,20 @@ mod tests {
         assert_eq!(output.usage.input_tokens, 8);
         assert_eq!(output.usage.output_tokens, 2);
         assert!(matches!(&output.assistant[0], WorkModelPart::Text(text) if text == "Hello"));
-        for event in [
-            json!({"type":"response.incomplete","response":{"status":"incomplete"}}),
-            json!({"type":"response.failed","response":{"error":{"code":"unknown"}}}),
+        for (event, issue) in [
+            (
+                json!({"type":"response.incomplete","response":{"status":"incomplete"}}),
+                ChatGptFailureIssue::Incomplete,
+            ),
+            (
+                json!({"type":"response.failed","response":{"error":{"code":"unknown"}}}),
+                ChatGptFailureIssue::Protocol,
+            ),
         ] {
             let mut decoder = StreamDecoder::new(&request());
             assert_eq!(
                 decoder.push(frame(event).as_bytes(), &|_| {}).err(),
-                Some(WorkModelError::Protocol)
+                Some(diagnostic(ChatGptFailureStage::Stream, Some(200), issue))
             );
         }
         let mut decoder = StreamDecoder::new(&request());
@@ -1098,7 +1366,11 @@ mod tests {
             .is_none());
         assert_eq!(
             decoder.finish(&|_| {}).err(),
-            Some(WorkModelError::Protocol)
+            Some(diagnostic(
+                ChatGptFailureStage::Stream,
+                Some(200),
+                ChatGptFailureIssue::Incomplete
+            ))
         );
         let mut decoder = StreamDecoder::new(&request());
         assert_eq!(
@@ -1145,7 +1417,7 @@ mod tests {
                     &|_| {},
                 )
                 .unwrap();
-            assert_eq!(decoder.push(frame(json!({"type":"response.failed","response":{"error":{"code":code,"message":"untrusted secret"}}})).as_bytes(), &|_| {}).err(), Some(expected));
+            assert_eq!(decoder.push(frame(json!({"type":"response.failed","response":{"error":{"code":code,"message":"untrusted secret"}}})).as_bytes(), &|_| {}).err(), Some(diagnose(ChatGptFailureStage::Stream, Some(200), expected)));
         }
     }
 
@@ -1190,7 +1462,11 @@ mod tests {
                         .unwrap()
                         .push(event))
                     .err(),
-                Some(WorkModelError::Protocol)
+                Some(diagnostic(
+                    ChatGptFailureStage::Complete,
+                    Some(200),
+                    ChatGptFailureIssue::Protocol
+                ))
             );
             assert!(events.lock().unwrap().is_empty());
         }
@@ -1203,7 +1479,11 @@ mod tests {
         let mut decoder = StreamDecoder::new(&request());
         assert_eq!(
             decoder.push(frame(response).as_bytes(), &|_| {}).err(),
-            Some(WorkModelError::Protocol)
+            Some(diagnostic(
+                ChatGptFailureStage::Complete,
+                Some(200),
+                ChatGptFailureIssue::Protocol
+            ))
         );
     }
 
@@ -1223,17 +1503,24 @@ mod tests {
                     .unwrap()
                     .push(event))
                 .err(),
-            Some(WorkModelError::Protocol)
+            Some(diagnostic(
+                ChatGptFailureStage::Complete,
+                Some(200),
+                ChatGptFailureIssue::Protocol
+            ))
         );
         assert!(events.lock().unwrap().is_empty());
     }
 
     #[test]
     fn incomplete_terminal_data_and_invalid_accounting_are_not_success() {
-        for patch in [
-            json!({"status":"failed"}),
-            json!({"usage":null}),
-            json!({"usage":{"input_tokens":1,"output_tokens":2,"input_tokens_details":{"cached_tokens":3}}}),
+        for (patch, issue) in [
+            (json!({"status":"failed"}), ChatGptFailureIssue::Protocol),
+            (json!({"usage":{}}), ChatGptFailureIssue::Protocol),
+            (
+                json!({"usage":{"input_tokens":1,"output_tokens":2,"input_tokens_details":{"cached_tokens":3}}}),
+                ChatGptFailureIssue::Protocol,
+            ),
         ] {
             let mut response = text_response();
             for (key, value) in patch.as_object().unwrap() {
@@ -1242,7 +1529,7 @@ mod tests {
             let mut decoder = StreamDecoder::new(&request());
             assert_eq!(
                 decoder.push(frame(response).as_bytes(), &|_| {}).err(),
-                Some(WorkModelError::Protocol)
+                Some(diagnostic(ChatGptFailureStage::Complete, Some(200), issue))
             );
         }
     }
@@ -1328,7 +1615,7 @@ mod tests {
         ] {
             assert_eq!(
                 http_error(status, b"untrusted secret body"),
-                chatgpt_error(expected)
+                diagnostic(ChatGptFailureStage::Http, Some(status), expected.issue())
             );
         }
         for (code, expected) in [
@@ -1371,8 +1658,373 @@ mod tests {
         ] {
             let body =
                 serde_json::to_vec(&json!({"error":{"code":code,"message":"secret"}})).unwrap();
-            assert_eq!(http_error(400, &body), chatgpt_error(expected));
+            assert_eq!(
+                http_error(400, &body),
+                diagnostic(ChatGptFailureStage::Http, Some(400), expected.issue())
+            );
         }
-        assert_eq!(http_error(500, b"unknown error"), WorkModelError::Protocol);
+        assert_eq!(
+            http_error(500, b"unknown error"),
+            diagnostic(
+                ChatGptFailureStage::Http,
+                Some(500),
+                ChatGptFailureIssue::Protocol
+            )
+        );
+    }
+
+    #[test]
+    fn public_preflight_is_exact_and_content_free() {
+        let mut request = request();
+        request.model.model = "gpt-6.1-sol".into();
+        request.reasoning = Some(WorkModelReasoning::High);
+        request.messages = vec![WorkModelMessage::User(vec![WorkModelPart::Text(
+            "مرحبا".into(),
+        )])];
+        assert_eq!(InferenceClient::validate_request(&request), Ok(()));
+        let payload: Value = serde_json::from_slice(&encode_request(&request).unwrap()).unwrap();
+        assert_eq!(payload["model"], "gpt-6.1-sol");
+        assert_eq!(payload["reasoning"]["effort"], "high");
+        assert_eq!(payload["store"], false);
+        assert_eq!(payload["stream"], true);
+        assert_eq!(payload["tools"][0]["type"], "namespace");
+        request.tools[0].description = "PRIVATE_REQUEST_SENTINEL".repeat(4096);
+        let error = InferenceClient::validate_request(&request).unwrap_err();
+        assert_eq!(
+            error,
+            diagnostic(
+                ChatGptFailureStage::Request,
+                None,
+                ChatGptFailureIssue::InvalidRequest
+            )
+        );
+        assert!(!format!("{error:?}").contains("PRIVATE_REQUEST_SENTINEL"));
+    }
+
+    #[test]
+    fn diagnostics_distinguish_transport_timeout_credential_and_bad_status_without_payloads() {
+        for stage in [ChatGptFailureStage::Send, ChatGptFailureStage::Stream] {
+            assert_eq!(
+                transport_error(stage, None, true),
+                diagnostic(stage, None, ChatGptFailureIssue::Timeout)
+            );
+            assert_eq!(
+                transport_error(stage, None, false),
+                diagnostic(stage, None, ChatGptFailureIssue::Unavailable)
+            );
+        }
+        assert_eq!(
+            diagnose(
+                ChatGptFailureStage::Credential,
+                None,
+                chatgpt_error(ChatGptModelFault::SignedOut)
+            ),
+            diagnostic(
+                ChatGptFailureStage::Credential,
+                None,
+                ChatGptFailureIssue::SignedOut
+            )
+        );
+        for status in [0, 99, 600, u16::MAX] {
+            assert_eq!(
+                diagnostic(
+                    ChatGptFailureStage::Http,
+                    Some(status),
+                    ChatGptFailureIssue::Protocol
+                ),
+                diagnostic(
+                    ChatGptFailureStage::Http,
+                    None,
+                    ChatGptFailureIssue::Protocol
+                )
+            );
+        }
+        let secret = b"{\"error\":{\"code\":\"private-code\",\"message\":\"PRIVATE_BODY_SENTINEL token email prompt\"}}";
+        for status in [400, 401, 403, 429, 500, 503] {
+            let error = http_error(status, secret);
+            assert!(!format!("{error:?}").contains("PRIVATE_BODY_SENTINEL"));
+            assert!(!format!("{error:?}").contains("private-code"));
+        }
+    }
+
+    #[test]
+    fn missing_or_null_usage_retains_valid_tools_but_never_emits_tool_callbacks() {
+        for missing in [true, false] {
+            for choice in [
+                WorkModelToolChoice::Auto,
+                WorkModelToolChoice::Named("read_page".into()),
+            ] {
+                let mut response = tool_response();
+                if missing {
+                    response["response"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("usage");
+                } else {
+                    response["response"]["usage"] = Value::Null;
+                }
+                let mut request = request();
+                request.tool_choice = choice;
+                let events = Mutex::new(Vec::new());
+                let outcome = StreamDecoder::new(&request)
+                    .push(frame(response).as_bytes(), &|event| {
+                        events.lock().unwrap().push(event)
+                    })
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(outcome.stop, WorkModelStop::ToolUse);
+                assert_eq!(outcome.usage.status, WorkModelUsageStatus::Unavailable);
+                assert_eq!(outcome.usage.cost_micros, None);
+                assert!(
+                    matches!(&outcome.assistant[..], [WorkModelPart::ToolCall(call)]
+                    if call.id == "call_1" && call.name == "read_page" && call.arguments == json!({}))
+                );
+                assert!(events.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn missing_or_null_usage_does_not_change_valid_refusal_empty_or_mixed_output() {
+        for missing in [true, false] {
+            for shape in 0..3 {
+                let mut response = text_response();
+                response["response"]["output"] = match shape {
+                    0 => json!([]),
+                    1 => {
+                        json!([{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"Cannot help with that."}]}])
+                    }
+                    _ => json!([
+                        {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Checking the page."}]},
+                        {"type":"function_call","call_id":"call_1","namespace":"zephium","name":"read_page","arguments":"{}"}
+                    ]),
+                };
+                if missing {
+                    response["response"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("usage");
+                } else {
+                    response["response"]["usage"] = Value::Null;
+                }
+                let events = Mutex::new(Vec::new());
+                let outcome = StreamDecoder::new(&request())
+                    .push(frame(response).as_bytes(), &|event| {
+                        events.lock().unwrap().push(event)
+                    })
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    outcome.stop,
+                    match shape {
+                        0 => WorkModelStop::EndTurn,
+                        1 => WorkModelStop::Refused,
+                        _ => WorkModelStop::ToolUse,
+                    }
+                );
+                assert_eq!(outcome.usage.status, WorkModelUsageStatus::Unavailable);
+                assert_eq!(outcome.usage.cost_micros, None);
+                let events = events.lock().unwrap();
+                assert!(events
+                    .iter()
+                    .all(|event| matches!(event, WorkModelEvent::Text(_))));
+                assert_eq!(events.len(), usize::from(shape == 2));
+            }
+        }
+    }
+
+    #[test]
+    fn absent_usage_never_relaxes_terminal_or_tool_validation() {
+        for missing in [true, false] {
+            for invalid in 0..5 {
+                let mut response = tool_response();
+                if missing {
+                    response["response"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("usage");
+                } else {
+                    response["response"]["usage"] = Value::Null;
+                }
+                match invalid {
+                    0 => response["response"]["status"] = json!("incomplete"),
+                    1 => response["response"]["output"][0]["namespace"] = json!("other"),
+                    2 => response["response"]["output"][0]["name"] = json!("not_offered"),
+                    3 => response["response"]["output"][0]["arguments"] = json!("[]"),
+                    _ => response["response"]["output"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"type":"unknown"})),
+                }
+                let events = Mutex::new(Vec::new());
+                let error = StreamDecoder::new(&request())
+                    .push(frame(response).as_bytes(), &|event| {
+                        events.lock().unwrap().push(event)
+                    })
+                    .err()
+                    .unwrap();
+                assert_eq!(
+                    error,
+                    diagnostic(
+                        ChatGptFailureStage::Complete,
+                        Some(200),
+                        ChatGptFailureIssue::Protocol
+                    )
+                );
+                assert!(events.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn http400_parameter_hints_are_finite_categories_never_raw_paths() {
+        for (param, expected) in [
+            ("model", ChatGptFailureField::Model),
+            ("store", ChatGptFailureField::Store),
+            ("stream", ChatGptFailureField::Stream),
+            ("reasoning.effort", ChatGptFailureField::Reasoning),
+            ("tools", ChatGptFailureField::Tools),
+            (
+                "tools[0].tools[12].parameters.properties.PRIVATE_FIELD",
+                ChatGptFailureField::Tools,
+            ),
+            ("tools.0.parameters", ChatGptFailureField::Tools),
+            ("input[0].content[1].type", ChatGptFailureField::Input),
+            ("input.0.content.1.text", ChatGptFailureField::Input),
+            ("input_secret", ChatGptFailureField::Unknown),
+            ("tools/0/name", ChatGptFailureField::Unknown),
+            ("tools..name", ChatGptFailureField::Unknown),
+            ("tools[-1]", ChatGptFailureField::Unknown),
+            ("tools[1234567]", ChatGptFailureField::Unknown),
+            ("tools[]", ChatGptFailureField::Unknown),
+            ("tools[0]PRIVATE_FIELD", ChatGptFailureField::Unknown),
+            ("tools[0].", ChatGptFailureField::Unknown),
+            ("tools[0][\"PRIVATE_FIELD\"]", ChatGptFailureField::Unknown),
+            ("tools\nPRIVATE_FIELD", ChatGptFailureField::Unknown),
+            ("input[0].مرحبا", ChatGptFailureField::Unknown),
+            ("model.PRIVATE_FIELD", ChatGptFailureField::Unknown),
+        ] {
+            let body =
+                serde_json::to_vec(&json!({"error":{"param":param,"message":"PRIVATE_BODY"}}))
+                    .unwrap();
+            let error = http_error(400, &body);
+            let WorkModelError::ChatGpt { fault } = error else {
+                panic!("expected source fault")
+            };
+            assert!(
+                matches!(fault, ChatGptModelFault::Diagnostic { field: Some(field), .. } if field == expected)
+            );
+            let safe = serde_json::to_string(&fault).unwrap();
+            assert!(!safe.contains("PRIVATE_FIELD") && !safe.contains("PRIVATE_BODY"));
+            assert_eq!(
+                http_error(403, &body),
+                diagnostic(
+                    ChatGptFailureStage::Http,
+                    Some(403),
+                    ChatGptFailureIssue::NotEligible
+                )
+            );
+        }
+        assert_eq!(
+            parameter_field(&"tools.a".repeat(100)),
+            ChatGptFailureField::Unknown
+        );
+        for param in [
+            Value::Null,
+            json!(""),
+            json!({"PRIVATE_FIELD":"PRIVATE_BODY"}),
+        ] {
+            let body = serde_json::to_vec(&json!({"error":{"param":param}})).unwrap();
+            let WorkModelError::ChatGpt { fault } = http_error(400, &body) else {
+                panic!()
+            };
+            let expected = if param.is_null() {
+                None
+            } else {
+                Some(ChatGptFailureField::Unknown)
+            };
+            assert!(
+                matches!(fault, ChatGptModelFault::Diagnostic { field, .. } if field == expected)
+            );
+        }
+        let legacy: ChatGptModelFault = serde_json::from_value(
+            json!({"diagnostic":{"stage":"http","status":400,"issue":"unsupported"}}),
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            ChatGptModelFault::Diagnostic { field: None, .. }
+        ));
+    }
+
+    #[test]
+    fn completed_plain_text_accepts_missing_or_null_usage_as_unknown_not_zero() {
+        for missing in [true, false] {
+            for reasoning in [true, false] {
+                let mut response = text_response();
+                if missing {
+                    response["response"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("usage");
+                } else {
+                    response["response"]["usage"] = Value::Null;
+                }
+                if reasoning {
+                    response["response"]["output"].as_array_mut().unwrap().insert(0,
+                        json!({"type":"reasoning","id":"rs_fixture","summary":[],"encrypted_content":"fixture-encrypted"}));
+                }
+                let events = Mutex::new(Vec::new());
+                let outcome = StreamDecoder::new(&request())
+                    .push(frame(response).as_bytes(), &|event| {
+                        events.lock().unwrap().push(event)
+                    })
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(outcome.stop, WorkModelStop::EndTurn);
+                assert_eq!(outcome.usage.status, WorkModelUsageStatus::Unavailable);
+                assert!(!outcome.usage.is_reported());
+                assert_eq!(outcome.usage.cost_micros, None);
+                assert!(outcome
+                    .assistant
+                    .iter()
+                    .any(|part| matches!(part, WorkModelPart::Text(text) if text == "Hello")));
+                assert!(events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|event| matches!(event, WorkModelEvent::Text(_))));
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_zero_is_reported_but_malformed_present_usage_is_not_absence() {
+        let zero = json!({"input_tokens":0,"output_tokens":0,"total_tokens":0});
+        let reported = response_usage(Some(&zero)).unwrap().unwrap();
+        assert!(reported.is_reported());
+        assert_eq!(reported.input_tokens, 0);
+        for value in [
+            json!({}),
+            json!("0"),
+            json!({"input_tokens":"1","output_tokens":2}),
+            json!({"input_tokens":1,"output_tokens":-1}),
+            json!({"input_tokens":1,"output_tokens":2,"total_tokens":4}),
+            json!({"input_tokens":1,"output_tokens":2,"input_tokens_details":"bad"}),
+            json!({"input_tokens":1,"output_tokens":2,"output_tokens_details":{"reasoning_tokens":"2"}}),
+            json!({"input_tokens":u64::MAX,"output_tokens":1}),
+        ] {
+            assert_eq!(response_usage(Some(&value)), Err(WorkModelError::Protocol));
+        }
+        let mut response = tool_response();
+        response["response"]["usage"] = json!({"input_tokens":"not-a-count","output_tokens":1});
+        let events = Mutex::new(Vec::new());
+        assert!(StreamDecoder::new(&request())
+            .push(frame(response).as_bytes(), &|event| events
+                .lock()
+                .unwrap()
+                .push(event))
+            .is_err());
+        assert!(events.lock().unwrap().is_empty());
     }
 }

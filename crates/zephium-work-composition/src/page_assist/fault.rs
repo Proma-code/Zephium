@@ -1,7 +1,7 @@
 //! Model failures and costs in the panel's closed words.
 use zephium_core::work::model::{
-    ChatGptModelFault, GatewayModelFault, HostedRefusal, OpenCodeGoModelFault, WorkModelEntry,
-    WorkModelError, WorkModelProvider, WorkModelUsage,
+    GatewayModelFault, HostedRefusal, OpenCodeGoModelFault, WorkModelEntry, WorkModelError,
+    WorkModelProvider, WorkModelUsage,
 };
 use zephium_ipc::page_assist::{PageAssistCostV1, PageAssistFaultV1, WorkModelFaultV1};
 use zephium_page_assist::cost;
@@ -18,13 +18,7 @@ pub(crate) fn model_fault(error: WorkModelError, hosted: bool) -> PageAssistFaul
     let fault = match error {
         // These are explicit connection failures, not API-key or Zephium-plan
         // remedies. The caller terminates the reply; none grants a fallback.
-        WorkModelError::ChatGpt { fault } => match fault {
-            ChatGptModelFault::UsageLimit => WorkModelFaultV1::RateLimited,
-            ChatGptModelFault::Unsupported => return PageAssistFaultV1::Unsupported,
-            ChatGptModelFault::SignedOut
-            | ChatGptModelFault::Unavailable
-            | ChatGptModelFault::NotEligible => return PageAssistFaultV1::Unavailable,
-        },
+        WorkModelError::ChatGpt { fault } => return PageAssistFaultV1::ChatGpt { fault },
         WorkModelError::OpenCodeGo { fault, .. } => match fault {
             OpenCodeGoModelFault::RateLimited => WorkModelFaultV1::RateLimited,
             OpenCodeGoModelFault::Unsupported => return PageAssistFaultV1::Unsupported,
@@ -156,6 +150,7 @@ pub(crate) fn cost(entry: &WorkModelEntry, usage: &WorkModelUsage) -> PageAssist
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zephium_core::work::model::ChatGptModelFault;
 
     #[test]
     fn faults_keep_the_retry_hint_and_hosting() {
@@ -203,10 +198,12 @@ mod tests {
             ChatGptModelFault::SignedOut,
             ChatGptModelFault::Unavailable,
             ChatGptModelFault::NotEligible,
+            ChatGptModelFault::UsageLimit,
+            ChatGptModelFault::Unsupported,
         ] {
             assert_eq!(
                 model_fault(WorkModelError::ChatGpt { fault }, true),
-                unavailable
+                PageAssistFaultV1::ChatGpt { fault }
             );
         }
         for unknown in [false, true] {
@@ -255,9 +252,6 @@ mod tests {
     #[test]
     fn protected_limits_have_no_invented_retry_deadline_and_unsupported_stays_explicit() {
         for error in [
-            WorkModelError::ChatGpt {
-                fault: ChatGptModelFault::UsageLimit,
-            },
             WorkModelError::OpenCodeGo {
                 fault: OpenCodeGoModelFault::RateLimited,
                 usage_unknown: true,
@@ -276,9 +270,6 @@ mod tests {
             );
         }
         for error in [
-            WorkModelError::ChatGpt {
-                fault: ChatGptModelFault::Unsupported,
-            },
             WorkModelError::OpenCodeGo {
                 fault: OpenCodeGoModelFault::Unsupported,
                 usage_unknown: false,

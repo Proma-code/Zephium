@@ -483,6 +483,20 @@ impl Reply {
         match outcome {
             Ok(Ok(outcome)) => Ok(outcome),
             Ok(Err(error)) => Err(End::Failed(fault::model_fault(error, hosted))),
+            Err(_)
+                if model.entry.model.provider
+                    == zephium_core::work::model::WorkModelProvider::OpenAi
+                    && model.entry.id.starts_with("chatgpt/") =>
+            {
+                Err(End::Failed(PageAssistFaultV1::ChatGpt {
+                    fault: zephium_core::work::model::ChatGptModelFault::Diagnostic {
+                        stage: zephium_core::work::model::ChatGptFailureStage::Send,
+                        status: None,
+                        issue: zephium_core::work::model::ChatGptFailureIssue::Timeout,
+                        field: None,
+                    },
+                }))
+            }
             Err(_) => Err(End::Failed(PageAssistFaultV1::Model {
                 fault: WorkModelFaultV1::ProviderDown,
                 retry_after_ms: None,
@@ -492,6 +506,11 @@ impl Reply {
 }
 
 fn add_usage(total: &mut WorkModelUsage, usage: &WorkModelUsage) {
+    if !total.is_reported() || !usage.is_reported() {
+        total.status = zephium_core::work::model::WorkModelUsageStatus::Unavailable;
+        total.cost_micros = None;
+        return;
+    }
     total.input_tokens += usage.input_tokens;
     total.cached_input_tokens += usage.cached_input_tokens;
     total.cache_write_input_tokens += usage.cache_write_input_tokens;
@@ -560,7 +579,7 @@ async fn body(reply: &Reply) -> End {
     reply.note(format_args!(
         "start model={} effort={:?} tools={} attachments={} suggestion={:?}",
         model.entry.id,
-        model.effort.map(super::sidebar_effort),
+        model.effort,
         model.entry.supports.tools,
         reply.attachments.len(),
         reply.suggestion
@@ -596,10 +615,7 @@ async fn body(reply: &Reply) -> End {
             tools: tools.clone(),
             messages: messages.clone(),
             max_output_tokens: prompt::MAX_OUTPUT_TOKENS.min(model.entry.max_output.max(8_192)),
-            reasoning: model
-                .effort
-                .filter(|_| model.entry.supports.reasoning)
-                .map(super::sidebar_effort),
+            reasoning: model.effort.filter(|_| model.entry.supports.reasoning),
             native_search: false,
             parallel_tools: false,
             tool_choice: WorkModelToolChoice::Auto,
@@ -613,15 +629,23 @@ async fn body(reply: &Reply) -> End {
             }
         };
         add_usage(&mut usage, &outcome.usage);
-        reply.note(format_args!(
-            "call stop={:?} in={} cached={} out={} reasoning={} text_blocks={}",
-            outcome.stop,
-            outcome.usage.input_tokens,
-            outcome.usage.cached_input_tokens,
-            outcome.usage.output_tokens,
-            outcome.usage.reasoning_tokens,
-            reply.next_block()
-        ));
+        if outcome.usage.is_reported() {
+            reply.note(format_args!(
+                "call stop={:?} in={} cached={} out={} reasoning={} text_blocks={}",
+                outcome.stop,
+                outcome.usage.input_tokens,
+                outcome.usage.cached_input_tokens,
+                outcome.usage.output_tokens,
+                outcome.usage.reasoning_tokens,
+                reply.next_block()
+            ));
+        } else {
+            reply.note(format_args!(
+                "call stop={:?} usage=unavailable text_blocks={}",
+                outcome.stop,
+                reply.next_block()
+            ));
+        }
         let exhausted = outcome.stop == WorkModelStop::MaxTokens;
         let calls: Vec<_> = outcome
             .assistant
@@ -631,6 +655,8 @@ async fn body(reply: &Reply) -> End {
                 _ => None,
             })
             .collect();
+        // Usage completeness does not authorize tools. The original Page loop's
+        // call/tool/time bounds and each tool's browser authority remain decisive.
         messages.push(WorkModelMessage::Assistant(outcome.assistant));
         if exhausted && calls.is_empty() && reply.next_block() == 0 && text.block.is_none() {
             reply.flush(&mut text);
@@ -693,7 +719,11 @@ async fn body(reply: &Reply) -> End {
     if reply.next_block() == 0 {
         return End::Failed(PageAssistFaultV1::NoAnswer);
     }
-    End::Done(Some(fault::cost(&model.entry, &usage)))
+    End::Done(
+        usage
+            .is_reported()
+            .then(|| fault::cost(&model.entry, &usage)),
+    )
 }
 
 async fn run_tool(reply: &Reply, text: &mut Text, call: Call) -> Result<ToolOutcome, End> {
@@ -1700,4 +1730,43 @@ async fn take_over(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    #[test]
+    fn absent_measurement_is_sticky_and_distinct_from_reported_zero() {
+        let mut usage = WorkModelUsage::default();
+        assert!(usage.is_reported());
+        add_usage(
+            &mut usage,
+            &WorkModelUsage {
+                input_tokens: 17,
+                cost_micros: Some(20),
+                ..WorkModelUsage::default()
+            },
+        );
+        assert_eq!(usage.input_tokens, 17);
+        add_usage(&mut usage, &WorkModelUsage::unavailable());
+        assert!(!usage.is_reported());
+        assert_eq!(usage.cost_micros, None);
+        add_usage(
+            &mut usage,
+            &WorkModelUsage {
+                input_tokens: 99,
+                cost_micros: Some(80),
+                ..WorkModelUsage::default()
+            },
+        );
+        assert!(!usage.is_reported());
+        assert_eq!(usage.cost_micros, None);
+        assert_eq!(
+            usage.input_tokens, 17,
+            "unavailable aggregate counters are not interpreted"
+        );
+        let mut missing = WorkModelUsage::unavailable();
+        add_usage(&mut missing, &WorkModelUsage::default());
+        assert!(!missing.is_reported());
+    }
 }

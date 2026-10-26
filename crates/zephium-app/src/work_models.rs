@@ -1421,8 +1421,8 @@ pub struct WorkModelsView {
     pub cloud_locked: Vec<String>,
     /// The cheapest plan each locked model needs, when the server says.
     pub cloud_locked_plans: Vec<(String, Option<String>)>,
-    /// The efforts each entry takes as a lead, for entries that take any.
-    pub efforts: Vec<(String, Vec<WorkModelReasoning>)>,
+    /// The supported and currently resolved effort for each reasoning entry.
+    pub efforts: Vec<(String, Vec<WorkModelReasoning>, Option<WorkModelReasoning>)>,
     /// The effort the lead runs at now; `None` when its model takes none.
     pub effort: Option<WorkModelReasoning>,
 }
@@ -1450,8 +1450,14 @@ pub async fn view(profile: ProfileId) -> WorkModelsView {
     }
     let efforts = entries
         .iter()
-        .map(|entry| (entry.id.clone(), efforts(&state, entry)))
-        .filter(|(_, levels)| !levels.is_empty())
+        .map(|entry| {
+            (
+                entry.id.clone(),
+                efforts(&state, entry),
+                effort_for(&state, profile, entry),
+            )
+        })
+        .filter(|(_, levels, _)| !levels.is_empty())
         .collect();
     let providers = KEYED_PROVIDERS
         .into_iter()
@@ -2107,12 +2113,12 @@ mod tests {
         assert!(view
             .efforts
             .iter()
-            .any(|(id, levels)| id == "openai/gpt-6-luna"
+            .any(|(id, levels, _)| id == "openai/gpt-6-luna"
                 && levels.last() == Some(&WorkModelReasoning::Max)));
         assert!(!view
             .efforts
             .iter()
-            .any(|(id, _)| id == "mistral/mistral-medium-3-5"));
+            .any(|(id, _, _)| id == "mistral/mistral-medium-3-5"));
         set_effort(tuned, Some(WorkModelReasoning::Max)).unwrap();
         assert_eq!(
             super::view(tuned).await.effort,
@@ -2149,10 +2155,25 @@ mod tests {
         impl WorkModelClient for SubscriptionClient {
             fn call<'a>(
                 &'a self,
-                _: WorkModelRequest,
-                _: &'a (dyn Fn(WorkModelEvent) + Send + Sync),
+                request: WorkModelRequest,
+                events: &'a (dyn Fn(WorkModelEvent) + Send + Sync),
             ) -> WorkModelFuture<'a> {
-                Box::pin(async { Err(WorkModelError::Cancelled) })
+                Box::pin(async move {
+                    assert_eq!(request.model.provider, P::OpenAi);
+                    assert_eq!(request.model.wire, WorkModelWire::OpenAiResponses);
+                    assert_eq!(request.model.model, "gpt-6.1-sol");
+                    assert_eq!(request.reasoning, Some(WorkModelReasoning::High));
+                    assert!(
+                        matches!(request.messages.as_slice(), [WorkModelMessage::User(parts)]
+                        if matches!(parts.as_slice(), [WorkModelPart::Text(text)] if text == "مرحبا"))
+                    );
+                    events(WorkModelEvent::Text("Hello from the fixture".into()));
+                    Ok(WorkModelOutcome {
+                        stop: WorkModelStop::EndTurn,
+                        usage: WorkModelUsage::default(),
+                        assistant: vec![WorkModelPart::Text("Hello from the fixture".into())],
+                    })
+                })
             }
         }
         impl WorkChatGptSession for Subscription {
@@ -2184,8 +2205,9 @@ mod tests {
             .find(|entry| entry.model.provider == P::OpenAi)
             .unwrap();
         let byok = subscribed.clone();
-        subscribed.id = "chatgpt/gpt-fixture".into();
-        subscribed.model.model = "gpt-fixture".into();
+        subscribed.id = "chatgpt/gpt-6.1-sol".into();
+        subscribed.model.model = "gpt-6.1-sol".into();
+        subscribed.supports.reasoning = true;
         subscribed.model.wire = WorkModelWire::OpenAiResponses;
         subscribed.display_name = "Fixture".into();
         subscribed.roles = vec![
@@ -2223,6 +2245,71 @@ mod tests {
             choose(profile_id(46), WorkModelRole::Lead, Some(&subscribed.id)),
             Err(WorkModelError::BadRequest)
         );
+        // Page effort is independent of a Lead or Zephium Cloud session.
+        // Both the picker row and the actual Page request resolve the same value.
+        choose(subscriber, WorkModelRole::Page, Some(&subscribed.id)).unwrap();
+        assert!(cloud().is_none());
+        let page_only = super::view(subscriber).await;
+        assert_eq!(page_only.effective[0], None);
+        assert_eq!(
+            page_only.effective[1].as_deref(),
+            Some(subscribed.id.as_str())
+        );
+        assert_eq!(page_only.effort, None);
+        assert!(page_only.efforts.iter().any(|(id, levels, current)| {
+            id == &subscribed.id
+                && !levels.is_empty()
+                && *current == Some(WorkModelReasoning::Medium)
+        }));
+        set_effort(subscriber, Some(WorkModelReasoning::High)).unwrap();
+        let (page_entry, page_client) = resolve_entry(subscriber, WorkModelRole::Page)
+            .await
+            .unwrap();
+        assert_eq!(
+            lead_effort(subscriber, &page_entry),
+            Some(WorkModelReasoning::High)
+        );
+        assert!(super::view(subscriber)
+            .await
+            .efforts
+            .iter()
+            .any(|(id, _, current)| {
+                id == &subscribed.id && *current == Some(WorkModelReasoning::High)
+            }));
+        let observed = Mutex::new(Vec::new());
+        let reply = page_client
+            .call(
+                WorkModelRequest {
+                    image_fence: None,
+                    cache_key: None,
+                    model: page_entry.model.clone(),
+                    system: vec![],
+                    tools: vec![],
+                    messages: vec![WorkModelMessage::User(vec![WorkModelPart::Text(
+                        "مرحبا".into(),
+                    )])],
+                    max_output_tokens: 8192,
+                    reasoning: lead_effort(subscriber, &page_entry),
+                    native_search: false,
+                    parallel_tools: false,
+                    tool_choice: WorkModelToolChoice::Auto,
+                    volatile_tail: 0,
+                },
+                &|event| observed.lock().unwrap().push(event),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply.stop, WorkModelStop::EndTurn);
+        assert!(
+            matches!(reply.assistant.as_slice(), [WorkModelPart::Text(text)]
+            if text == "Hello from the fixture")
+        );
+        assert!(
+            matches!(observed.lock().unwrap().as_slice(), [WorkModelEvent::Text(text)]
+            if text == "Hello from the fixture")
+        );
+        assert!(!super::view(subscriber).await.cloud_signed_in);
+        choose(subscriber, WorkModelRole::Page, None).unwrap();
         choose(subscriber, WorkModelRole::Lead, Some(&subscribed.id)).unwrap();
         assert_eq!(
             effective(&state(), subscriber, WorkModelRole::Lead)
@@ -2443,7 +2530,7 @@ mod tests {
             .await
             .efforts
             .iter()
-            .any(|(id, _)| id == &entry.id));
+            .any(|(id, _, _)| id == &entry.id));
         let mut limited = entry.clone();
         limited.roles = vec![WorkModelRole::Lead];
         replace_gateway_for_test(Some(Arc::new(Gateway {
@@ -2629,7 +2716,7 @@ mod tests {
             .await
             .efforts
             .iter()
-            .any(|(id, _)| id == &entry.id));
+            .any(|(id, _, _)| id == &entry.id));
         let mut limited = entry.clone();
         limited.roles = vec![WorkModelRole::Lead];
         replace_go_for_test(Some(Arc::new(Go {

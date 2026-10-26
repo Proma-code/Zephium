@@ -218,6 +218,13 @@ export function effortLevels(models: WorkModelsV1 | null, id: string | null | un
   return models.efforts.find((row) => row.id === id)?.levels ?? [];
 }
 
+/** The selected entry's native-resolved effort, independent of the Work/Lead route. */
+export function modelEffort(models: WorkModelsV1 | null, id: string | null | undefined) {
+  if (!models || !id) return null;
+  const row = models.efforts.find((entry) => entry.id === id);
+  return row?.effort && row.levels.includes(row.effort) ? row.effort : null;
+}
+
 /** A context window the way a model card says it: 1M, 400K, 128K. */
 export function contextSize(tokens: number): string {
   const binary = tokens % 1024 === 0;

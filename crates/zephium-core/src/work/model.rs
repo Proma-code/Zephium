@@ -205,8 +205,20 @@ pub enum WorkModelStop {
     Refused,
 }
 
+/// Whether counters were actually supplied for the completed request.
+/// This is unrelated to remaining plan quota or inference entitlement.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WorkModelUsageStatus {
+    #[default]
+    Reported,
+    Unavailable,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WorkModelUsage {
+    /// When unavailable, counters are undefined placeholders, not measured zero.
+    /// Do not price, log or display them; retain conservative budget admission.
+    pub status: WorkModelUsageStatus,
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
     /// Of `input_tokens`, those written to the provider's prompt cache.
@@ -216,6 +228,21 @@ pub struct WorkModelUsage {
     /// Cost in millionths of a US dollar, including provider tool fees, when
     /// the catalog prices the model.
     pub cost_micros: Option<u64>,
+}
+
+impl WorkModelUsage {
+    /// True only when numeric counters may be used as reported usage.
+    pub const fn is_reported(self) -> bool {
+        matches!(self.status, WorkModelUsageStatus::Reported)
+    }
+
+    /// An explicit absence of measurements, not a zero-token/free response.
+    pub fn unavailable() -> Self {
+        Self {
+            status: WorkModelUsageStatus::Unavailable,
+            ..Self::default()
+        }
+    }
 }
 
 pub struct WorkModelOutcome {
@@ -317,7 +344,9 @@ pub enum GatewayModelFault {
 }
 
 /// Closed direct ChatGPT errors. No provider-authored text or account data.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "ipc-types", derive(specta::Type))]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub enum ChatGptModelFault {
     /// The selected local grant is missing, expired, or was refused.
     SignedOut,
@@ -329,6 +358,96 @@ pub enum ChatGptModelFault {
     NotEligible,
     /// This route does not support the requested capability or body.
     Unsupported,
+    /// Bounded native evidence, not a provider message or request identifier.
+    Diagnostic {
+        stage: ChatGptFailureStage,
+        /// The observed HTTP status (100..=599), only when one was received.
+        status: Option<u16>,
+        issue: ChatGptFailureIssue,
+        /// An allowlisted HTTP400 field category; never the provider's path.
+        field: Option<ChatGptFailureField>,
+    },
+}
+
+/// The last locally observed stage, without any request or credential content.
+#[cfg_attr(feature = "ipc-types", derive(specta::Type))]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatGptFailureStage {
+    Request,
+    Credential,
+    Send,
+    Http,
+    Stream,
+    Complete,
+}
+
+/// A closed request-field hint, not an echo of provider-authored error.param.
+#[cfg_attr(feature = "ipc-types", derive(specta::Type))]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatGptFailureField {
+    Model,
+    Reasoning,
+    Tools,
+    Input,
+    Store,
+    Stream,
+    Unknown,
+}
+
+/// Closed failure categories used for actionable UI, never provider strings.
+#[cfg_attr(feature = "ipc-types", derive(specta::Type))]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatGptFailureIssue {
+    InvalidRequest,
+    SignedOut,
+    NotEligible,
+    UsageLimit,
+    Unavailable,
+    Unsupported,
+    Timeout,
+    Protocol,
+    Incomplete,
+    UsageUnavailable,
+    Cancelled,
+}
+
+impl ChatGptModelFault {
+    /// Preserve admission/limit semantics for both legacy and diagnostic faults.
+    pub const fn issue(self) -> ChatGptFailureIssue {
+        match self {
+            Self::SignedOut => ChatGptFailureIssue::SignedOut,
+            Self::UsageLimit => ChatGptFailureIssue::UsageLimit,
+            Self::Unavailable => ChatGptFailureIssue::Unavailable,
+            Self::NotEligible => ChatGptFailureIssue::NotEligible,
+            Self::Unsupported => ChatGptFailureIssue::Unsupported,
+            Self::Diagnostic { issue, .. } => issue,
+        }
+    }
+
+    /// No confirmed outcome is not a claim that nothing was sent or charged.
+    /// Admission refusals before dispatch retain their existing semantics.
+    pub const fn unknown_outcome(self) -> bool {
+        matches!(
+            self,
+            Self::Diagnostic {
+                stage: ChatGptFailureStage::Send
+                    | ChatGptFailureStage::Stream
+                    | ChatGptFailureStage::Complete,
+                ..
+            } | Self::Diagnostic {
+                stage: ChatGptFailureStage::Http,
+                status: Some(500..=599),
+                ..
+            } | Self::Diagnostic {
+                stage: ChatGptFailureStage::Http,
+                issue: ChatGptFailureIssue::Protocol | ChatGptFailureIssue::Timeout,
+                ..
+            }
+        )
+    }
 }
 
 /// Why Zephium Cloud refused, by its stable error codes. None of these is

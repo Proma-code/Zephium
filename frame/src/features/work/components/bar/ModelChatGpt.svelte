@@ -1,11 +1,8 @@
 <script lang="ts">
-  import { onDestroy } from "svelte";
-  import { settle } from "$domain/operations";
-  import { commands } from "$shared/ipc/bindings";
   import { ChatGptSession, chatGptFault, chatGptStatus } from "$domain/chatgpt";
   import Button from "$shared/ui/Button";
   import IconButton from "$shared/ui/IconButton";
-  import { ArrowReloadHorizontalIcon, ArrowUpRight01Icon, Plug01Icon } from "../../lib/icons";
+  import { ArrowReloadHorizontalIcon, Plug01Icon } from "../../lib/icons";
   import * as m from "$shared/i18n/messages";
 
   let { profile, hasModels }: { profile: string; hasModels: boolean } = $props();
@@ -23,26 +20,6 @@
   const signingIn = $derived(session?.signingIn ?? false);
   const busy = $derived(session?.busy ?? null);
   const status = $derived(chatGptStatus(view, signingIn));
-  let usagePending = $state(false);
-  let usageUnconfirmed = $state(false);
-  const lifetime = new AbortController();
-  onDestroy(() => lifetime.abort());
-
-  async function openUsage() {
-    if (usagePending) return;
-    usagePending = true;
-    usageUnconfirmed = false;
-    const result = await settle(
-      Promise.resolve().then(() =>
-        commands.browserOpenUrl("https://chatgpt.com/settings/usage", true),
-      ),
-      5000,
-      lifetime.signal,
-    );
-    if (lifetime.signal.aborted) return;
-    usagePending = false;
-    usageUnconfirmed = result.outcome !== "applied" && result.outcome !== "no_op";
-  }
 </script>
 
 <div class="connection" class:empty={!hasModels}>
@@ -63,12 +40,6 @@
           pending={busy === "sign_out"}
           disabled={!!busy}
           onclick={() => void session?.signOut()}
-        />
-        <IconButton
-          icon={ArrowUpRight01Icon}
-          label={m.ai_chatgpt_usage()}
-          pending={usagePending}
-          onclick={() => void openUsage()}
         />
       </div>
     {/if}
@@ -108,9 +79,6 @@
       {m.ai_chatgpt_observation_failed()}
     </p>{/if}
   {#if view?.error && !busy}<p class="fault" role="alert">{chatGptFault(view.error)}</p>{/if}
-  {#if usageUnconfirmed}<p class="fault" role="alert">
-      {m.ai_chatgpt_usage_unconfirmed()}
-    </p>{/if}
   {#if view?.revocation_unconfirmed}<p class="fault" role="alert">
       {m.ai_chatgpt_revocation()}
     </p>{/if}

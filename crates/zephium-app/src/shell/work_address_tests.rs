@@ -89,6 +89,7 @@ impl WorkModelClient for Script {
                     output_tokens: 100,
                     reasoning_tokens: 0,
                     cost_micros: None,
+                    ..WorkModelUsage::default()
                 },
                 assistant,
             })

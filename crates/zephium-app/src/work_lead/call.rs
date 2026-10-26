@@ -72,7 +72,10 @@ const UNPRICED: WorkModelPrice = WorkModelPrice {
 
 /// Tokens a call bills: fresh input and output. Cached input is charged in
 /// the cost at its own price but not counted against the token limit.
-pub(crate) fn usage(entry: &WorkModelEntry, usage: WorkModelUsage) -> WorkUsage {
+pub(crate) fn usage(entry: &WorkModelEntry, usage: WorkModelUsage) -> Option<WorkUsage> {
+    if !usage.is_reported() {
+        return None;
+    }
     let cached = usage.cached_input_tokens.min(usage.input_tokens);
     let fresh = usage.input_tokens - cached;
     let tokens = fresh.saturating_add(usage.output_tokens);
@@ -87,12 +90,12 @@ pub(crate) fn usage(entry: &WorkModelEntry, usage: WorkModelUsage) -> WorkUsage 
             WorkUsageAccounting::ConservativeReservation,
         ),
     };
-    WorkUsage {
+    Some(WorkUsage {
         model_tokens: u32::try_from(tokens).unwrap_or(u32::MAX),
         cost_micro_usd: u32::try_from(cost).unwrap_or(u32::MAX),
         operations: 1,
         accounting,
-    }
+    })
 }
 fn priced(price: &WorkModelPrice, fresh: u64, cached: u64, output: u64) -> u64 {
     let part = |tokens: u64, rate: u64| (u128::from(tokens) * u128::from(rate)).div_ceil(1_000_000);
@@ -100,6 +103,31 @@ fn priced(price: &WorkModelPrice, fresh: u64, cached: u64, output: u64) -> u64 {
         part(fresh, price.input) + part(cached, price.cached_input) + part(output, price.output),
     )
     .unwrap_or(u64::MAX)
+}
+
+fn unavailable_usage_error(source_id: &str) -> WorkModelError {
+    if source_id.starts_with("chatgpt/") {
+        WorkModelError::ChatGpt {
+            fault: ChatGptModelFault::Diagnostic {
+                stage: ChatGptFailureStage::Complete,
+                status: None,
+                issue: ChatGptFailureIssue::UsageUnavailable,
+                field: None,
+            },
+        }
+    } else if source_id.starts_with("gateway/") {
+        WorkModelError::Gateway {
+            fault: GatewayModelFault::UsageUnavailable,
+            usage_unknown: true,
+        }
+    } else if source_id.starts_with("opencode-go/") {
+        WorkModelError::OpenCodeGo {
+            fault: OpenCodeGoModelFault::UsageUnavailable,
+            usage_unknown: true,
+        }
+    } else {
+        WorkModelError::Protocol
+    }
 }
 
 fn protected_source_failure(
@@ -123,7 +151,7 @@ fn protected_source_failure(
                 reservation,
             })
         }
-        WorkModelError::ChatGpt { fault } if observed_output => {
+        WorkModelError::ChatGpt { fault } if observed_output || fault.unknown_outcome() => {
             Some(CallFailure::ChatGptUnknownOutcome { fault, reservation })
         }
         WorkModelError::OpenCodeGo {
@@ -200,7 +228,13 @@ pub(crate) async fn call(
             ) => result,
         };
         let error = match result {
+            Ok(Ok(outcome)) if !outcome.usage.is_reported() => {
+                unavailable_usage_error(&model.entry.id)
+            }
             Ok(Ok(outcome)) => {
+                let Some(charged) = usage(&model.entry, outcome.usage) else {
+                    return Err(CallFailure::Lost);
+                };
                 let first = first_event.load(std::sync::atomic::Ordering::Relaxed);
                 run.report(super::WorkLeadDiagnostic::ModelSettled {
                     role,
@@ -210,7 +244,6 @@ pub(crate) async fn call(
                     output_tokens: outcome.usage.output_tokens,
                     reasoning_tokens: outcome.usage.reasoning_tokens,
                 });
-                let charged = usage(&model.entry, outcome.usage);
                 run.charge(charged);
                 return Ok((outcome, charged));
             }
@@ -442,6 +475,69 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_stage_preserves_unknown_usage_before_any_delta_and_limits_remain_terminal() {
+        let remaining = WorkExecutionLimits {
+            model_tokens: 321,
+            cost_micro_usd: 654,
+            operations: 8,
+            timeout_seconds: 30,
+            max_workers: 1,
+        };
+        for (stage, status, unknown) in [
+            (ChatGptFailureStage::Request, None, false),
+            (ChatGptFailureStage::Credential, None, false),
+            (ChatGptFailureStage::Send, None, true),
+            (ChatGptFailureStage::Http, Some(401), false),
+            (ChatGptFailureStage::Http, Some(429), false),
+            (ChatGptFailureStage::Http, Some(408), false),
+            (ChatGptFailureStage::Http, Some(302), false),
+            (ChatGptFailureStage::Http, Some(500), true),
+            (ChatGptFailureStage::Http, Some(503), true),
+            (ChatGptFailureStage::Stream, Some(200), true),
+            (ChatGptFailureStage::Complete, Some(200), true),
+        ] {
+            for issue in [
+                ChatGptFailureIssue::Unavailable,
+                ChatGptFailureIssue::Timeout,
+                ChatGptFailureIssue::Protocol,
+                ChatGptFailureIssue::UsageLimit,
+                ChatGptFailureIssue::UsageUnavailable,
+                ChatGptFailureIssue::Cancelled,
+            ] {
+                let fault = ChatGptModelFault::Diagnostic {
+                    stage,
+                    status,
+                    issue,
+                    field: None,
+                };
+                let error = WorkModelError::ChatGpt { fault };
+                assert_eq!(fault.issue(), issue);
+                assert_eq!(retry_wait(error, 0), None);
+                let failure = protected_source_failure("chatgpt/fixture", error, false, remaining);
+                let expected_unknown = unknown
+                    || (stage == ChatGptFailureStage::Http
+                        && matches!(
+                            issue,
+                            ChatGptFailureIssue::Protocol | ChatGptFailureIssue::Timeout
+                        ));
+                assert_eq!(failure.is_some(), expected_unknown, "{fault:?}");
+                if let Some(CallFailure::ChatGptUnknownOutcome {
+                    fault: actual,
+                    reservation,
+                }) = failure
+                {
+                    assert_eq!(actual, fault);
+                    assert_eq!(reservation.model_tokens, remaining.model_tokens);
+                    assert_eq!(
+                        reservation.accounting,
+                        WorkUsageAccounting::ConservativeReservation
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn gateway_dispatch_uncertainty_reserves_budget_and_never_retries() {
         let remaining = WorkExecutionLimits {
             model_tokens: 1234,
@@ -529,6 +625,36 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_measurements_are_never_priced_as_zero() {
+        assert_eq!(usage(&entry(None), WorkModelUsage::unavailable()), None);
+        assert_eq!(
+            usage(&entry(Some(UNPRICED)), WorkModelUsage::unavailable()),
+            None
+        );
+        let error = unavailable_usage_error("chatgpt/fixture");
+        let remaining = WorkExecutionLimits {
+            model_tokens: 44,
+            cost_micro_usd: 55,
+            operations: 2,
+            timeout_seconds: 1,
+            max_workers: 1,
+        };
+        let Some(CallFailure::ChatGptUnknownOutcome { reservation, fault }) =
+            protected_source_failure("chatgpt/fixture", error, false, remaining)
+        else {
+            panic!("accounting halt")
+        };
+        assert_eq!(reservation.model_tokens, 44);
+        assert_eq!(reservation.cost_micro_usd, 55);
+        assert_eq!(
+            reservation.accounting,
+            WorkUsageAccounting::ConservativeReservation
+        );
+        assert_eq!(fault.issue(), ChatGptFailureIssue::UsageUnavailable);
+        assert_eq!(retry_wait(error, 0), None);
+    }
+
+    #[test]
     fn cached_input_is_priced_but_not_counted_against_the_token_limit() {
         let price = WorkModelPrice {
             input: 2_000_000,
@@ -544,8 +670,10 @@ mod tests {
                 output_tokens: 500,
                 reasoning_tokens: 0,
                 cost_micros: None,
+                ..WorkModelUsage::default()
             },
-        );
+        )
+        .unwrap();
         assert_eq!(used.model_tokens, 2_500);
         assert_eq!(used.cost_micro_usd, 4_000 + 1_600 + 4_000);
         assert_eq!(used.accounting, WorkUsageAccounting::Exact);
@@ -558,8 +686,10 @@ mod tests {
                 output_tokens: 100,
                 reasoning_tokens: 0,
                 cost_micros: None,
+                ..WorkModelUsage::default()
             },
-        );
+        )
+        .unwrap();
         assert_eq!(
             unpriced.accounting,
             WorkUsageAccounting::ConservativeReservation

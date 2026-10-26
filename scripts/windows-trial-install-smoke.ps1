@@ -1,13 +1,15 @@
 # Disposable GitHub-hosted runner only. Synthetic preservation, not real-app coexistence.
 param(
   [Parameter(Mandatory)][string] $ExpectedSourceRevision,
-  [Parameter(Mandatory)][string] $ExpectedInstallerSha256
+  [Parameter(Mandatory)][string] $ExpectedInstallerSha256,
+  [switch] $UpgradeFromDeliveredTrial
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . "$PSScriptRoot/windows-trial-install-checks.ps1"
 . "$PSScriptRoot/windows-trial-staging-checks.ps1"
 . "$PSScriptRoot/windows-trial-binary-identity.ps1"
+. "$PSScriptRoot/windows-trial-upgrade-checks.ps1"
 $context = @{
   actions = "$env:GITHUB_ACTIONS"; repository = "$env:GITHUB_REPOSITORY"; event = "$env:GITHUB_EVENT_NAME"
   ref = "$env:GITHUB_REF"; runner = "$env:RUNNER_ENVIRONMENT"; os = "$env:RUNNER_OS"
@@ -144,7 +146,7 @@ function Remove-OwnedFixtures {
 }
 
 Push-Location $root
-$uninstaller = $null; $uninstallerHash = $null; $uninstalled = $false
+$uninstaller = $null; $uninstallerHash = $null; $uninstalled = $false; $upgradeCredential = $null; $baseline = $null
 try {
   $revision = (git rev-parse HEAD).Trim()
   if ($LASTEXITCODE -ne 0) { throw 'Cannot read workflow source revision.' }
@@ -184,6 +186,10 @@ try {
   Assert-TrialBinaryIdentityInfo -Info $info -Identity $binaryIdentity
   $binaryHash = $binaryIdentity.NsisSha256
   Write-Output 'PASS: generated NSIS payload source is the exact built trial executable.'
+  if ($UpgradeFromDeliveredTrial) {
+    Assert-DistinctTrialUpgrade -Candidate $info -InstallerSha256 $ExpectedInstallerSha256
+    $baseline = Expand-DeliveredTrialBaseline
+  }
 
   $profileRoot = [Environment]::GetFolderPath('UserProfile')
   $local = [Environment]::GetFolderPath('LocalApplicationData')
@@ -269,15 +275,15 @@ try {
     }
     Assert-NoAppProcess
   }
-  function Assert-TrialInstalled {
+  function Assert-TrialInstalled([string] $ExpectedPayloadHash = $binaryHash) {
     $exe = Join-Path $trialDirectory 'zephium-subscription-trial.exe'; Assert-NoReparse $exe
     $installedHash = Get-Hash $exe
     $installedProduct = (Get-Item -LiteralPath $exe).VersionInfo.ProductName
-    $hashMatches = $installedHash -ceq $binaryHash
+    $hashMatches = $installedHash -ceq $ExpectedPayloadHash
     $productMatches = $installedProduct -ceq 'Zephium Subscription Trial'
     Write-Output "Installed trial identity: bytes_match=$hashMatches; product_match=$productMatches; product_length=$(([string]$installedProduct).Length)."
-    if (-not $hashMatches) { Write-Output "Expected NSIS SHA256=$binaryHash; installed SHA256=$installedHash." }
-    Assert-TrialInstalledBinary -ActualHash $installedHash -ExpectedHash $binaryHash -ProductName $installedProduct
+    if (-not $hashMatches) { Write-Output "Expected NSIS SHA256=$ExpectedPayloadHash; installed SHA256=$installedHash." }
+    Assert-TrialInstalledBinary -ActualHash $installedHash -ExpectedHash $ExpectedPayloadHash -ProductName $installedProduct
     $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($trialKey, $false)
     if ($null -eq $key) { throw 'Missing trial uninstall registration.' }
     try {
@@ -301,8 +307,13 @@ try {
     # _?= must be last and unquoted for NSIS; fixed runner-owned path, no user input.
     Invoke-InstallerProcess $copy ("/S _?=$trialDirectory") $uninstallerHash
   }
-  Invoke-InstallerProcess $installer '/S' $ExpectedInstallerSha256
-  Assert-TrialInstalled
+  if ($UpgradeFromDeliveredTrial) {
+    Invoke-InstallerProcess $baseline.InstallerPath '/S' $baseline.InstallerSha256
+    Assert-TrialInstalled -ExpectedPayloadHash $baseline.PayloadSha256
+  } else {
+    Invoke-InstallerProcess $installer '/S' $ExpectedInstallerSha256
+    Assert-TrialInstalled
+  }
   $uninstaller = Join-Path $trialDirectory 'uninstall.exe'; Assert-NoReparse $uninstaller; $uninstallerHash = Get-Hash $uninstaller
   Assert-ProductionPreserved
   Write-Output 'PASS: silent trial install; synthetic production files, registry, shortcuts and browser choices preserved. App not launched.'
@@ -310,10 +321,24 @@ try {
   New-FixtureDirectory $trialLocalData; Save-FixtureFile (Join-Path $trialLocalData 'retained-fixture.txt') "synthetic:$fixtureId"
   Save-FixtureValue $runKey 'Zephium Subscription Trial' "synthetic-fixture:$fixtureId" String
   Save-FixtureValue $approvedKey 'Zephium Subscription Trial' ([byte[]](3,0,0,0,0,0,0,0,0,0,0,0)) Binary
+  if ($UpgradeFromDeliveredTrial) {
+    Save-FixtureFile (Join-Path $trialData 'upgrade-smoke-settings.json') (@{ fixture = $fixtureId; synthetic = $true; theme = 'dark'; note = 'Installer preservation fixture, not application DB or account state.' } | ConvertTo-Json -Compress)
+    Add-Type -Path "$PSScriptRoot/windows-trial-upgrade-credential.cs"
+    $upgradeCredential = [ZephiumTrialUpgradeCredential]::Create()
+    if (-not $upgradeCredential.IsUnchanged()) { throw 'Synthetic credential fixture was not established.' }
+    Invoke-InstallerProcess $installer '/S /UPDATE' $ExpectedInstallerSha256
+    Assert-TrialInstalled; Assert-ProductionPreserved
+    foreach ($entry in $fixtureFiles) { if ((Get-Hash $entry.path) -cne $entry.hash) { throw 'Different-build replacement changed a fixture.' } }
+    foreach ($entry in $fixtureValues) { if ((Read-RegistryValue $entry.path $entry.name) -cne $entry.snapshot) { throw 'Different-build replacement changed fixture startup state.' } }
+    if (-not $upgradeCredential.IsUnchanged()) { throw 'Different-build replacement changed the exact synthetic credential fixture.' }
+    $uninstallerHash = Get-Hash $uninstaller
+    Write-Output "PASS: delivered c4956618 -> $($info.sourceRevision) different-build replacement preserved synthetic settings-file/credential/startup and production sentinels; installed payload identity verified."
+  }
   Invoke-InstallerProcess $installer '/S /UPDATE' $ExpectedInstallerSha256
   Assert-TrialInstalled; Assert-ProductionPreserved
   foreach ($entry in $fixtureFiles) { if ((Get-Hash $entry.path) -cne $entry.hash) { throw 'In-place reinstall changed a fixture.' } }
   foreach ($entry in $fixtureValues) { if ((Read-RegistryValue $entry.path $entry.name) -cne $entry.snapshot) { throw 'In-place reinstall changed fixture startup state.' } }
+  if ($null -ne $upgradeCredential -and -not $upgradeCredential.IsUnchanged()) { throw 'Same-artifact reinstall changed the synthetic credential fixture.' }
   $uninstallerHash = Get-Hash $uninstaller
   Write-Output 'PASS: same-artifact in-place reinstall retained synthetic trial data/startup state; production sentinels preserved.'
   Remove-TrialInstallation
@@ -327,8 +352,9 @@ try {
     if ((Read-RegistryValue $key 'Zephium Subscription Trial') -cne 'absent') { throw 'Trial startup fixture remains after uninstall.' }
   }
   foreach ($entry in $fixtureFiles) { if ((Get-Hash $entry.path) -cne $entry.hash) { throw 'Ordinary uninstall removed retained fixture data.' } }
+  if ($null -ne $upgradeCredential -and -not $upgradeCredential.IsUnchanged()) { throw 'Ordinary uninstall changed the synthetic credential fixture.' }
   Write-Output 'PASS: silent uninstall removed trial registration/shortcuts/startup values, retained synthetic trial data, preserved production sentinels.'
-  Write-Output 'LIMIT: synthetic installer smoke only; no real production app, app launch, UI, credentials, account flow or higher-version upgrade was tested.'
+  Write-Output 'LIMIT: synthetic installer preservation only; no real production app, app launch, UI, real credentials, account flow, database migration or higher-version semantics were tested.'
 } finally {
   # Never remove unknown trees or restore pre-existing state. A partial/unverified
   # installation is left to disposable-runner teardown, not guessed cleanup.
@@ -338,7 +364,10 @@ try {
     }
     if ($script:cleanupUnsafe) {
       Write-Warning 'Process custody is uncertain: no further installer or fixture cleanup attempted. Dispose of this hosted runner.'
-    } else { Remove-OwnedFixtures }
+    } else {
+      try { if ($null -ne $upgradeCredential) { $upgradeCredential.RemoveOwned() } }
+      finally { Remove-OwnedFixtures }
+    }
   } finally {
     Pop-Location
   }

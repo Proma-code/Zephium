@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use sha2::{Digest as _, Sha256};
 use zephium_core::work::model::{
-    ChatGptModelFault, GatewayModelFault, HostedRefusal, OpenCodeGoModelFault, WorkModelClient,
+    ChatGptFailureIssue, GatewayModelFault, HostedRefusal, OpenCodeGoModelFault, WorkModelClient,
     WorkModelEntry, WorkModelError, WorkModelEvent, WorkModelPrice, WorkModelRef, WorkModelUsage,
 };
 
@@ -157,6 +157,9 @@ impl AgentProviderModelClient {
     /// What `usage` costs at this model's rates: cached and written input at
     /// their own rates, the rest of the input and all output at theirs.
     pub(super) fn usage_cost_micro_usd(&self, usage: &WorkModelUsage) -> Option<u64> {
+        if !usage.is_reported() {
+            return None;
+        }
         let cached = usage.cached_input_tokens.min(usage.input_tokens);
         let written = usage
             .cache_write_input_tokens
@@ -221,6 +224,12 @@ impl AgentProviderModelClient {
                     )
                 }
             };
+            if !outcome.usage.is_reported() {
+                return format!(
+                    "usage=unavailable elapsed_ms={}",
+                    started.elapsed().as_millis()
+                );
+            }
             match (asked_again < MAX_REASKS)
                 .then(|| contract.reask(&outcome, &request.tools))
                 .flatten()
@@ -295,6 +304,9 @@ const RUNAWAY_REASK_OUTPUT: u64 = 512;
 const REASK_INPUT_ALLOWANCE: u64 = 1_024;
 
 fn added(spent: WorkModelUsage, more: WorkModelUsage) -> WorkModelUsage {
+    if !spent.is_reported() || !more.is_reported() {
+        return WorkModelUsage::unavailable();
+    }
     WorkModelUsage {
         input_tokens: spent.input_tokens.saturating_add(more.input_tokens),
         cached_input_tokens: spent
@@ -309,6 +321,7 @@ fn added(spent: WorkModelUsage, more: WorkModelUsage) -> WorkModelUsage {
             .cost_micros
             .zip(more.cost_micros)
             .map(|(spent, more)| spent.saturating_add(more)),
+        ..WorkModelUsage::default()
     }
 }
 
@@ -328,15 +341,15 @@ const fn failure_for(error: WorkModelError) -> AgentProviderFailure {
         WorkModelError::OverBudget | WorkModelError::PlanLimit => {
             AgentProviderFailureClass::Provider
         }
-        WorkModelError::ChatGpt { fault } => match fault {
-            ChatGptModelFault::SignedOut => AgentProviderFailureClass::Authentication,
-            ChatGptModelFault::NotEligible => AgentProviderFailureClass::Permission,
-            ChatGptModelFault::Unsupported => AgentProviderFailureClass::InvalidRequest,
-            // These are terminal for this attempt, not an invitation to retry
-            // a possibly billed request or to rotate credentials.
-            ChatGptModelFault::UsageLimit | ChatGptModelFault::Unavailable => {
-                AgentProviderFailureClass::Provider
+        WorkModelError::ChatGpt { fault } => match fault.issue() {
+            ChatGptFailureIssue::SignedOut => AgentProviderFailureClass::Authentication,
+            ChatGptFailureIssue::NotEligible => AgentProviderFailureClass::Permission,
+            ChatGptFailureIssue::Cancelled => AgentProviderFailureClass::Cancelled,
+            ChatGptFailureIssue::Unsupported | ChatGptFailureIssue::InvalidRequest => {
+                AgentProviderFailureClass::InvalidRequest
             }
+            // Explicit-source diagnostics are terminal, never transport retries.
+            _ => AgentProviderFailureClass::Provider,
         },
         WorkModelError::OpenCodeGo { fault, .. } => match fault {
             OpenCodeGoModelFault::NotConfigured | OpenCodeGoModelFault::Unauthorized => {
@@ -475,6 +488,14 @@ impl AgentProviderAttempt {
                     ))
                 }
             };
+            if !outcome.usage.is_reported() {
+                // A complete plain answer can be valid without measurements,
+                // but this budgeted browser turn must not reask or run tools.
+                return self.finish_terminal(protocol_decoder_failure(
+                    crate::AgentProviderProtocolError::Usage,
+                    None,
+                ));
+            }
             let last = outcome.usage;
             spent = if reasks == 0 {
                 last

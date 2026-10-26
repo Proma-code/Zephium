@@ -1701,6 +1701,7 @@ fn parse_usage(value: &Value, wire: WorkModelWire) -> Result<(WorkModelUsage, Go
             cache_write_input_tokens: 0,
             reasoning_tokens: reasoning,
             cost_micros: None,
+            ..WorkModelUsage::default()
         },
         GoBilling {
             source,

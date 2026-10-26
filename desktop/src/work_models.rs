@@ -72,11 +72,12 @@ pub(crate) struct WorkLockedPlanV1 {
     pub(crate) plan: Option<String>,
 }
 
-/// The efforts one entry takes as the lead, weakest first.
+/// The efforts one entry takes, weakest first, and its current profile selection.
 #[derive(Clone, Debug, Serialize, Deserialize, specta::Type)]
 pub(crate) struct WorkModelEffortsV1 {
     pub(crate) id: String,
     pub(crate) levels: Vec<WorkModelReasoning>,
+    pub(crate) effort: Option<WorkModelReasoning>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, specta::Type)]
@@ -245,7 +246,7 @@ mod product {
             efforts: view
                 .efforts
                 .into_iter()
-                .map(|(id, levels)| WorkModelEffortsV1 { id, levels })
+                .map(|(id, levels, effort)| WorkModelEffortsV1 { id, levels, effort })
                 .collect(),
             effort: view.effort,
         }

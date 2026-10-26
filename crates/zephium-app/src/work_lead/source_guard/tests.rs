@@ -630,3 +630,129 @@ async fn malformed_go_identity_provider_and_wire_never_dispatch() {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }
+
+#[tokio::test]
+async fn completed_text_with_unknown_usage_blocks_work_reasks_and_other_roles() {
+    struct Unknown(Arc<AtomicUsize>);
+    impl WorkModelClient for Unknown {
+        fn call<'a>(
+            &'a self,
+            _: WorkModelRequest,
+            _: &'a (dyn Fn(WorkModelEvent) + Send + Sync),
+        ) -> WorkModelFuture<'a> {
+            Box::pin(async move {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let mut response = outcome();
+                response.usage = WorkModelUsage::unavailable();
+                Ok(response)
+            })
+        }
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    for expected_calls in [1, 2] {
+        let models = guard_run_sources(
+            profile(),
+            group(
+                "chatgpt",
+                [
+                    ready(&calls, None),
+                    Arc::new(Unknown(calls.clone())),
+                    ready(&calls, None),
+                ],
+            ),
+        );
+        for model in [&models.page, &models.light, &models.lead] {
+            let error = model
+                .client
+                .call(request(model), &|_| panic!("no tool side effect"))
+                .await
+                .err()
+                .unwrap();
+            let WorkModelError::ChatGpt { fault } = error else {
+                panic!("source-specific halt")
+            };
+            assert_eq!(fault.issue(), ChatGptFailureIssue::UsageUnavailable);
+            assert!(fault.unknown_outcome());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+    }
+}
+
+#[tokio::test]
+async fn exact_chatgpt_unknown_tool_usage_never_reaches_work_callbacks_or_another_role() {
+    struct WireFixture {
+        calls: Arc<AtomicUsize>,
+        response: Vec<u8>,
+    }
+    impl WorkModelClient for WireFixture {
+        fn call<'a>(
+            &'a self,
+            request: WorkModelRequest,
+            events: &'a (dyn Fn(WorkModelEvent) + Send + Sync),
+        ) -> WorkModelFuture<'a> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                zephium_chatgpt::inference::fixture_call(&request, &self.response, events)
+                    .map(|(_, outcome)| outcome)
+            })
+        }
+    }
+    for missing in [true, false] {
+        let mut response = serde_json::json!({
+            "type":"response.completed",
+            "response":{
+                "status":"completed",
+                "output":[{"type":"function_call","call_id":"call_1",
+                    "namespace":"zephium","name":"read_page","arguments":"{}"}],
+                "usage":null
+            }
+        });
+        if missing {
+            response["response"]
+                .as_object_mut()
+                .unwrap()
+                .remove("usage");
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = Arc::new(WireFixture {
+            calls: calls.clone(),
+            response: format!("data: {response}\n\n").into_bytes(),
+        });
+        let models = guard_run_sources(
+            profile(),
+            group(
+                "chatgpt",
+                [ready(&calls, None), client, ready(&calls, None)],
+            ),
+        );
+        let events = AtomicUsize::new(0);
+        for model in [&models.page, &models.light, &models.lead] {
+            let mut request = request(model);
+            request.tools.push(WorkModelTool {
+                name: "read_page".into(),
+                description: "Read the current page fixture".into(),
+                schema: serde_json::json!({"type":"object","properties":{},"additionalProperties":false}),
+                strict: true,
+            });
+            let error = model
+                .client
+                .call(request, &|_| {
+                    events.fetch_add(1, Ordering::SeqCst);
+                })
+                .await
+                .err()
+                .unwrap();
+            let WorkModelError::ChatGpt { fault } = error else {
+                panic!("source-specific accounting halt");
+            };
+            assert_eq!(fault.issue(), ChatGptFailureIssue::UsageUnavailable);
+            assert!(fault.unknown_outcome());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no role-based reask");
+        assert_eq!(
+            events.load(Ordering::SeqCst),
+            0,
+            "no early tool side effect"
+        );
+    }
+}

@@ -254,3 +254,34 @@ async fn nothing_is_sent_past_the_budget_for_a_secret_or_for_another_model() {
     assert!(reserved.model_tokens > SEARCH_CONTEXT_TOKENS);
     assert!(reserved.cost_micro_usd > 0);
 }
+
+#[tokio::test]
+async fn unavailable_usage_never_produces_zero_cost_search_evidence() {
+    let (search, client) = search(
+        Box::new(|| {
+            let mut response = outcome(Some(0));
+            response.usage = WorkModelUsage::unavailable();
+            (
+                vec![WorkModelEvent::Text("complete answer".into())],
+                Ok(response),
+            )
+        }),
+        Some(haiku_price()),
+    );
+    let expected = search.minimum_reservation(&scope("query"), &[]).unwrap();
+    let error = search
+        .search(&scope("query"), &[], limits())
+        .await
+        .err()
+        .unwrap();
+    let WorkPublicSearchError::Rejected(reserved) = error else {
+        panic!("must reserve, not invent evidence")
+    };
+    assert_eq!(reserved.model_tokens, expected.model_tokens);
+    assert_eq!(reserved.cost_micro_usd, expected.cost_micro_usd);
+    assert_eq!(
+        reserved.accounting,
+        WorkUsageAccounting::ConservativeReservation
+    );
+    assert_eq!(client.requests.lock().unwrap().len(), 1);
+}

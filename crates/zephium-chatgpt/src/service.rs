@@ -15,7 +15,8 @@ use crate::oauth::{AuthError, Authorization, Client, LoginAttempt};
 use crate::token::{Identity, Tokens};
 use crate::vault::{AccountVault, PendingRegistration, Stored, VaultError};
 use zephium_core::work::model::{
-    ChatGptModelFault, WorkModelError, WorkModelEvent, WorkModelOutcome, WorkModelRequest,
+    ChatGptFailureIssue, ChatGptFailureStage, ChatGptModelFault, WorkModelError, WorkModelEvent,
+    WorkModelOutcome, WorkModelRequest,
 };
 
 /// User callback deadline, not reset by invalid callback traffic.
@@ -1112,12 +1113,26 @@ impl Service {
                     .ok_or_else(|| work_fault(Fault::Invalid))?,
             }
         };
-        let tokens = self.credential_for(Some(scope)).await.map_err(work_fault)?;
+        let tokens = self.credential_for(Some(scope)).await.map_err(|fault| {
+            crate::inference::diagnose(
+                ChatGptFailureStage::Credential,
+                None,
+                if fault == Fault::Cancelled {
+                    WorkModelError::Cancelled
+                } else {
+                    work_fault(fault)
+                },
+            )
+        })?;
         if !self.accepts(lease, &request.model.model) {
             return Err(work_fault(Fault::SessionExpired));
         }
         if cancellation.has_changed().unwrap_or(true) {
-            return Err(work_fault(Fault::Cancelled));
+            return Err(crate::inference::diagnose(
+                ChatGptFailureStage::Credential,
+                None,
+                WorkModelError::Cancelled,
+            ));
         }
         let fence = cancellation.clone();
         let fenced_events = |event| {
@@ -1127,11 +1142,15 @@ impl Service {
         };
         let result = tokio::select! {
             biased;
-            _ = cancellation.changed() => Err(work_fault(Fault::Cancelled)),
+            _ = cancellation.changed() => Err(crate::inference::diagnose(ChatGptFailureStage::Send, None, WorkModelError::Cancelled)),
             result = self.transport.call(&tokens, request, &fenced_events) => result,
         };
         if fence.has_changed().unwrap_or(true) {
-            Err(work_fault(Fault::Cancelled))
+            Err(crate::inference::diagnose(
+                ChatGptFailureStage::Send,
+                None,
+                WorkModelError::Cancelled,
+            ))
         } else {
             result
         }
@@ -1267,12 +1286,12 @@ fn work_fault(fault: Fault) -> WorkModelError {
 
 fn model_fault(error: WorkModelError) -> Fault {
     match error {
-        WorkModelError::ChatGpt { fault } => match fault {
-            ChatGptModelFault::SignedOut => Fault::SessionExpired,
-            ChatGptModelFault::UsageLimit => Fault::UsageLimit,
-            ChatGptModelFault::Unavailable => Fault::Offline,
-            ChatGptModelFault::NotEligible => Fault::Denied,
-            ChatGptModelFault::Unsupported => Fault::Protocol,
+        WorkModelError::ChatGpt { fault } => match fault.issue() {
+            ChatGptFailureIssue::SignedOut => Fault::SessionExpired,
+            ChatGptFailureIssue::UsageLimit => Fault::UsageLimit,
+            ChatGptFailureIssue::Unavailable | ChatGptFailureIssue::Timeout => Fault::Offline,
+            ChatGptFailureIssue::NotEligible => Fault::Denied,
+            _ => Fault::Protocol,
         },
         WorkModelError::Unauthorized | WorkModelError::MissingKey => Fault::SessionExpired,
         WorkModelError::RateLimited { .. }
@@ -1464,6 +1483,10 @@ mod tests {
         models_started: Notify,
         models_release: Notify,
         block_models: AtomicBool,
+        allow_calls: AtomicBool,
+        calls: AtomicUsize,
+        call_started: Notify,
+        block_call: AtomicBool,
         revoked: StdMutex<Vec<String>>,
         revoke_fails: AtomicBool,
     }
@@ -1504,16 +1527,46 @@ mod tests {
                     self.models_release.notified().await;
                     return Err(work_fault(Fault::UsageLimit));
                 }
-                Ok(Vec::new())
+                Ok(if self.allow_calls.load(Ordering::SeqCst) {
+                    vec![Model {
+                        slug: "gpt-6.1-sol".into(),
+                        display_name: "Fixture".into(),
+                    }]
+                } else {
+                    Vec::new()
+                })
             })
         }
         fn call<'a>(
             &'a self,
             _: &'a Tokens,
-            _: WorkModelRequest,
-            _: &'a (dyn Fn(WorkModelEvent) + Send + Sync),
+            request: WorkModelRequest,
+            events: &'a (dyn Fn(WorkModelEvent) + Send + Sync),
         ) -> PortFuture<'a, Result<WorkModelOutcome, WorkModelError>> {
-            Box::pin(async { panic!("no inference request expected") })
+            Box::pin(async move {
+                assert!(
+                    self.allow_calls.load(Ordering::SeqCst),
+                    "no inference request expected"
+                );
+                InferenceClient::validate_request(&request)?;
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.call_started.notify_one();
+                if self.block_call.load(Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
+                }
+                events(WorkModelEvent::Text("fixture response".into()));
+                Ok(WorkModelOutcome {
+                    assistant: vec![zephium_core::work::model::WorkModelPart::Text(
+                        "fixture response".into(),
+                    )],
+                    stop: zephium_core::work::model::WorkModelStop::EndTurn,
+                    usage: zephium_core::work::model::WorkModelUsage {
+                        input_tokens: 8,
+                        output_tokens: 2,
+                        ..Default::default()
+                    },
+                })
+            })
         }
     }
     fn fixture(tokens: Option<Tokens>) -> (Arc<Service>, Arc<MemoryVault>, Arc<Fake>) {
@@ -1539,6 +1592,102 @@ mod tests {
             tasks: Arc::new(Tasks::default()),
         });
         (service, vault, transport)
+    }
+
+    fn inference_request() -> WorkModelRequest {
+        use zephium_core::work::model::*;
+        WorkModelRequest {
+            image_fence: None,
+            model: WorkModelRef {
+                provider: WorkModelProvider::OpenAi,
+                wire: WorkModelWire::OpenAiResponses,
+                model: "gpt-6.1-sol".into(),
+            },
+            system: vec![],
+            tools: vec![],
+            messages: vec![WorkModelMessage::User(vec![WorkModelPart::Text(
+                "مرحبا".into(),
+            )])],
+            max_output_tokens: 100,
+            reasoning: Some(WorkModelReasoning::High),
+            native_search: false,
+            parallel_tools: false,
+            tool_choice: WorkModelToolChoice::Auto,
+            volatile_tail: 0,
+            cache_key: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn synthetic_grant_catalog_and_real_service_admission_complete_one_call() {
+        let (service, vault, transport) = fixture(None);
+        transport.allow_calls.store(true, Ordering::SeqCst);
+        assert!(!service.view().connected);
+        {
+            let mut state = service.state.write().unwrap();
+            state.signing_in = true;
+            state.attempt = Some(ATTEMPT.into());
+        }
+        service
+            .finish_login(0, Ok(token("synthetic-grant", u64::MAX)))
+            .await;
+        assert!(service.view().connected);
+        assert_eq!(service.view().models, 1);
+        assert!(vault.record.lock().unwrap().is_some());
+        let lease = service.lease().unwrap();
+        let events = StdMutex::new(Vec::new());
+        let result = service
+            .call(lease, inference_request(), &|event| {
+                events.lock().unwrap().push(event)
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.usage.input_tokens, 8);
+        assert_eq!(result.usage.output_tokens, 2);
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(events.lock().unwrap().len(), 1);
+        assert_eq!(transport.refreshes.load(Ordering::SeqCst), 0);
+        service.refresh_models().await.unwrap();
+        assert!(service.accepts(lease, "gpt-6.1-sol"));
+        service.sign_out().await.unwrap();
+        assert!(!service.accepts(lease, "gpt-6.1-sol"));
+        assert!(service
+            .call(lease, inference_request(), &|_| panic!("stale output"))
+            .await
+            .is_err());
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_transport_admission_is_not_an_uncharged_auth_refusal() {
+        let (service, _, transport) = fixture(Some(token("synthetic", u64::MAX)));
+        transport.allow_calls.store(true, Ordering::SeqCst);
+        transport.block_call.store(true, Ordering::SeqCst);
+        service.refresh_models().await.unwrap();
+        let lease = service.lease().unwrap();
+        let call = tokio::spawn({
+            let service = service.clone();
+            async move {
+                service
+                    .call(lease, inference_request(), &|_| {
+                        panic!("cancelled output must not escape")
+                    })
+                    .await
+            }
+        });
+        transport.call_started.notified().await;
+        service.set_foreground(false);
+        let Err(error) = call.await.unwrap() else {
+            panic!("expected cancellation")
+        };
+        let WorkModelError::ChatGpt { fault } = error else {
+            panic!("expected closed source fault")
+        };
+        assert_eq!(fault.issue(), ChatGptFailureIssue::Cancelled);
+        assert!(fault.unknown_outcome());
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+        assert!(service.state.read().unwrap().tokens.is_some());
+        assert!(transport.revoked.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2123,7 +2272,14 @@ mod tests {
         service.set_foreground(false);
         service.set_foreground(true);
         drop(held);
-        assert_eq!(call.await.unwrap(), Some(work_fault(Fault::Cancelled)));
+        assert_eq!(
+            call.await.unwrap(),
+            Some(crate::inference::diagnose(
+                ChatGptFailureStage::Credential,
+                None,
+                WorkModelError::Cancelled
+            ))
+        );
         assert_eq!(transport.refreshes.load(Ordering::SeqCst), 0);
     }
     #[tokio::test]

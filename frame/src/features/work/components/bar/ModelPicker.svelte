@@ -7,6 +7,7 @@
   import {
     ModelsSession,
     effortLevels,
+    modelEffort,
     effortName,
     entryOf,
     favourites,
@@ -62,11 +63,23 @@
   const uid = $props.id();
 
   let session = $state.raw<ModelsSession | null>(null);
+  let effortGeneration = 0;
+  let wanted: WorkModelReasoning | null = null;
+  let sending = false;
   $effect(() => {
     const owner = new ModelsSession(profile);
     session = owner;
     void owner.start();
-    return () => owner.dispose();
+    return () => {
+      owner.dispose();
+      if (session === owner) {
+        session = null;
+        effortGeneration++;
+        wanted = null;
+        sending = false;
+        intent = null;
+      }
+    };
   });
 
   onMount(() => {
@@ -244,8 +257,9 @@
   /** The effort the person last set while the menu is open, ahead of Rust's answer. */
   let intent = $state<WorkModelReasoning | null>(null);
   const levels = $derived(effortLevels(models, chosen));
+  const resolvedEffort = $derived(modelEffort(models, chosen));
   const effort = $derived<WorkModelReasoning | null>(
-    levels.length ? (intent ? nearestEffort(levels, intent) : (models?.effort ?? null)) : null,
+    levels.length ? (intent ? nearestEffort(levels, intent) : resolvedEffort) : null,
   );
 
   const card = $derived.by<CardSubject | null>(() => {
@@ -411,18 +425,22 @@
   }
 
   /** Each change goes to Rust in turn; a newer one waits for the last to land. */
-  let wanted: WorkModelReasoning | null = null;
-  let sending = false;
   async function setEffort(level: WorkModelReasoning) {
+    const owner = session;
+    if (!owner) return;
     intent = level;
     wanted = level;
     if (sending) return;
+    const generation = effortGeneration;
+    const owns = () => session === owner && generation === effortGeneration;
     sending = true;
     try {
-      while (session && wanted && wanted !== models?.effort) {
+      while (owns() && wanted && wanted !== resolvedEffort) {
         const asked: WorkModelReasoning = wanted;
-        if (!(await session.setEffort(asked))) {
-          if (session.busy) {
+        const accepted = await owner.setEffort(asked);
+        if (!owns()) return;
+        if (!accepted) {
+          if (owner.busy) {
             await new Promise((done) => setTimeout(done, 60));
             continue;
           }
@@ -433,7 +451,7 @@
         if (wanted === asked) wanted = null;
       }
     } finally {
-      sending = false;
+      if (owns()) sending = false;
     }
   }
 

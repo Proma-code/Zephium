@@ -114,6 +114,7 @@ fn outcome(stop: WorkModelStop, assistant: Vec<WorkModelPart>) -> WorkModelOutco
             output_tokens: 5,
             reasoning_tokens: 4,
             cost_micros: None,
+            ..WorkModelUsage::default()
         },
         assistant,
     }
@@ -634,4 +635,73 @@ fn gateway_failures_never_become_retriable_transport_classes() {
             AgentProviderFailureClass::Provider
         );
     }
+}
+
+#[test]
+fn chatgpt_diagnostics_never_become_retryable_transport_failures() {
+    use zephium_core::work::model::{ChatGptFailureIssue, ChatGptFailureStage, ChatGptModelFault};
+    for issue in [
+        ChatGptFailureIssue::Timeout,
+        ChatGptFailureIssue::Unavailable,
+        ChatGptFailureIssue::UsageLimit,
+        ChatGptFailureIssue::Protocol,
+        ChatGptFailureIssue::Incomplete,
+        ChatGptFailureIssue::UsageUnavailable,
+    ] {
+        let failure = failure_for(WorkModelError::ChatGpt {
+            fault: ChatGptModelFault::Diagnostic {
+                stage: ChatGptFailureStage::Stream,
+                status: Some(200),
+                issue,
+                field: None,
+            },
+        });
+        assert_eq!(failure.class(), AgentProviderFailureClass::Provider);
+        assert!(failure.retry_after().is_none());
+    }
+    let failure = failure_for(WorkModelError::ChatGpt {
+        fault: ChatGptModelFault::Diagnostic {
+            stage: ChatGptFailureStage::Send,
+            status: None,
+            issue: ChatGptFailureIssue::Cancelled,
+            field: None,
+        },
+    });
+    assert_eq!(failure.class(), AgentProviderFailureClass::Cancelled);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_usage_stops_before_reask_tools_and_pricing() {
+    let mut reply = outcome(
+        WorkModelStop::EndTurn,
+        vec![WorkModelPart::Text("complete plain answer".into())],
+    );
+    reply.usage = WorkModelUsage::unavailable();
+    let client = Scripted::answering(Ok(reply));
+    let (mut policy, model, result) = run(client.clone()).await;
+    assert_eq!(client.seen.lock().unwrap().len(), 1);
+    assert_eq!(
+        model.usage_cost_micro_usd(&WorkModelUsage::unavailable()),
+        None
+    );
+    assert_eq!(
+        result.usage_knowledge(),
+        AgentProviderUsageKnowledge::UnknownAfterDispatch
+    );
+    let AgentProviderPolicySettlement::Immediate(settlement) = result.into_policy_settlement()
+    else {
+        panic!("unknown usage is never priced")
+    };
+    assert_eq!(
+        settlement.usage_accounting(),
+        AgentModelUsageAccounting::ReservationCeiling
+    );
+    assert_eq!(
+        settlement.settlement(),
+        AgentModelCallSettlement::ProviderFailed
+    );
+    settlement.settle(&mut policy).unwrap();
+    assert_eq!(policy.pending_model_calls(), 0);
+    assert!(!added(WorkModelUsage::default(), WorkModelUsage::unavailable()).is_reported());
+    assert!(!added(WorkModelUsage::unavailable(), WorkModelUsage::default()).is_reported());
 }

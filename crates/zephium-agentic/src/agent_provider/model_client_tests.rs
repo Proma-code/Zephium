@@ -314,6 +314,7 @@ fn reply(stop: WorkModelStop, assistant: Vec<WorkModelPart>) -> WorkModelOutcome
             output_tokens: 20,
             reasoning_tokens: 30,
             cost_micros: None,
+            ..WorkModelUsage::default()
         },
         assistant,
     }
@@ -612,4 +613,18 @@ fn a_model_turn_without_its_call_is_refused() {
         .unwrap()
         .push(json!({"type": "zephium_model_turn", "call_id": "toolu_1", "parts": []}));
     assert!(translate(&config, &model(), false, &bytes(&body)).is_err());
+}
+
+#[test]
+fn unavailable_usage_cannot_become_a_measured_tool_receipt() {
+    let (config, contract) = contract();
+    let mut response = reply(
+        WorkModelStop::EndTurn,
+        vec![WorkModelPart::Text("complete".into())],
+    );
+    response.usage = WorkModelUsage::unavailable();
+    assert_eq!(
+        contract.finish(identity(), &config, response).err(),
+        Some(AgentProviderProtocolError::Usage)
+    );
 }

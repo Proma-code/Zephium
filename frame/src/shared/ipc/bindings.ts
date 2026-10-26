@@ -1151,6 +1151,37 @@ export type ChangedNote = {
 	revision: string | null,
 };
 
+/**  A closed request-field hint, not an echo of provider-authored error.param. */
+export type ChatGptFailureField = "model" | "reasoning" | "tools" | "input" | "store" | "stream" | "unknown";
+
+/**  Closed failure categories used for actionable UI, never provider strings. */
+export type ChatGptFailureIssue = "invalid_request" | "signed_out" | "not_eligible" | "usage_limit" | "unavailable" | "unsupported" | "timeout" | "protocol" | "incomplete" | "usage_unavailable" | "cancelled";
+
+/**  The last locally observed stage, without any request or credential content. */
+export type ChatGptFailureStage = "request" | "credential" | "send" | "http" | "stream" | "complete";
+
+/**  Closed direct ChatGPT errors. No provider-authored text or account data. */
+export type ChatGptModelFault =
+/**  The selected local grant is missing, expired, or was refused. */
+"signed_out" |
+/**  A ChatGPT plan-sharing limit was reached; its scope/reset are unknown. */
+"usage_limit" |
+/**  Account or usage admission is temporarily unavailable. */
+"unavailable" |
+/**  The account, workspace, region or grant policy does not permit this call. */
+"not_eligible" |
+/**  This route does not support the requested capability or body. */
+"unsupported" |
+/**  Bounded native evidence, not a provider message or request identifier. */
+{ diagnostic: {
+	stage: ChatGptFailureStage,
+	/**  The observed HTTP status (100..=599), only when one was received. */
+	status: number | null,
+	issue: ChatGptFailureIssue,
+	/**  An allowlisted HTTP400 field category; never the provider's path. */
+	field: ChatGptFailureField | null,
+} };
+
 export type DefaultBrowserStatus = {
 	is_default: boolean,
 	/**
@@ -2034,7 +2065,9 @@ export type PageAssistFaultV1 = { reason: "ai_off" } | { reason: "private" } | {
  *  The model call failed. `retry_after_ms` is set for `rate_limited`
  *  (and hosted limits) when the provider or server said when to retry.
  */
-{ reason: "model"; fault: WorkModelFaultV1; retry_after_ms: number | null } | { reason: "unavailable" };
+{ reason: "model"; fault: WorkModelFaultV1; retry_after_ms: number | null } |
+/**  The selected ChatGPT connection failed; only closed native diagnostics cross. */
+{ reason: "chat_gpt"; fault: ChatGptModelFault } | { reason: "unavailable" };
 
 export type PageAssistHandoffStateV1 =
 /**  Waits for Continue in Work. */
@@ -5363,10 +5396,11 @@ export type WorkMemoryV1_Serialize = {
 	used_ms?: string | null,
 };
 
-/**  The efforts one entry takes as the lead, weakest first. */
+/**  The efforts one entry takes, weakest first, and its current profile selection. */
 export type WorkModelEffortsV1 = {
 	id: string,
 	levels: WorkModelReasoning[],
+	effort: WorkModelReasoning | null,
 };
 
 export type WorkModelEntry = WorkModelEntry_Serialize | WorkModelEntry_Deserialize;

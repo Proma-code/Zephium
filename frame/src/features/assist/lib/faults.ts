@@ -1,5 +1,12 @@
 import * as m from "$shared/i18n/messages";
-import type { PageAssistAvailabilityV1, PageAssistFaultV1 } from "$shared/ipc/bindings";
+import type {
+  ChatGptFailureField,
+  ChatGptFailureIssue,
+  ChatGptFailureStage,
+  ChatGptModelFault,
+  PageAssistAvailabilityV1,
+  PageAssistFaultV1,
+} from "$shared/ipc/bindings";
 
 type FaultFix = { label: string; command: string };
 
@@ -7,6 +14,8 @@ export type FaultView = {
   /** Seconds Rust asked to wait, when it said. */
   wait?: number | null;
   message: string;
+  /** Safe native classification only, never raw provider text or account data. */
+  diagnostic?: { code: string; uncertain: boolean };
   /** Where the person fixes it, when they can. */
   fix: FaultFix | null;
   /** The same message may be sent again as is; a countdown waits first. */
@@ -24,12 +33,100 @@ const models = (label: string): FaultFix => ({ label, command: "settings.ai" });
 
 /** Every way a reply can end early, said as the person can act on it. */
 export function faultView(reason: PageAssistFaultV1): FaultView {
+  if (reason.reason === "chat_gpt") return chatGptFault(reason.fault);
   if (reason.reason !== "model") return pageFault(reason.reason);
   const view = modelFault(reason.fault);
   const milliseconds = reason.retry_after_ms;
   if (milliseconds !== null && Number.isSafeInteger(milliseconds) && milliseconds > 0)
     return { ...view, wait: Math.ceil(milliseconds / 1000) };
   return view.retry === "wait" ? { ...view, retry: "now", wait: null } : view;
+}
+
+const chatGptStages = {
+  request: "REQUEST",
+  credential: "CREDENTIAL",
+  send: "SEND",
+  http: "HTTP",
+  stream: "STREAM",
+  complete: "COMPLETE",
+} satisfies Record<ChatGptFailureStage, string>;
+
+const chatGptFields = {
+  model: "MODEL",
+  reasoning: "REASONING",
+  tools: "TOOLS",
+  input: "INPUT",
+  store: "STORE",
+  stream: "STREAM",
+  unknown: "UNKNOWN",
+} satisfies Record<ChatGptFailureField, string>;
+
+const chatGptIssues = {
+  invalid_request: {
+    code: "INVALID_REQUEST",
+    message: m.assist_chatgpt_invalid_request,
+    retry: "no",
+  },
+  signed_out: { code: "SIGNED_OUT", message: m.assist_chatgpt_signed_out, retry: "no" },
+  not_eligible: { code: "NOT_ELIGIBLE", message: m.assist_chatgpt_not_eligible, retry: "no" },
+  usage_limit: { code: "USAGE_LIMIT", message: m.assist_chatgpt_usage_limit, retry: "now" },
+  unavailable: { code: "UNAVAILABLE", message: m.assist_chatgpt_unavailable, retry: "now" },
+  unsupported: { code: "UNSUPPORTED", message: m.assist_chatgpt_unsupported, retry: "no" },
+  timeout: { code: "TIMEOUT", message: m.assist_chatgpt_timeout, retry: "now" },
+  protocol: { code: "PROTOCOL", message: m.assist_chatgpt_protocol, retry: "now" },
+  incomplete: { code: "INCOMPLETE", message: m.assist_chatgpt_incomplete, retry: "now" },
+  usage_unavailable: {
+    code: "USAGE_UNAVAILABLE",
+    message: m.assist_chatgpt_usage_unavailable,
+    retry: "no",
+  },
+  cancelled: { code: "CANCELLED", message: m.assist_chatgpt_cancelled, retry: "now" },
+} satisfies Record<
+  ChatGptFailureIssue,
+  { code: string; message: () => string; retry: FaultView["retry"] }
+>;
+
+/** Keep copyable evidence finite, even if an incompatible native build sends an unknown value. */
+function chatGptFault(fault: ChatGptModelFault): FaultView {
+  const diagnostic = typeof fault === "object" && fault !== null ? fault.diagnostic : null;
+  const issue = diagnostic?.issue ?? (typeof fault === "string" ? fault : "protocol");
+  const knownIssue = Object.hasOwn(chatGptIssues, issue) ? issue : "protocol";
+  const classification = chatGptIssues[knownIssue];
+  const stage = diagnostic
+    ? Object.hasOwn(chatGptStages, diagnostic.stage)
+      ? chatGptStages[diagnostic.stage]
+      : "UNKNOWN"
+    : "LEGACY";
+  const status = diagnostic?.status;
+  const field = diagnostic?.field;
+  const fieldCode =
+    field == null
+      ? ""
+      : `/${Object.hasOwn(chatGptFields, field) ? chatGptFields[field] : "UNKNOWN"}`;
+  const statusCode =
+    typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599
+      ? String(status)
+      : "-";
+  const uncertain =
+    stage === "SEND" ||
+    stage === "STREAM" ||
+    stage === "COMPLETE" ||
+    (stage === "HTTP" &&
+      ((statusCode !== "-" && status! >= 500) ||
+        knownIssue === "protocol" ||
+        knownIssue === "timeout"));
+  return {
+    message: classification.message(),
+    retry: classification.retry,
+    fix:
+      knownIssue === "signed_out" || knownIssue === "not_eligible" || knownIssue === "unsupported"
+        ? models(m.assist_fix_open_models())
+        : null,
+    diagnostic: {
+      code: `CHATGPT/${stage}/${statusCode}/${classification.code}${fieldCode}`,
+      uncertain,
+    },
+  };
 }
 
 function modelFault(fault: Extract<PageAssistFaultV1, { reason: "model" }>["fault"]): FaultView {
@@ -113,7 +210,7 @@ function modelFault(fault: Extract<PageAssistFaultV1, { reason: "model" }>["faul
   }
 }
 
-function pageFault(reason: Exclude<PageAssistFaultV1["reason"], "model">): FaultView {
+function pageFault(reason: Exclude<PageAssistFaultV1["reason"], "model" | "chat_gpt">): FaultView {
   switch (reason) {
     case "unreadable":
       return { message: m.assist_fault_unreadable(), fix: null, retry: "now" };

@@ -1,8 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from "svelte";
   import { ChatGptSession, chatGptFault, chatGptStatus } from "$domain/chatgpt";
-  import { settle } from "$domain/operations";
-  import { commands } from "$shared/ipc/bindings";
   import * as m from "$shared/i18n/messages";
   import Button from "$shared/ui/Button";
   import SettingsGroup from "$shared/ui/SettingsGroup";
@@ -23,38 +20,21 @@
   const signingIn = $derived(session?.signingIn ?? false);
   const busy = $derived(session?.busy ?? null);
   const status = $derived(chatGptStatus(view, signingIn));
-  let usagePending = $state(false);
-  let usageUnconfirmed = $state(false);
-  const lifetime = new AbortController();
-  onDestroy(() => lifetime.abort());
-
-  async function openUsage() {
-    if (usagePending) return;
-    usagePending = true;
-    usageUnconfirmed = false;
-    const result = await settle(
-      Promise.resolve().then(() =>
-        commands.browserOpenUrl("https://chatgpt.com/settings/usage", true),
-      ),
-      5000,
-      lifetime.signal,
-    );
-    if (lifetime.signal.aborted) return;
-    usagePending = false;
-    usageUnconfirmed = result.outcome !== "applied" && result.outcome !== "no_op";
-  }
 </script>
 
-<SettingsGroup title={m.ai_chatgpt_title()} description={m.ai_chatgpt_note()}>
+<SettingsGroup title={m.ai_chatgpt_title()}>
   <div class="chatgpt-account">
     <p class="status" aria-live="polite">{status}</p>
     {#if view?.state === "connected" && !signingIn}
-      <p>
-        {view.models
-          ? m.ai_chatgpt_available_models({ count: view.models })
-          : m.ai_chatgpt_no_models()}
+      <p class="metadata">
+        <span
+          >{view.models
+            ? m.ai_chatgpt_available_models({ count: view.models })
+            : m.ai_chatgpt_no_models()}</span
+        >
+        <span aria-hidden="true">·</span>
+        <span>{m.model_chatgpt_quota_unknown()}</span>
       </p>
-      <p>{m.ai_chatgpt_quota_unavailable()}</p>
     {:else if view?.state === "signed_out" && !signingIn}
       <p>{m.ai_chatgpt_consent()}</p>
     {/if}
@@ -83,9 +63,6 @@
           disabled={!!busy}
           onclick={() => void session?.signOut()}>{m.ai_chatgpt_disconnect()}</Button
         >
-        <Button size="compact" pending={usagePending} onclick={() => void openUsage()}
-          >{m.ai_chatgpt_usage()}</Button
-        >
       {/if}
       {#if session?.observationFailed || session?.pollingPaused || view?.state === "unavailable"}
         <Button
@@ -103,9 +80,13 @@
     {#if view?.revocation_unconfirmed}<p class="fault" role="alert">
         {m.ai_chatgpt_revocation()}
       </p>{/if}
-    {#if usageUnconfirmed}<p class="fault" role="alert">
-        {m.ai_chatgpt_usage_unconfirmed()}
-      </p>{/if}
+    {#if view?.state === "connected" && !signingIn}
+      <details class="details">
+        <summary>{m.ai_chatgpt_details()}</summary>
+        <p>{m.ai_chatgpt_note()}</p>
+        <p>{m.ai_chatgpt_quota_unavailable()}</p>
+      </details>
+    {/if}
   </div>
 </SettingsGroup>
 
@@ -133,11 +114,68 @@
     font-weight: 500;
   }
 
+  .metadata {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
   .actions {
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
     margin-block-start: 12px;
+  }
+
+  .details {
+    margin-block-start: 10px;
+  }
+
+  summary {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding-block: 4px;
+    color: var(--color-muted);
+    font-size: var(--text-label);
+    list-style: none;
+    cursor: default;
+  }
+
+  summary::-webkit-details-marker {
+    display: none;
+  }
+
+  summary::before {
+    inline-size: 0;
+    block-size: 0;
+    border-block: 4px solid transparent;
+    border-inline-start: 5px solid currentcolor;
+    content: "";
+    transition: rotate var(--motion-fast) var(--ease-out);
+  }
+
+  .details[open] summary::before {
+    rotate: 90deg;
+  }
+
+  summary:hover {
+    color: var(--color-text);
+  }
+
+  summary:focus-visible {
+    outline: 2px solid var(--color-ring);
+    outline-offset: 2px;
+  }
+
+  .details[open] summary {
+    margin-block-end: 6px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    summary::before {
+      transition: none;
+    }
   }
 
   .fault {

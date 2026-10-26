@@ -18,6 +18,7 @@
     Target02Icon,
   } from "../lib/icons";
   import AddMenu from "./AddMenu.svelte";
+  import FaultNote from "./FaultNote.svelte";
 
   let {
     session,
@@ -228,7 +229,9 @@
       }}
       {onkeydown}></textarea>
   {/if}
-  {#if notice}<p class="notice" role="alert">{notice}</p>{/if}
+  {#if session.notice?.reason === "chat_gpt"}
+    <FaultNote fault={session.notice} />
+  {:else if notice}<p class="notice" role="alert">{notice}</p>{/if}
   <div class="bar">
     <AddMenu {session} onpick={pick} />
     <span class="grow"></span>
