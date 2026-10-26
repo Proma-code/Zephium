@@ -14,6 +14,11 @@ public sealed class ZephiumTrialRuntimeHost : IDisposable
     private IntPtr job, process;
     private uint processId;
     private FileStream executableLock;
+    private IntPtr observedWindow;
+    private uint observedThread;
+    private string observedClass;
+    private bool closeAttempted;
+    private uint closeMessagesPosted;
     private const uint KillOnJobClose = 0x2000, ExtendedStartupInfo = 0x80000, CreateSuspended = 4;
     private const uint WaitTimeout = 258, WmClose = 0x10;
     private const int JobExtendedLimits = 9, JobAccounting = 1;
@@ -164,24 +169,57 @@ public sealed class ZephiumTrialRuntimeHost : IDisposable
         bool inJob;
         return pid == processId && IsProcessInJob(process, job, out inJob) && inJob;
     }
+    private bool DescribeResponsiveWindow(IntPtr window, out uint thread, out string className)
+    {
+        thread = 0; className = null;
+        Rect rect; var name = new StringBuilder(256);
+        if (!StillOwnsWindow(window) || !IsWindowVisible(window) ||
+            GetClassNameW(window, name, name.Capacity) <= 0 || name.ToString() == "#32770" ||
+            !GetWindowRect(window, out rect) || rect.Right - rect.Left < 100 || rect.Bottom - rect.Top < 100) return false;
+        uint pid; thread = GetWindowThreadProcessId(window, out pid);
+        if (thread == 0 || pid != processId) return false;
+        className = name.ToString();
+        IntPtr result;
+        return SendMessageTimeoutW(window, 0, IntPtr.Zero, IntPtr.Zero, 2, 250, out result) != IntPtr.Zero;
+    }
+    private static bool SameWindowIdentity(IntPtr expected, uint expectedThread, string expectedClass,
+        IntPtr actual, uint actualThread, string actualClass)
+    {
+        return expected != IntPtr.Zero && expectedThread != 0 && !String.IsNullOrEmpty(expectedClass) &&
+            expected == actual && expectedThread == actualThread &&
+            String.Equals(expectedClass, actualClass, StringComparison.Ordinal);
+    }
+    private bool ObservedWindowStillReady()
+    {
+        uint thread; string className;
+        return observedWindow != IntPtr.Zero && DescribeResponsiveWindow(observedWindow, out thread, out className) &&
+            SameWindowIdentity(observedWindow, observedThread, observedClass, observedWindow, thread, className);
+    }
     public bool HasVisibleResponsiveWindow()
     {
+        // Once observed, never substitute a later window or hidden helper.
+        if (observedWindow != IntPtr.Zero) return ObservedWindowStillReady();
         foreach (IntPtr window in OwnedWindows())
         {
-            Rect rect; var name = new StringBuilder(256);
-            GetClassNameW(window, name, name.Capacity);
-            if (!StillOwnsWindow(window) || !IsWindowVisible(window) || name.ToString() == "#32770" ||
-                !GetWindowRect(window, out rect) || rect.Right - rect.Left < 100 || rect.Bottom - rect.Top < 100) continue;
-            IntPtr result;
-            if (SendMessageTimeoutW(window, 0, IntPtr.Zero, IntPtr.Zero, 2, 250, out result) != IntPtr.Zero) return true;
+            uint thread; string className;
+            if (!DescribeResponsiveWindow(window, out thread, out className)) continue;
+            observedWindow = window; observedThread = thread; observedClass = className;
+            return true;
         }
         return false;
     }
+    public uint CloseMessagesPosted { get { return closeMessagesPosted; } }
     public bool RequestClose()
     {
-        bool sent = false;
-        foreach (IntPtr window in OwnedWindows())
-            if (StillOwnsWindow(window)) sent |= PostMessageW(window, WmClose, IntPtr.Zero, IntPtr.Zero);
+        if (closeAttempted) return false;
+        closeAttempted = true;
+        if (!ObservedWindowStillReady()) return false;
+        // Recheck retained-process ownership immediately before one close. A
+        // stale/recreated HWND with a different thread/class is never accepted.
+        // This is trusted-client window matching, not hostile HWND attestation.
+        if (!StillOwnsWindow(observedWindow)) return false;
+        bool sent = PostMessageW(observedWindow, WmClose, IntPtr.Zero, IntPtr.Zero);
+        if (sent) closeMessagesPosted = 1;
         return sent;
     }
     public bool WaitForEmpty(int milliseconds)

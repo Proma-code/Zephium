@@ -68,7 +68,7 @@ $result = [ordered]@{
   sourceRevision = $ExpectedSourceRevision; executableSha256 = $ExpectedExecutableSha256
   workflowRunId = $context.runId; workflowRunAttempt = $context.runAttempt
   outcome = 'not-started'; observation = 'not-observed'; visibleResponsiveOwnedWindow = $false
-  closeRequested = $false; exitCode = $null; ownedJobEmpty = $false; forcedCleanup = $false; nativeLaunchError = 0
+  closeRequested = $false; closeMessagesPosted = 0; exitCode = $null; ownedJobEmpty = $false; forcedCleanup = $false; nativeLaunchError = 0
 }
 $outputPaths = Get-TrialOutputPaths
 $resultDirectory = $outputPaths.RuntimeDirectory
@@ -159,7 +159,8 @@ try {
   if ($result.observation -ne 'initialized-marker' -or -not $result.visibleResponsiveOwnedWindow) { throw 'Startup observation timed out; process survival is not readiness.' }
   $result.outcome = 'close-failed'
   $result.closeRequested = $owner.RequestClose()
-  if (-not $result.closeRequested) { throw 'No owned window accepted a graceful close request.' }
+  $result.closeMessagesPosted = $owner.CloseMessagesPosted
+  if (-not $result.closeRequested -or $result.closeMessagesPosted -ne 1) { throw 'The exact observed window did not accept one graceful close request.' }
   $result.ownedJobEmpty = $owner.WaitForEmpty(30000)
   if (-not $result.ownedJobEmpty) { throw 'Graceful close timed out or owned descendants remained.' }
   $result.exitCode = $owner.ExitCode
@@ -181,7 +182,7 @@ try {
     }
     if ($canWriteResult) {
       $result | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $resultDirectory 'summary.json') -Encoding utf8
-      Write-Output "Runtime smoke: $($result.outcome); observation=$($result.observation); graceful=$($result.closeRequested -and -not $result.forcedCleanup); owned_job_empty=$($result.ownedJobEmpty)."
+      Write-Output "Runtime smoke: $($result.outcome); observation=$($result.observation); close_requested=$($result.closeRequested); close_messages=$($result.closeMessagesPosted); exit_code=$($result.exitCode); owned_job_empty=$($result.ownedJobEmpty); forced_cleanup=$($result.forcedCleanup)."
       Write-Output 'LIMIT: first-run initialization/window and orderly close only; no UI correctness, installed-app coexistence, accounts, navigation or inference tested. Full log is not uploaded.'
     }
   } finally { Pop-Location }

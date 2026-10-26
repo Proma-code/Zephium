@@ -13,30 +13,31 @@ tests. Detailed internal reviews are kept separately.
 - On Windows, the account/picker Chromium component tests, native account and
   focused routing tests, trial configuration checks, strict desktop Clippy and
   complete generated IPC binding checks passed at source
-  `9b21629b96c7c6385ba2257a7426cb9be5797c84`.
+  `75d5ccc5cbbb7e3b79925fa4153eb5d5c4f3b8af`, including the context-budget cases.
 - The Windows native vault fixture passed using fresh synthetic trial profiles.
   It exercised credential roundtrip, replacement, profile separation and cleanup,
   not a real provider account.
-- The original pinned Claude client passed credential-free version/help startup
-  checks. This does not enable Claude account linking or establish login and
-  conversation behavior.
+- The original pinned Claude client passed credential-free version/help and
+  fresh signed-out status checks. This does not enable Claude account linking or
+  establish login, credential persistence or conversation behavior.
 - Packaging identity/guard checks and the nine-skill inventory validation passed.
   Pure guard tests alone do not prove Windows installation or application startup.
 
-[Windows run for that source](https://github.com/Proma-code/Zephium/actions/runs/40279899377).
+[Windows run for that source](https://github.com/Proma-code/Zephium/actions/runs/40290729203).
 
 ## Installer and application status
 
-The Windows installer job for the source above completed successfully on
-2026-10-26. It built and staged the unsigned installer, checked its exact bundled
-payload identity, and passed disposable install, same-artifact reinstall and
-uninstall checks with synthetic preservation fixtures. The workflow uploaded a
-temporary installer artifact. No application was launched by that smoke test.
+The source above built and staged the unsigned installer, checked its exact
+bundled payload identity, and passed disposable install, same-artifact reinstall
+and uninstall checks with synthetic preservation fixtures on 2026-10-26.
 
-The next raw-executable runtime check is still pending. It is limited to fresh
-first-run initialization, an observed responsive application window and orderly
-close. It is not complete UI testing or proof of installed-resource behavior.
-Five additional context-budget component cases also await their exact Windows run.
+The separate raw-executable smoke test then observed first-run initialization
+and a responsive application window. It failed the close check: the application
+returned exit code 1. The owned process tree exited without forced cleanup, but
+that is not a successful orderly-close result. A corrected single-window close
+test is awaiting its next exact-source Windows run. The overall job failed and
+did not publish a new installer artifact. This is not complete UI testing or proof
+of installed-resource behavior.
 
 Real side-by-side operation with an existing Zephium installation, live provider
 sign-in, model requests and account quota responses still need explicit user
@@ -45,12 +46,12 @@ Do not disable Windows protection to run an unsigned experimental installer.
 
 ## Remaining test limits
 
-- The separate full Windows Work run at the source above completed with
-  **914 application tests passed, 47 failed and 14 skipped**. Its provider suite
-  passed 1,231 tests and durable composition passed 186 tests. The overall run
-  therefore failed despite the successful installer job. Fixture repairs and
-  additional diagnostics are awaiting a new exact-source Windows run; the
-  intentionally gated positive cases are not counted as passes.
+- The independent full Windows Work job at
+  `8e28c0ea01f4670b4d034eb1422ba856355c3ec9` passed **966 application tests**,
+  **1,231 provider tests** and **186 durable-composition tests**, with **18 skipped
+  application cases**. This closes the earlier application test failures, not the
+  separate runtime-close failure. Skipped cases are not counted as passes.
+  [Exact Windows run](https://github.com/Proma-code/Zephium/actions/runs/40294953636).
 - An expanded Linux app subset passed 951 tests with 11 ignored. The unfiltered
   run failed ten unchanged temporary-directory-layout fixtures and two consequent
   shared-lock checks. This is not an unfiltered full-suite pass.
