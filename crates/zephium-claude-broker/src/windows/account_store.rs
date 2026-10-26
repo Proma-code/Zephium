@@ -1,0 +1,365 @@
+//! Debug-only synthetic store custody. No production path or native account adapter.
+//!
+//! Receipts are deliberately in-process capabilities, not restart provenance. A
+//! persistent dirty byte blocks reuse even if a crashed process loses its lock.
+//! No store destructor clears that byte or deletes a store directory. A clean
+//! last Profile Arc still runs the existing fixture Profile destructor; unresolved
+//! custody deliberately retains it. A process crash can leave fixture residue.
+#![cfg(all(debug_assertions, feature = "native-fixtures"))]
+
+use super::security::Profile;
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom, Write},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+};
+
+mod native;
+use native::{HeldDirectory, Identity, Policy};
+
+const LOCK: &str = "custody.lock";
+const STATE: &str = "custody.state";
+const CONFIG: &str = "official-config";
+const CLEAN: &[u8; 9] = b"ZCLST001\0";
+const DIRTY: &[u8; 9] = b"ZCLST001\x01";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Error {
+    Busy,
+    Collision,
+    Dirty,
+    Invalid,
+    Io,
+    Quarantined,
+}
+
+/// These names are synthetic domains, never product/trial root selectors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FixtureDomain {
+    ProductModel,
+    TrialModel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct FixtureKey {
+    pub(super) domain: FixtureDomain,
+    pub(super) profile: u128,
+    pub(super) incarnation: u128,
+}
+
+struct Receipt {
+    parent: PathBuf,
+    root_name: String,
+    key: FixtureKey,
+    chain: Vec<native::DirectoryReceipt>,
+    config: Identity,
+    lock: Identity,
+    state: Identity,
+    // Keeps the existing fresh fixture identity alive through every borrower.
+    profile: Arc<Profile>,
+    owner_sid: String,
+    package_sid: String,
+}
+
+/// Not serializable, reconstructible from a path, or transferable to another run.
+#[derive(Clone)]
+pub(super) struct InProcessFixtureReceipt(Arc<Receipt>);
+
+/// Owns a fresh synthetic receipt; no store directory cleanup is performed.
+/// Last clean ownership release can run the existing fixture Profile destructor.
+pub(super) struct FixtureStoreOwner {
+    receipt: InProcessFixtureReceipt,
+}
+
+pub(super) struct StoreLease {
+    inner: Arc<Inner>,
+}
+struct Inner {
+    receipt: InProcessFixtureReceipt,
+    chain: Vec<HeldDirectory>,
+    config: HeldDirectory,
+    lock: File,
+    state: Mutex<File>,
+    active: Mutex<bool>,
+    quarantined: AtomicBool,
+}
+
+impl FixtureStoreOwner {
+    /// Creates exactly one new random synthetic child of the held temp chain.
+    /// No retry/adoption/fallback follows a collision or ambiguous publication.
+    pub(super) fn create(profile: Profile, key: FixtureKey) -> Result<(Self, StoreLease), Error> {
+        // Consume the non-Clone fresh Profile. Two fixture keys cannot share a
+        // package principal by passing the same Arc into separate store roots.
+        let profile = Arc::new(profile);
+        let (owner_sid, package_sid) = profile.fixture_sids().map_err(|_| Error::Invalid)?;
+        let ambient_parent = std::env::temp_dir();
+        let mut chain = native::pin_parent(&ambient_parent, &owner_sid)?;
+        // Store only the held canonical spelling, after exact raw input proof.
+        let parent = native::canonical_parent(&chain.last().ok_or(Error::Invalid)?.file)?;
+        let root_name = native::fresh_name()?;
+        let root_policy = Policy::directory(&owner_sid, &package_sid, false);
+        let root = native::create_directory(
+            &chain.last().ok_or(Error::Invalid)?.file,
+            &root_name,
+            &root_policy,
+        )?;
+        native::sync_directory(&chain.last().ok_or(Error::Invalid)?.file)?;
+        chain.push(root);
+        let root = &chain.last().ok_or(Error::Invalid)?.file;
+        let broker_policy = Policy::broker_file(&owner_sid);
+        let lock = native::create_file(root, LOCK, &broker_policy)?;
+        native::lock_exclusive(&lock)?;
+        let mut state = native::create_file(root, STATE, &broker_policy)?;
+        // Partial fresh creation is never represented as a clean reusable store.
+        state.write_all(DIRTY).map_err(|_| Error::Io)?;
+        state.sync_all().map_err(|_| Error::Io)?;
+        native::sync_directory(root)?;
+        let config = native::create_directory(
+            root,
+            CONFIG,
+            &Policy::directory(&owner_sid, &package_sid, true),
+        )?;
+        native::sync_directory(root)?;
+        let receipt = InProcessFixtureReceipt(Arc::new(Receipt {
+            parent,
+            root_name,
+            key,
+            chain: chain.iter().map(HeldDirectory::receipt).collect(),
+            config: config.identity,
+            lock: native::identity(&lock, false)?,
+            state: native::identity(&state, false)?,
+            profile,
+            owner_sid,
+            package_sid,
+        }));
+        let inner = Arc::new(Inner {
+            receipt: receipt.clone(),
+            chain,
+            config,
+            lock,
+            state: Mutex::new(state),
+            active: Mutex::new(false),
+            quarantined: AtomicBool::new(false),
+        });
+        inner.verify()?;
+        // No process has been admitted by this fresh-only constructor.
+        inner.write_state(CLEAN)?;
+        Ok((Self { receipt }, StoreLease { inner }))
+    }
+    pub(super) fn receipt(&self) -> InProcessFixtureReceipt {
+        self.receipt.clone()
+    }
+}
+
+impl StoreLease {
+    /// Exact in-process reopen only. Missing nodes and dirty state are not repaired.
+    pub(super) fn reopen(
+        receipt: &InProcessFixtureReceipt,
+        key: FixtureKey,
+    ) -> Result<Self, Error> {
+        let expected = &receipt.0;
+        if key != expected.key {
+            return Err(Error::Invalid);
+        }
+        let sids = expected
+            .profile
+            .fixture_sids()
+            .map_err(|_| Error::Invalid)?;
+        if sids != (expected.owner_sid.clone(), expected.package_sid.clone()) {
+            return Err(Error::Invalid);
+        }
+        let mut chain = native::pin_parent(&expected.parent, &expected.owner_sid)?;
+        let root = native::open_directory(
+            &chain.last().ok_or(Error::Invalid)?.file,
+            &expected.root_name,
+            &Policy::directory(&expected.owner_sid, &expected.package_sid, false),
+        )?;
+        chain.push(root);
+        if chain.iter().map(HeldDirectory::receipt).collect::<Vec<_>>() != expected.chain {
+            return Err(Error::Invalid);
+        }
+        let parent = &chain.last().ok_or(Error::Invalid)?.file;
+        let broker_policy = Policy::broker_file(&expected.owner_sid);
+        let lock = native::open_file(parent, LOCK, &broker_policy)?;
+        if native::identity(&lock, false)? != expected.lock
+            || lock.metadata().map_err(|_| Error::Io)?.len() != 0
+        {
+            return Err(Error::Invalid);
+        }
+        native::lock_exclusive(&lock)?;
+        // Mutable state is inspected only while holding the original lease.
+        let state = native::open_file(parent, STATE, &broker_policy)?;
+        let config = native::open_directory(
+            parent,
+            CONFIG,
+            &Policy::directory(&expected.owner_sid, &expected.package_sid, true),
+        )?;
+        let inner = Arc::new(Inner {
+            receipt: receipt.clone(),
+            chain,
+            config,
+            lock,
+            state: Mutex::new(state),
+            active: Mutex::new(false),
+            quarantined: AtomicBool::new(false),
+        });
+        inner.verify()?;
+        inner.require_clean()?;
+        Ok(Self { inner })
+    }
+    pub(super) fn verify(&self) -> Result<(), Error> {
+        self.inner.verify()
+    }
+
+    /// Retains lifetime custody and flushes dirty state before any future spawn.
+    pub(super) fn begin_operation(&self) -> Result<ActiveStore, Error> {
+        let mut active = self.inner.active.lock().map_err(|_| {
+            self.inner.quarantined.store(true, Ordering::Release);
+            Error::Quarantined
+        })?;
+        if *active {
+            return Err(Error::Busy);
+        }
+        self.inner.verify()?;
+        self.inner.require_clean()?;
+        self.inner.write_state(DIRTY)?;
+        *active = true;
+        Ok(ActiveStore {
+            inner: Arc::clone(&self.inner),
+            settled: false,
+        })
+    }
+}
+
+/// Only this opaque type can clear an active record. There is intentionally no
+/// native constructor: the real owning-worker return boundary is not integrated.
+/// A future constructor must live in the actual process owner, never UI/Ports.
+pub(super) struct WorkerSettled {
+    _private: (),
+}
+
+/// Independently retains every lease/ancestor even after all views/owners drop.
+pub(super) struct ActiveStore {
+    inner: Arc<Inner>,
+    settled: bool,
+}
+impl ActiveStore {
+    /// Path observation is available only under active, independently held custody.
+    pub(super) fn config_path(&self) -> Result<PathBuf, Error> {
+        self.inner.verify()?;
+        if let Err(error) = self.inner.require_state(DIRTY) {
+            self.inner.quarantined.store(true, Ordering::Release);
+            return Err(error);
+        }
+        let receipt = &self.inner.receipt.0;
+        Ok(receipt.parent.join(&receipt.root_name).join(CONFIG))
+    }
+    pub(super) fn settle(mut self, _proof: WorkerSettled) -> Result<(), Error> {
+        let mut active = self.inner.active.lock().map_err(|_| Error::Quarantined)?;
+        if !*active {
+            return Err(Error::Invalid);
+        }
+        self.inner.verify()?;
+        self.inner.require_state(DIRTY)?;
+        self.inner.write_state(CLEAN)?;
+        *active = false;
+        self.settled = true;
+        Ok(())
+    }
+}
+impl Drop for ActiveStore {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.inner.quarantined.store(true, Ordering::Release);
+            // An unresolved worker must not release the native lease on panic or
+            // UI abandonment. Deliberately retain until process teardown; the
+            // persisted dirty record then blocks any subsequent opener.
+            std::mem::forget(Arc::clone(&self.inner));
+        }
+    }
+}
+
+impl Inner {
+    fn verify(&self) -> Result<(), Error> {
+        if self.quarantined.load(Ordering::Acquire) {
+            return Err(Error::Quarantined);
+        }
+        let result = self.verify_inner();
+        if result.is_err() {
+            self.quarantined.store(true, Ordering::Release);
+        }
+        result
+    }
+    fn verify_inner(&self) -> Result<(), Error> {
+        let receipt = &self.receipt.0;
+        native::verify_chain(&self.chain, &receipt.chain, &receipt.owner_sid)?;
+        let parent = &self.chain.last().ok_or(Error::Invalid)?.file;
+        native::verify_directory(
+            parent,
+            CONFIG,
+            &self.config,
+            &Policy::directory(&receipt.owner_sid, &receipt.package_sid, true),
+        )?;
+        if self.config.identity != receipt.config {
+            return Err(Error::Invalid);
+        }
+        let policy = Policy::broker_file(&receipt.owner_sid);
+        native::verify_file(parent, LOCK, &self.lock, receipt.lock, &policy)?;
+        if self.lock.metadata().map_err(|_| Error::Io)?.len() != 0 {
+            return Err(Error::Invalid);
+        }
+        let state = self.state.lock().map_err(|_| Error::Quarantined)?;
+        native::verify_file(parent, STATE, &state, receipt.state, &policy)?;
+        if state.metadata().map_err(|_| Error::Io)?.len() != CLEAN.len() as u64 {
+            return Err(Error::Dirty);
+        }
+        Ok(())
+    }
+    fn require_clean(&self) -> Result<(), Error> {
+        self.require_state(CLEAN)
+    }
+    fn require_state(&self, expected: &[u8; 9]) -> Result<(), Error> {
+        // File clones share the kernel cursor: always serialize all marker I/O,
+        // including construction/reopen proof, independently of operation state.
+        let guard = self.state.lock().map_err(|_| {
+            self.quarantined.store(true, Ordering::Release);
+            Error::Quarantined
+        })?;
+        let mut file = &*guard;
+        if file.metadata().map_err(|_| Error::Io)?.len() != expected.len() as u64 {
+            return Err(Error::Dirty);
+        }
+        file.seek(SeekFrom::Start(0)).map_err(|_| Error::Io)?;
+        let mut state = [0; CLEAN.len()];
+        file.read_exact(&mut state).map_err(|_| Error::Io)?;
+        if &state != expected {
+            return Err(Error::Dirty);
+        }
+        Ok(())
+    }
+
+    fn write_state(&self, state: &[u8; 9]) -> Result<(), Error> {
+        let result = (|| {
+            let guard = self.state.lock().map_err(|_| Error::Quarantined)?;
+            let mut file = &*guard;
+            if file.metadata().map_err(|_| Error::Io)?.len() != state.len() as u64 {
+                return Err(Error::Dirty);
+            }
+            file.seek(SeekFrom::Start(0)).map_err(|_| Error::Io)?;
+            file.write_all(state).map_err(|_| Error::Io)?;
+            file.sync_all().map_err(|_| Error::Io)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.quarantined.store(true, Ordering::Release);
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests;

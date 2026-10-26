@@ -38,5 +38,14 @@ jobs:
         with:
           shared-key: windows-claude-broker-qualification
           cache-on-failure: true
+      - name: Fresh synthetic account-store fixtures (no account)
+        run: |
+          $listed = & cargo test -p zephium-claude-broker --locked --features native-fixtures --lib windows::account_store::tests -- --ignored --list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $listed | Write-Output
+          $fixtures = @($listed | Where-Object { $_ -match '^windows::account_store::tests::[a-z_]+: test$' })
+          if ($fixtures.Count -ne 11) { throw 'Expected exactly 11 reviewed synthetic store fixtures.' }
+          cargo test -p zephium-claude-broker --locked --features native-fixtures --lib windows::account_store::tests -- --ignored --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Synthetic fixtures then exact original client startup (no login or inference)
         run: pwsh -NoProfile -File crates/zephium-claude-broker/qualify-windows.ps1
