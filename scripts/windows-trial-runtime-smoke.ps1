@@ -70,7 +70,8 @@ $result = [ordered]@{
   outcome = 'not-started'; observation = 'not-observed'; visibleResponsiveOwnedWindow = $false
   closeRequested = $false; exitCode = $null; ownedJobEmpty = $false; forcedCleanup = $false; nativeLaunchError = 0
 }
-$resultDirectory = Join-Path $root 'target/windows-trial-runtime-smoke'
+$outputPaths = Get-TrialOutputPaths
+$resultDirectory = $outputPaths.RuntimeDirectory
 $canWriteResult = $false
 Push-Location $root
 try {
@@ -83,7 +84,7 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'Trial identity config guard failed.' }
   node --test scripts/windows-trial.test.mjs
   if ($LASTEXITCODE -ne 0) { throw 'Trial updater/default-browser/source guards failed.' }
-  $artifact = Join-Path $root 'target/windows-subscription-trial-artifact'; Assert-DirectRuntimePath $artifact
+  $artifact = $outputPaths.ArtifactDirectory; Assert-DirectRuntimePath $artifact
   $expectedFiles = @('BUILD-INFO.json', 'README.md', 'installer-hooks.nsh.txt', 'installer.nsi.txt', 'Zephium-Subscription-Trial-Windows-x64-setup.exe')
   $seen = @{}
   foreach ($line in @(Get-Content (Join-Path $artifact 'SHA256SUMS'))) {

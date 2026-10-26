@@ -21,8 +21,8 @@ try {
   if ($exe.VersionInfo.ProductName -ne 'Zephium Subscription Trial') { throw 'Executable product name is not isolated.' }
   if ((Get-AuthenticodeSignature -LiteralPath $exe.FullName).Status.ToString() -cne 'NotSigned') { throw 'Expected an unsigned compiler executable for the reviewed NSIS identity derivation.' }
   $binaryIdentity = Get-TrialBinaryIdentity -Path $exe.FullName
-  $out = 'target/windows-subscription-trial-artifact'
-  if (Test-Path $out) { throw 'Artifact staging directory already exists; inspect it before retrying.' }
+  $out = (Get-TrialOutputPaths).ArtifactDirectory
+  if (Test-Path -LiteralPath $out) { throw 'Artifact staging directory already exists for this run/attempt; inspect it before retrying.' }
   New-Item -ItemType Directory $out | Out-Null
   $setupName = 'Zephium-Subscription-Trial-Windows-x64-setup.exe'
   Copy-Item $installers[0].FullName (Join-Path $out $setupName)

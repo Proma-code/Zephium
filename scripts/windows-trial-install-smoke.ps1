@@ -156,7 +156,7 @@ try {
   node --test scripts/windows-trial.test.mjs
   if ($LASTEXITCODE -ne 0) { throw 'Trial installer/updater source contract failed.' }
 
-  $artifact = Join-Path $root 'target/windows-subscription-trial-artifact'
+  $artifact = (Get-TrialOutputPaths).ArtifactDirectory
   Assert-NoReparse $artifact
   $expectedFiles = @('BUILD-INFO.json', 'README.md', 'installer-hooks.nsh.txt', 'installer.nsi.txt', 'Zephium-Subscription-Trial-Windows-x64-setup.exe')
   $manifest = @(Get-Content (Join-Path $artifact 'SHA256SUMS'))

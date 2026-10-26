@@ -31,6 +31,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Resolve fresh uncached trial output paths
+        id: trial_outputs
+        run: |
+          . ./scripts/windows-trial-staging-checks.ps1
+          $paths = Get-TrialOutputPaths
+          "artifact_directory=$($paths.ArtifactDirectory)" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+          "runtime_directory=$($paths.RuntimeDirectory)" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -135,12 +142,14 @@ jobs:
         run: ./scripts/stage-windows-trial.ps1
       - name: Disposable installer preservation smoke (synthetic sentinels, no app launch)
         run: |
-          $installer = Join-Path $PWD 'target/windows-subscription-trial-artifact/Zephium-Subscription-Trial-Windows-x64-setup.exe'
+          . ./scripts/windows-trial-staging-checks.ps1
+          $installer = Join-Path (Get-TrialOutputPaths).ArtifactDirectory 'Zephium-Subscription-Trial-Windows-x64-setup.exe'
           ./scripts/windows-trial-install-smoke.ps1 -ExpectedSourceRevision $env:GITHUB_SHA -ExpectedInstallerSha256 ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant())
       - name: Fresh raw trial initialization, owned window and orderly close
         id: runtime_smoke
         run: |
-          $installer = Join-Path $PWD 'target/windows-subscription-trial-artifact/Zephium-Subscription-Trial-Windows-x64-setup.exe'
+          . ./scripts/windows-trial-staging-checks.ps1
+          $installer = Join-Path (Get-TrialOutputPaths).ArtifactDirectory 'Zephium-Subscription-Trial-Windows-x64-setup.exe'
           $executable = Join-Path $PWD 'target/release/zephium-subscription-trial.exe'
           ./scripts/windows-trial-runtime-smoke.ps1 -ExpectedSourceRevision $env:GITHUB_SHA -ExpectedInstallerSha256 ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()) -ExpectedExecutableSha256 ((Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant())
       - name: Retain bounded runtime observation (no raw log)
@@ -148,13 +157,13 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: Windows-Trial-Startup-Observation-${{ github.sha }}
-          path: target/windows-trial-runtime-smoke/summary.json
+          path: ${{ steps.trial_outputs.outputs.runtime_directory }}/summary.json
           if-no-files-found: warn
           retention-days: 14
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: Zephium-Subscription-Trial-Windows-x64-${{ github.sha }}
-          path: target/windows-subscription-trial-artifact/
+          path: ${{ steps.trial_outputs.outputs.artifact_directory }}/
           if-no-files-found: error
           retention-days: 14
 
