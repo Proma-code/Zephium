@@ -16,7 +16,7 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc, Mutex, OnceLock, RwLock,
+        mpsc, Arc, Mutex, MutexGuard, OnceLock, RwLock,
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -1193,7 +1193,7 @@ fn worker(
                     }
                 }
                 Event::Conversation(event) => {
-                    if matches!(event, conversation::Event::Closed) {
+                    if matches!(event, conversation::Event::Closed { .. }) {
                         let mut settling =
                             service.settling.lock().unwrap_or_else(|e| e.into_inner());
                         if active.is_none()
@@ -2314,7 +2314,7 @@ impl NativeConversationReservation for Reservation {
         )
     }
     fn commit(
-        mut self: Box<Self>,
+        self: Box<Self>,
         reply: u32,
         cancel: Arc<AtomicBool>,
         events: NativeConversationEvents,
@@ -2324,24 +2324,32 @@ impl NativeConversationReservation for Reservation {
         let Some(registry) = REGISTRY.get() else {
             return Box::pin(async { Err(PageAssistNativeFaultV1::OutcomeUnknown) });
         };
-        let Some(reserved) = self.reserved.take() else {
+        let Self {
+            account_revision,
+            service,
+            selection,
+            draft,
+            reserved,
+            ..
+        } = *self;
+        let Some(reserved) = reserved else {
             return Box::pin(async { Err(PageAssistNativeFaultV1::Protocol) });
         };
         let guard = CancelReply(Some(cancel.clone()));
         let (send, receive) = tokio::sync::oneshot::channel();
         let request = NativeConversationRequest {
-            conversation: self.draft.conversation,
+            conversation: draft.conversation,
             reply,
-            new_conversation: self.draft.new_conversation,
-            previous_reply: self.draft.previous_reply,
-            text: self.draft.text,
+            new_conversation: draft.new_conversation,
+            previous_reply: draft.previous_reply,
+            text: draft.text,
         };
-        let sent = self.service.queue.handoff(reserved, |turn| {
+        let sent = service.queue.handoff(reserved, |turn| {
             Command::Reply(ReplyCall {
                 turn: Some(turn),
-                account_revision: self.account_revision,
+                account_revision,
                 request,
-                selection: self.selection,
+                selection,
                 events,
                 cancel,
                 result: ReplySink::Text(send),
@@ -2356,10 +2364,9 @@ impl NativeConversationReservation for Reservation {
                 .map_err(|_| PageAssistNativeFaultV1::OutcomeUnknown)?;
             guard.0 = None;
             result.receive(
-                registry.scope(&self.service.profile.to_string()) == Some(self.service.epoch),
-                registry.current(&self.service)
-                    && self.account_revision
-                        == self.service.account_revision.load(Ordering::Acquire),
+                registry.scope(&service.profile.to_string()) == Some(service.epoch),
+                registry.current(&service)
+                    && account_revision == service.account_revision.load(Ordering::Acquire),
             )
         })
     }
@@ -2810,7 +2817,8 @@ mod tests {
             Err(PageAssistNativeFaultV1::ScopeChanged)
         ));
         assert!(matches!(
-            ReplyDelivery::Failed(PageAssistNativeFaultV1::Protocol).receive(true, false),
+            ReplyDelivery::<NativeConversationOutcome>::Failed(PageAssistNativeFaultV1::Protocol)
+                .receive(true, false),
             Err(PageAssistNativeFaultV1::ScopeChanged)
         ));
     }

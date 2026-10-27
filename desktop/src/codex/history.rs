@@ -68,13 +68,14 @@ pub(super) fn restore(body: String, association: Option<&Association>) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zephium_core::codex_store::{Dispatch, Scope, Terminal};
+    use zephium_core::codex_store::{ConversationPolicy, Dispatch, Scope, Terminal};
     fn association(dispatch: Dispatch) -> Association {
         Association {
             scope: Scope {
                 incarnation: [1; 16],
                 grant_epoch: 1,
             },
+            policy: ConversationPolicy::TextOnlyLegacy,
             conversation: "chat-1".into(),
             thread_id: Some("thread-1".into()),
             revision: 2,

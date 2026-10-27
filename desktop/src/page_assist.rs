@@ -77,7 +77,7 @@ mod product {
     use zephium_core::ids::ProfileId;
     use zephium_core::ports::engine::Engine as _;
     use zephium_core::ports::store::Store as _;
-    use zephium_core::work::model::{WorkModelError, WorkModelRole};
+    use zephium_core::work::model::WorkModelRole;
     use zephium_work_composition::page_assist::port::*;
     use zephium_work_composition::page_assist::{PageAssist, Ports};
 

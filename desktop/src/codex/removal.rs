@@ -5,9 +5,8 @@ use super::*;
 use std::collections::BTreeMap;
 use zephium_app::profile_removal as app;
 use zephium_codex_broker::{
-    connection::{RemovalAdmission, RemovalAttemptId, RemovalFailure},
+    connection::{RemovalAdmission, RemovalAttemptId, RemovalFailure, RemovalRetryAdmission},
     profile::{self as native, RemovalFault},
-    removal::RemovalRetryAdmission,
 };
 use zephium_core::ports::store::{ProfileDeletionLoad, SessionLoad};
 
@@ -869,7 +868,7 @@ impl app::ProfileRemovalParticipant for Participant {
             for slot in slots.values() {
                 slot.action.cancel.store(true, Ordering::Release);
             }
-        }
+        };
     }
     fn retry(&self, retry: &app::ExplicitRemovalRetry, deadline: Instant) -> app::Preparation {
         self.existing(retry.attempt(), deadline, true)

@@ -7627,6 +7627,7 @@ dependencies = [
  "zephium-ipc",
  "zephium-notes",
  "zephium-opencode-go",
+ "zephium-provider-accounts",
  "zephium-store",
  "zephium-voice",
  "zephium-webext",
