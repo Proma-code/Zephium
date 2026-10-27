@@ -87,17 +87,20 @@ export function frameConfig(pages: readonly Page[]): UserConfig {
                 tags: ["$initial"],
               },
               {
+                name: "browser-resident",
+                priority: 3,
+                test: chromeResidentHelpers,
+                tags: ["$initial"],
+                // Fixed browser helpers must not pull shared Icon/IPC/runtime
+                // dependencies into a chunk the resident Panel also imports.
+                includeDependenciesRecursively: false,
+              },
+              {
                 name: "chrome-shared",
                 priority: 2,
                 // Preferences are read by lazy destinations too; kept here they
                 // never make a destination import the browser entry.
-                // These resident helpers otherwise fragment into tiny JS/CSS
-                // requests as new lazy consumers are added. No optional view is
-                // selected, and the initial tag still bounds this partition.
-                test: (id) =>
-                  /[\\/]src[\\/](?:shared[\\/](ipc[\\/]|platform\.ts|lib[\\/]motion\.ts|i18n[\\/]runtime\.js)|domain[\\/]preferences[\\/])/u.test(
-                    id,
-                  ) || chromeResidentHelpers.test(id),
+                test: /[\\/]src[\\/](?:shared[\\/](ipc[\\/]|platform\.ts|lib[\\/]motion\.ts|i18n[\\/]runtime\.js)|domain[\\/]preferences[\\/])/u,
                 tags: ["$initial"],
               },
             ],

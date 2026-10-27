@@ -1,5 +1,5 @@
 /**
- * Small chrome helpers shared by the browser and lazy destinations. They are
+ * Browser-only helpers shared with lazy destinations, never Panel. They are
  * already in the browser's static graph; `$initial` on the group remains the
  * admission condition so a future lazy-only consumer is not made eager here.
  */
