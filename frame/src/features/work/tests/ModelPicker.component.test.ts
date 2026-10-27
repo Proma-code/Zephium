@@ -110,6 +110,8 @@ vi.mock("$shared/ipc/gateway-bindings", async () => {
   });
 });
 beforeEach(() => {
+  native.effort.mockReset();
+  native.choose.mockReset();
   for (const command of Object.values(codex)) command.mockReset();
 
   for (const command of Object.values(go)) command.mockReset();
@@ -1069,7 +1071,7 @@ test("profile replacement discards queued effort without applying it to the new 
   });
   const screen = await render(ModelPicker, { profile: PROFILE });
   await screen
-    .getByRole("button", { name: "Model: GPT-6 Luna, Medium effort", exact: true })
+    .getByRole("button", { name: "Work · Model: GPT-6 Luna, Medium effort", exact: true })
     .click();
   await screen.getByRole("button", { name: "Effort: Medium", exact: true }).click();
   await userEvent.keyboard("{ArrowRight}");
@@ -1080,7 +1082,9 @@ test("profile replacement discards queued effort without applying it to the new 
     .toHaveAttribute("aria-valuetext", "Extra high");
   await screen.rerender({ profile: nextProfile });
   await expect
-    .element(screen.getByRole("button", { name: "Model: GPT-6 Luna, Medium effort", exact: true }))
+    .element(
+      screen.getByRole("button", { name: "Work · Model: GPT-6 Luna, Medium effort", exact: true }),
+    )
     .toBeVisible();
   finish({
     ...previous,
@@ -1088,7 +1092,9 @@ test("profile replacement discards queued effort without applying it to the new 
     efforts: previous.efforts.map((row) => (row.id === id ? { ...row, effort: "high" } : row)),
   });
   await expect
-    .element(screen.getByRole("button", { name: "Model: GPT-6 Luna, Medium effort", exact: true }))
+    .element(
+      screen.getByRole("button", { name: "Work · Model: GPT-6 Luna, Medium effort", exact: true }),
+    )
     .toBeVisible();
   expect(native.effort).toHaveBeenCalledExactlyOnceWith(PROFILE, "high");
   const slider = screen.getByRole("slider", { name: "Effort", exact: true });
@@ -1099,7 +1105,9 @@ test("profile replacement discards queued effort without applying it to the new 
   await expect.poll(() => native.effort.mock.calls.length).toBe(2);
   expect(native.effort).toHaveBeenLastCalledWith(nextProfile, "max");
   await expect
-    .element(screen.getByRole("button", { name: "Model: GPT-6 Luna, Max effort", exact: true }))
+    .element(
+      screen.getByRole("button", { name: "Work · Model: GPT-6 Luna, Max effort", exact: true }),
+    )
     .toBeVisible();
 });
 
@@ -1170,7 +1178,7 @@ test("retained Codex trigger needs no process preparation until its panel opens"
   const trigger = screen.getByRole("button", {
     name: /Original Native Name · Codex/u,
   });
-  await expect.element(trigger).toHaveTextContent("Original Native Name·High");
+  await expect.element(trigger).toHaveTextContent(/^Original Native Name\s*·\s*High$/u);
   await expect.element(trigger).not.toHaveTextContent("Codex");
   expect(codex.read).not.toHaveBeenCalled();
   expect(codex.select).not.toHaveBeenCalled();
@@ -1228,7 +1236,59 @@ test("Codex uses the existing effort pill and slider with only original advertis
   await expect.element(slider).toHaveAttribute("aria-valuetext", "Minimal");
   expect(page.getByRole("combobox").query()).toBeNull();
   expect(codex.connect).not.toHaveBeenCalled();
+  await userEvent.keyboard("{Escape}");
+  await expect
+    .element(page.getByRole("button", { name: "Effort: Minimal", exact: true }))
+    .toHaveFocus();
+  expect(slider.query()).toBeNull();
 }, 20_000);
+
+test("a held Codex effort pointer is not dismissed while focus moves within the picker", async () => {
+  const catalog = codexView(PROFILE, {
+    state: "connected",
+    page_selected: true,
+    selection: { model: "original", effort: { kind: "explicit", effort: "high" } },
+    models: [
+      {
+        id: "original",
+        name: "Original Native Name",
+        efforts: ["minimal", "high"],
+        default_effort: "high",
+      },
+    ],
+  });
+  codex.read.mockResolvedValue(catalog);
+  const screen = await render(ModelPicker, {
+    profile: PROFILE,
+    role: "page",
+    nativeModel: {
+      id: "original",
+      name: "Original Native Name",
+      source: "codex",
+      capabilities: "text_only",
+      hosted: false,
+      effort: "high",
+    },
+  });
+  await screen.getByRole("button", { name: /Original Native Name · Codex/u }).click();
+  await page.getByRole("button", { name: "Effort: High", exact: true }).click();
+  const slider = page.getByRole("slider", { name: "Effort", exact: true });
+  const face = slider.element().closest(".face")!;
+  face.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerId: 7, button: 0 }));
+  const rows = page.getByRole("listbox", { name: "Codex model", exact: true });
+  (rows.element() as HTMLElement).focus();
+  await expect.element(rows).toHaveFocus();
+  await new Promise((resolve) => setTimeout(resolve, 4_000));
+  await expect.element(slider).toBeVisible();
+  expect(codex.select).not.toHaveBeenCalled();
+  // A release outside the face must end the hold and restore ordinary idle dismissal.
+  window.dispatchEvent(new PointerEvent("pointerup", { pointerId: 7 }));
+  await expect.poll(() => slider.query(), { timeout: 5_000 }).toBeNull();
+  await expect
+    .element(page.getByRole("button", { name: "Effort: High", exact: true }))
+    .toHaveFocus();
+  expect(codex.select).not.toHaveBeenCalled();
+}, 15_000);
 
 test("Page offers exactly Codex and API key without converting a retained legacy choice", async () => {
   await page.viewport(640, 600);

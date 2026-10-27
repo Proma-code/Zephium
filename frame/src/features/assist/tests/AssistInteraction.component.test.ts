@@ -381,7 +381,9 @@ test("an immediate ChatGPT refusal preserves the draft and exposes its finite di
   await expect
     .element(screen.getByText("CHATGPT/CREDENTIAL/-/SIGNED_OUT", { exact: true }))
     .toBeVisible();
-  await expect.element(screen.getByText("Sign in to ChatGPT again in AI settings.")).toBeVisible();
+  await expect
+    .element(screen.getByText("This direct ChatGPT connection is retired.", { exact: false }))
+    .toBeVisible();
   await expect
     .element(screen.getByRole("button", { name: "Copy error code", exact: true }))
     .toBeEnabled();

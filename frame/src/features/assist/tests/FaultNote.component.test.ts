@@ -178,7 +178,9 @@ test("closing while copying cleans up observation without touching the next faul
       .element(next.getByRole("button", { name: "Copy error code", exact: true }))
       .toBeEnabled();
     await expect.element(next.getByRole("status")).not.toBeInTheDocument();
-    await expect.element(next.getByText("Sign in to ChatGPT again in AI settings.")).toBeVisible();
+    await expect
+      .element(next.getByText("This direct ChatGPT connection is retired.", { exact: false }))
+      .toBeVisible();
   } finally {
     vi.useRealTimers();
   }

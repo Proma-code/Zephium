@@ -22,6 +22,33 @@ pub struct QuotaView {
     pub refresh_needed: bool,
     pub last_attempt_at_ms: Option<u64>,
 }
+/// Credential-free qualification admits only an exact current, empty projection.
+/// This is not a quota read receipt and never changes production admission.
+#[cfg(any(test, all(windows, debug_assertions, feature = "native-fixtures")))]
+pub(crate) fn qualify_initial_quota(
+    scope: &Scope,
+    event_scope: &Scope,
+    has_conversation: bool,
+    state: zephium_provider_accounts::codex::AccountState,
+    current: &QuotaView,
+    observed: &QuotaView,
+) -> bool {
+    use zephium_provider_accounts::codex::AccountState;
+    let unavailable = match state {
+        AccountState::Checking => QuotaUnavailable::ObserverNotConnected,
+        AccountState::SignedOut => QuotaUnavailable::SignedOut,
+        _ => return false,
+    };
+    scope == event_scope
+        && !has_conversation
+        && observed == current
+        && observed.profile_revision != 0
+        && observed.account_revision != 0
+        && !observed.checking
+        && !observed.refresh_needed
+        && observed.last_attempt_at_ms.is_none()
+        && observed.state == QuotaState::Unavailable(unavailable)
+}
 pub(crate) struct QuotaOwner {
     scope: Scope,
     profile_revision: u64,
@@ -226,6 +253,134 @@ mod tests {
     }
     fn reading(used: f64) -> Value {
         json!({"rateLimits":{"limitId":"codex","primary":{"usedPercent":used,"windowDurationMins":300,"resetsAt":500000},"secondary":null,"planType":"plus"}})
+    }
+    #[test]
+    fn original_status_qualifier_accepts_only_current_empty_initial_projections() {
+        use zephium_provider_accounts::codex::AccountState;
+        let mut q = owner();
+        q.invalidate(false); // Initial account/read admission invalidation.
+        let checking = q.take_changed().unwrap();
+        assert!(qualify_initial_quota(
+            &q.scope,
+            &q.scope,
+            false,
+            AccountState::Checking,
+            &q.view(),
+            &checking,
+        ));
+        assert!(q.begin(Instant::now(), 100).is_none());
+        q.signed_out();
+        let signed_out = q.take_changed().unwrap();
+        assert!(qualify_initial_quota(
+            &q.scope,
+            &q.scope,
+            false,
+            AccountState::SignedOut,
+            &q.view(),
+            &signed_out,
+        ));
+        assert!(q.begin(Instant::now(), 100).is_none());
+        assert!(!qualify_initial_quota(
+            &q.scope,
+            &q.scope,
+            false,
+            AccountState::SignedOut,
+            &q.view(),
+            &checking,
+        ));
+        assert!(!qualify_initial_quota(
+            &q.scope,
+            &q.scope,
+            false,
+            AccountState::Checking,
+            &q.view(),
+            &signed_out,
+        ));
+    }
+    #[test]
+    fn original_status_qualifier_refuses_foreign_or_observing_projections() {
+        use zephium_provider_accounts::codex::AccountState;
+        let mut q = owner();
+        q.signed_out();
+        let current = q.view();
+        let foreign = Scope::new("synthetic-profile".into(), [2; 16], 7).unwrap();
+        assert!(!qualify_initial_quota(
+            &q.scope,
+            &foreign,
+            false,
+            AccountState::SignedOut,
+            &current,
+            &current,
+        ));
+        assert!(!qualify_initial_quota(
+            &q.scope,
+            &q.scope,
+            true,
+            AccountState::SignedOut,
+            &current,
+            &current,
+        ));
+        assert!(!qualify_initial_quota(
+            &q.scope,
+            &q.scope,
+            false,
+            AccountState::ChatGpt,
+            &current,
+            &current,
+        ));
+        for changed in 0..6 {
+            let mut observed = current.clone();
+            match changed {
+                0 => observed.profile_revision = 0,
+                1 => observed.account_revision = 0,
+                2 => observed.account_revision += 1,
+                3 => observed.checking = true,
+                4 => observed.refresh_needed = true,
+                _ => observed.last_attempt_at_ms = Some(100),
+            }
+            assert!(!qualify_initial_quota(
+                &q.scope,
+                &q.scope,
+                false,
+                AccountState::SignedOut,
+                &current,
+                &observed,
+            ));
+            if changed != 2 {
+                assert!(!qualify_initial_quota(
+                    &q.scope,
+                    &q.scope,
+                    false,
+                    AccountState::SignedOut,
+                    &observed,
+                    &observed,
+                ));
+            }
+        }
+        q.ready();
+        let (epoch, ticket) = q.begin(Instant::now(), 100).unwrap();
+        q.complete(epoch, ticket, &reading(10.0), 100);
+        assert!(matches!(q.view().state, QuotaState::Available(_)));
+        let observed = q.view();
+        assert!(!qualify_initial_quota(
+            &q.scope,
+            &q.scope,
+            false,
+            AccountState::SignedOut,
+            &observed,
+            &observed,
+        ));
+        q.mark_stale(30_100);
+        let observed = q.view();
+        assert!(matches!(observed.state, QuotaState::Stale { .. }));
+        assert!(!qualify_initial_quota(
+            &q.scope,
+            &q.scope,
+            false,
+            AccountState::SignedOut,
+            &observed,
+            &observed,
+        ));
     }
     #[test]
     fn signed_out_never_reads_and_ready_has_one_initial_observation() {

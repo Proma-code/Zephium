@@ -97,6 +97,7 @@
   });
   let list = $state<HTMLElement>();
   let pill = $state<HTMLElement>();
+  let control = $state<{ effortEngaged: () => boolean }>();
   let expanded = $state(false);
   let fold: ReturnType<typeof setTimeout> | undefined;
   export function collapse() {
@@ -108,7 +109,12 @@
   }
   function rest(delay = 3000) {
     clearTimeout(fold);
-    if (expanded) fold = setTimeout(collapse, delay);
+    if (expanded)
+      fold = setTimeout(() => {
+        // A focused reader or held pointer has not left this control. The
+        // next focus/pointer event can restart rest; do not poll or steal it.
+        if (!control?.effortEngaged()) collapse();
+      }, delay);
   }
   function toggle() {
     expanded = !expanded;
@@ -172,6 +178,7 @@
 
 {#if card}
   <ModelCard
+    bind:this={control}
     subject={card}
     {expanded}
     region="{uid}-effort"

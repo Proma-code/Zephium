@@ -44,7 +44,7 @@ test("retained account cleanup is collapsed, explicit and never reconnects or re
   const summary = screen.getByText("Advanced legacy account recovery");
   await expect.element(summary).toBeVisible();
   await expect
-    .element(screen.getByRole("button", { name: "Disconnect ChatGPT" }))
+    .element(screen.getByRole("button", { name: "Disconnect ChatGPT", includeHidden: true }))
     .not.toBeVisible();
   await summary.click();
   await expect

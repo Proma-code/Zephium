@@ -200,11 +200,27 @@ fn persistent_profile(image: Arc<PinnedImage>) -> Result<(), &'static str> {
             let events = connection
                 .poll(&scope, &cancel)
                 .map_err(|_| "owner-status-poll")?;
+            let quota = connection.quota(&scope).map_err(|_| "owner-status-quota")?;
             if events.into_iter().any(|event| {
-                !matches!(
-                    event.into_event(),
-                    crate::connection::Event::Account(AccountState::SignedOut)
-                )
+                if event.scope() != &scope || event.conversation().is_some() {
+                    return true;
+                }
+                match event.into_event() {
+                    crate::connection::Event::Account(AccountState::SignedOut) => {
+                        connection.state() != AccountState::SignedOut
+                    }
+                    crate::connection::Event::Quota(observed) => {
+                        !crate::quota_owner::qualify_initial_quota(
+                            &scope,
+                            &scope,
+                            false,
+                            connection.state(),
+                            &quota,
+                            &observed,
+                        )
+                    }
+                    _ => true,
+                }
             }) {
                 return Err("owner-status-event");
             }

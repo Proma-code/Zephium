@@ -133,6 +133,23 @@
   /** The control is built while it shows and for the moment it leaves, so its orb never turns unseen. */
   let built = $state(false);
   let face = $state<HTMLElement>();
+  let heldPointer: number | null = null;
+  /** Reading with focus or holding the control is not idle dismissal. */
+  export function effortEngaged() {
+    return heldPointer !== null || !!face?.contains(document.activeElement);
+  }
+  function releaseEffort(event: PointerEvent) {
+    if (heldPointer !== event.pointerId) return;
+    releaseHeldEffort();
+  }
+  function releaseHeldEffort() {
+    if (heldPointer === null) return;
+    heldPointer = null;
+    onstir?.();
+  }
+  $effect(() => {
+    if (!expanded) heldPointer = null;
+  });
   $effect(() => {
     if (expanded && built)
       face
@@ -148,6 +165,13 @@
     return () => clearTimeout(timer);
   });
 </script>
+
+<!-- Releases can land outside the face, including buttons without pointer capture. -->
+<svelte:window
+  onpointerup={releaseEffort}
+  onpointercancel={releaseEffort}
+  onblur={releaseHeldEffort}
+/>
 
 <!-- One card, two faces: the model, or how long it thinks. They never show together. -->
 <section
@@ -198,9 +222,15 @@
     role="presentation"
     inert={!expanded}
     bind:this={face}
-    onpointerdown={onstir}
+    onpointerdown={(event) => {
+      if (event.button === 0) heldPointer = event.pointerId;
+      onstir?.();
+    }}
     onpointermove={onstir}
+    onlostpointercapture={releaseEffort}
     onkeydown={onstir}
+    onfocusin={onstir}
+    onfocusout={onstir}
   >
     {#if built}
       {#if nativeSubject && defaultSelected}
