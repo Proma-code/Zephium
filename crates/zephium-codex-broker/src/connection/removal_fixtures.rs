@@ -126,6 +126,9 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
                 )
             },
             existing_owner: Some(store_scope),
+            expected_record: None,
+            wake_deadline: None,
+            wake_cancel: None,
         },
         &stop,
     )

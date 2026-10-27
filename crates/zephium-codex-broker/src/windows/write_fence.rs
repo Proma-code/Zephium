@@ -10,6 +10,7 @@ pub(crate) struct WriteFence {
     revision: Option<(Arc<AtomicU64>, u64)>,
     additional: Option<(Arc<AtomicBool>, Arc<AtomicU64>, u64)>,
     browser_budget: Option<Arc<dyn crate::browser_port::BrowserBudget>>,
+    action_cancel: Option<Arc<AtomicBool>>,
 }
 impl WriteFence {
     pub(crate) fn login(cancel: Arc<AtomicBool>) -> Self {
@@ -18,6 +19,7 @@ impl WriteFence {
             revision: None,
             additional: None,
             browser_budget: None,
+            action_cancel: None,
         }
     }
     pub(crate) fn text(cancel: Arc<AtomicBool>, revision: Arc<AtomicU64>, expected: u64) -> Self {
@@ -26,6 +28,7 @@ impl WriteFence {
             revision: Some((revision, expected)),
             additional: None,
             browser_budget: None,
+            action_cancel: None,
         }
     }
     pub(crate) fn preparation(revision: Arc<AtomicU64>, expected: u64) -> Self {
@@ -34,6 +37,7 @@ impl WriteFence {
             revision: Some((revision, expected)),
             additional: None,
             browser_budget: None,
+            action_cancel: None,
         }
     }
     pub(crate) fn with_browser_budget(
@@ -49,12 +53,20 @@ impl WriteFence {
     pub(crate) fn is_text(&self) -> bool {
         self.cancel.is_some() && self.revision.is_some()
     }
+    pub(crate) fn and_cancel(mut self, cancel: Arc<AtomicBool>) -> Option<Self> {
+        if self.action_cancel.is_some() {
+            return None;
+        }
+        self.action_cancel = Some(cancel);
+        Some(self)
+    }
     /// Conjunction with a distinct native lifecycle action, never replacement
     /// of the already-owned call/profile fence. Exactly two gates are bounded.
     pub(crate) fn and_action(mut self, action: &Self) -> Option<Self> {
         if self.additional.is_some()
             || action.additional.is_some()
             || action.browser_budget.is_some()
+            || action.action_cancel.is_some()
         {
             return None;
         }
@@ -68,6 +80,8 @@ impl WriteFence {
             || other.additional.is_some()
             || self.browser_budget.is_some()
             || other.browser_budget.is_some()
+            || self.action_cancel.is_some()
+            || other.action_cancel.is_some()
         {
             return false;
         }
@@ -79,14 +93,18 @@ impl WriteFence {
         }
     }
     pub(crate) fn current(&self) -> bool {
-        self.browser_budget.as_ref().is_none_or(|budget| {
-            budget
-                .deadline()
-                .is_ok_and(|deadline| std::time::Instant::now() < deadline)
-        }) && self
-            .cancel
+        self.action_cancel
             .as_ref()
             .is_none_or(|cancel| !cancel.load(Ordering::Acquire))
+            && self.browser_budget.as_ref().is_none_or(|budget| {
+                budget
+                    .deadline()
+                    .is_ok_and(|deadline| std::time::Instant::now() < deadline)
+            })
+            && self
+                .cancel
+                .as_ref()
+                .is_none_or(|cancel| !cancel.load(Ordering::Acquire))
             && self
                 .revision
                 .as_ref()
@@ -104,6 +122,22 @@ impl WriteFence {
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+    #[test]
+    fn login_initial_action_and_ceremony_cancellation_remain_distinct() {
+        let ceremony = Arc::new(AtomicBool::new(false));
+        let action = Arc::new(AtomicBool::new(false));
+        let original = WriteFence::login(ceremony.clone());
+        let initial = original.clone().and_cancel(action.clone()).unwrap();
+        assert!(initial.current());
+        action.store(true, Ordering::Release);
+        assert!(!initial.current());
+        assert!(original.current()); // Original acknowledged ceremony can wait.
+        ceremony.store(true, Ordering::Release);
+        assert!(!original.current());
+        assert!(initial
+            .and_cancel(Arc::new(AtomicBool::new(false)))
+            .is_none());
+    }
     #[test]
     fn lifecycle_fence_conjoins_without_replacing_original_call_guard() {
         let original = Arc::new(AtomicBool::new(false));

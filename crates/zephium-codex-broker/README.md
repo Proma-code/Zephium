@@ -38,6 +38,16 @@ does not implement browser actions. Completion joins original runtime settlement
 with Page's local-effect receipt. Lost receipts retain an explicit quarantine,
 not permission to resend or start another turn.
 
+Healthy dormant receipts are distinct from failures and current authority. They
+are minted only after physical closure and carry data-only original managed-home
+identity, not image handles or credentials. Wake uses an existing-only lease and
+fresh image, protocol, account and catalog checks under one preparation deadline.
+It cannot fall back to reprovisioning. Quota-only close drainage joins exact owned
+request IDs without publishing a successful reading; other unresolved operations
+prevent healthy dormancy. Active image custody is never weakened for an updater;
+the native qualification suite tests package replacement at this physical-release
+boundary.
+
 Startup and simulated transcripts do not establish real authenticated browser
 actions, Ultra, or authenticated cross-version continuity. Existing API and
 retired direct-account records are not converted into Codex credentials. Actual

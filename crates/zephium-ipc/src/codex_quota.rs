@@ -100,8 +100,9 @@ pub struct CodexQuotaBucketV1 {
 pub struct CodexQuotaViewV1 {
     pub source: CodexQuotaSourceV1,
     pub state: CodexQuotaStateV1,
-    /// Native live account epoch, encoded exactly without JavaScript u64 loss.
-    /// Scope/account retirement clears old data before a different epoch appears.
+    /// Original quota observation's account epoch, without JavaScript u64 loss.
+    /// Healthy dormancy may retain it only as stale reading provenance. A new
+    /// owner, account or profile clears it before projecting another epoch.
     pub account_epoch: Option<String>,
     pub checking: bool,
     pub refresh_needed: bool,

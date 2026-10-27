@@ -42,12 +42,14 @@ pub enum PageAssistSuggestionV1 {
     Readable,
 }
 
-/// Whether the page in front can be read now. Anything but `ready` means the
-/// page is not attached; the conversation itself still works.
+/// Whether local page context is available. `dormant` retains local draft context
+/// but requires fresh original-runtime admission before any model dispatch.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum PageAssistAvailabilityV1 {
     Ready,
+    /// Local draft context is available; the original client must be freshly admitted on send.
+    Dormant,
     /// AI is switched off in Settings.
     AiOff,
     /// Private windows never send pages to a model.
@@ -75,7 +77,7 @@ pub enum PageAssistModelSourceV1 {
     Codex,
 }
 
-/// Native conversation mode cannot read pages, attach content or execute tools.
+/// Capability freshly observed from the selected backend, not a renderer grant.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum PageAssistCapabilitiesV1 {
@@ -119,8 +121,9 @@ pub struct PageAssistModelV1 {
     pub hosted: bool,
     /// Actual backend, not inferred from the display name.
     pub source: PageAssistModelSourceV1,
-    /// Capabilities are known before reading any page context.
-    pub capabilities: PageAssistCapabilitiesV1,
+    /// Freshly observed runtime capability; absent for a dormant original client.
+    /// Local draft context is not a provider or tool admission.
+    pub capabilities: Option<PageAssistCapabilitiesV1>,
     /// The effort it runs at, such as "high"; null when it has none.
     pub effort: Option<String>,
 }

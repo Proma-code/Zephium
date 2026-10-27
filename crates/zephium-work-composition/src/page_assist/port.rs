@@ -364,6 +364,16 @@ pub struct NativeConversationChoice {
     pub effort: Option<String>,
 }
 
+/// Retained display metadata from a healthy, physically parked native owner.
+/// This is not a current model capability, account grant, or permission to send.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeDormantChoice {
+    pub id: String,
+    pub name: String,
+    pub source: zephium_ipc::page_assist::PageAssistModelSourceV1,
+    pub effort: Option<String>,
+}
+
 #[derive(Clone)]
 pub enum PageBackendChoice {
     Model(ModelChoice),
@@ -496,8 +506,40 @@ pub trait NativeConversationReservation: Send {
     }
 }
 
+/// One deliberate reply's uncommitted native queue/capacity ownership. A wake
+/// does not grant model authority. Refinement consumes this same hold and must
+/// recheck the captured source, selection, scope, cancellation and original
+/// absolute preparation deadline. Drop releases only this unsent demand.
+pub trait NativeConversationDemand: Send {
+    fn reserve_browser(
+        self: Box<Self>,
+        expected: NativeConversationChoice,
+        draft: NativeConversationDraft,
+        manifest: NativeBrowserManifest,
+    ) -> BoxFuture<'static, Result<Box<dyn NativeConversationReservation>, PageBackendError>>;
+}
+
 /// The person's Page backend.
 pub trait ModelSource: Send + Sync {
+    /// Explicit reply demand only; passive observations must never call this.
+    /// Native adapters retain a move-only queue hold across wake and reserve.
+    /// Legacy Model adapters need no preparation and return None.
+    fn prepare_reply<'a>(
+        &'a self,
+        _profile: &'a ProfileId,
+        _cancel: Arc<std::sync::atomic::AtomicBool>,
+        _absolute_deadline: std::time::Instant,
+    ) -> BoxFuture<'a, Result<Option<Box<dyn NativeConversationDemand>>, PageBackendError>> {
+        Box::pin(async { Ok(None) })
+    }
+    /// Passive healthy-dormant metadata only; no process wake, grant or I/O to
+    /// the original runtime. Local draft preparation may use Page's own policy.
+    fn dormant<'a>(
+        &'a self,
+        _profile: &'a ProfileId,
+    ) -> BoxFuture<'a, Option<NativeDormantChoice>> {
+        Box::pin(async { None })
+    }
     /// Reserve the original draft plus the native-owned BrowserV1 manifest.
     /// No provider thread ID or renderer-selected capability map is accepted.
     /// Old text-only associations must explicitly refuse, not fake an upgrade.

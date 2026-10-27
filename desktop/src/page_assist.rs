@@ -72,7 +72,7 @@ fn valid_id(id: &str) -> bool {
 mod product {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{atomic::AtomicBool, Arc, Mutex, OnceLock};
     use std::time::Instant;
     use zephium_core::ids::ProfileId;
     use zephium_core::ports::engine::Engine as _;
@@ -647,6 +647,22 @@ mod product {
     struct Models;
 
     impl ModelSource for Models {
+        fn dormant<'a>(
+            &'a self,
+            profile: &'a ProfileId,
+        ) -> BoxFuture<'a, Option<NativeDormantChoice>> {
+            Box::pin(async move { crate::codex::page_dormant(*profile) })
+        }
+        fn prepare_reply<'a>(
+            &'a self,
+            profile: &'a ProfileId,
+            cancel: Arc<AtomicBool>,
+            deadline: std::time::Instant,
+        ) -> BoxFuture<'a, Result<Option<Box<dyn NativeConversationDemand>>, PageBackendError>>
+        {
+            Box::pin(async move { crate::codex::prepare_page(*profile, cancel, deadline).await })
+        }
+
         fn reserve_native_browser<'a>(
             &'a self,
             profile: &'a ProfileId,

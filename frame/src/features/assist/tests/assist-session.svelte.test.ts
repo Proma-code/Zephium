@@ -3,13 +3,14 @@ import type { PageAssistAskResponseV1 } from "$shared/ipc/bindings";
 import { AssistSession, MESSAGE_LIMIT } from "../lib/assist-session.svelte";
 import { status } from "./fixtures";
 
-const native = vi.hoisted(() => ({ ask: vi.fn(), read: vi.fn(), close: vi.fn() }));
+const native = vi.hoisted(() => ({ ask: vi.fn(), read: vi.fn(), close: vi.fn(), stop: vi.fn() }));
 vi.mock("$shared/ipc/bindings", async () => {
   const { mockBindings } = await import("$shared/testing/bindings");
   return mockBindings({
     pageAssistAsk: native.ask,
     pageAssistStatus: native.read,
     pageAssistClose: native.close,
+    pageAssistStop: native.stop,
   });
 });
 const advisory = vi.hoisted(() => ({
@@ -289,4 +290,48 @@ test("a late model-listener registration is released after disposal, not adopted
   await starting;
   expect(lateStop).toHaveBeenCalledTimes(1);
   expect(advisory.pageStop).toHaveBeenCalledTimes(1);
+});
+
+test("dormant local draft context sends unchanged only through explicit native ask", async () => {
+  native.read.mockResolvedValue(
+    status([], {
+      availability: "dormant",
+      model: { ...status().model!, id: "original", source: "codex", capabilities: null },
+    }),
+  );
+  native.ask.mockResolvedValue({ reply: 1, fault: null });
+  const session = await owner();
+  expect(session.attachable).toBe(true);
+  expect(session.pageAttached).toBe(true);
+  expect(native.ask).not.toHaveBeenCalled();
+  expect(await session.ask("  Keep exact words  ", "summarize")).toBe(true);
+  expect(native.ask).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({
+      text: "  Keep exact words  ",
+      suggestion: "summarize",
+      attachments: [{ kind: "page", tab: "tab-a" }],
+    }),
+  );
+});
+
+test("Stop during native preparation preserves pending ownership and draft until refusal settles", async () => {
+  const pending = deferred();
+  native.ask.mockReturnValue(pending.promise);
+  native.stop.mockResolvedValue(true);
+  const session = await owner();
+  session.others = ["draft-tab"];
+  const request = session.ask("Keep my draft");
+  expect(session.sending).toBe(true);
+  session.stop();
+  await flush();
+  expect(native.stop).toHaveBeenCalledExactlyOnceWith("space-a");
+  expect(session.sending).toBe(true);
+  expect(session.others).toEqual(["draft-tab"]);
+  expect(await session.ask("Do not enqueue again")).toBe(false);
+  expect(native.ask).toHaveBeenCalledTimes(1);
+  pending.resolve({ reply: null, fault: { reason: "native_conversation", fault: "cancelled" } });
+  expect(await request).toBe(false);
+  expect(session.sending).toBe(false);
+  expect(session.others).toEqual(["draft-tab"]);
+  expect(session.conversation.messages).toEqual([]);
 });

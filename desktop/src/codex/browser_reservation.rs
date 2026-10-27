@@ -1,5 +1,5 @@
-//! BrowserV1 reservation on the existing native worker/queue. Product routing
-//! remains closed until the native owner proof API and full cohort are qualified.
+//! BrowserV1 reservation on the existing native worker/queue. Public Page
+//! admission requires the current native capability and exact pre-say proof.
 use super::*;
 use zephium_codex_broker::connection::{BrowserCommit, BrowserDraft, PreparedBrowser};
 
@@ -32,13 +32,27 @@ pub(super) async fn reserve(
     manifest: NativeBrowserManifest,
 ) -> Result<Box<dyn NativeConversationReservation>, PageBackendError> {
     let base = reserve_page_value(profile, expected, draft, admission::TurnMode::Browser)?;
+    reserve_held(
+        base,
+        manifest,
+        Arc::new(AtomicBool::new(false)),
+        Instant::now() + Duration::from_secs(8),
+    )
+    .await
+}
+
+pub(super) async fn reserve_held(
+    base: Reservation,
+    manifest: NativeBrowserManifest,
+    cancelled: Arc<AtomicBool>,
+    deadline: Instant,
+) -> Result<Box<dyn NativeConversationReservation>, PageBackendError> {
     let native_manifest = browser::manifest(manifest).map_err(|_| {
         PageBackendError::NativeConversation(PageAssistNativeFaultV1::UnsupportedInput)
     })?;
     let key = ConversationKey::from_native(base.draft.conversation.clone()).ok_or(
         PageBackendError::NativeConversation(PageAssistNativeFaultV1::Protocol),
     )?;
-    let cancelled = Arc::new(AtomicBool::new(false));
     let mut guard = CancelReply(Some(cancelled.clone()));
     let (send, receive) = tokio::sync::oneshot::channel();
     let reserved = base.reserved.as_ref().ok_or(PageBackendError::Busy)?;
@@ -59,7 +73,7 @@ pub(super) async fn reserve(
                 },
                 manifest: native_manifest,
                 cancelled,
-                deadline: Instant::now() + Duration::from_secs(8),
+                deadline: deadline.min(Instant::now() + Duration::from_secs(8)),
                 result: send,
             })),
         )

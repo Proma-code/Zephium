@@ -71,7 +71,7 @@ pub fn refusal(availability: Availability) -> Option<Fault> {
         Availability::NoModel => Fault::NoModel,
         Availability::Loading => Fault::Loading,
         Availability::Unsupported => Fault::Unsupported,
-        Availability::Unavailable => Fault::Unavailable,
+        Availability::Unavailable | Availability::Dormant => Fault::Unavailable,
     })
 }
 

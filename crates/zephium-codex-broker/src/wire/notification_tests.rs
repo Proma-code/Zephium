@@ -512,3 +512,69 @@ fn late_usage_is_a_separate_typed_class_with_the_canonical_snapshot_validator() 
     params["tokenUsage"]["last"]["cachedInputTokens"] = json!(1);
     assert!(classify_notification("thread/tokenUsage/updated", &params).is_err());
 }
+
+#[test]
+fn skills_invalidation_does_not_consume_or_replace_pending_rpc_identity() {
+    use crate::notification_scope::AdvisoryJoin;
+
+    let params = json!({});
+    let NotificationClass::Informational(advisory) =
+        classify_notification("skills/changed", &params).unwrap()
+    else {
+        panic!("metadata only")
+    };
+    assert_eq!(advisory.kind, AdvisoryKind::SkillsChanged);
+    assert_eq!(advisory.scope, AdvisoryScope::Global);
+    for correct_reply in [false, true] {
+        let mut join = AdvisoryJoin::default();
+        join.accept(
+            AdvisoryScope::Thread("pending-thread"),
+            &[],
+            &[],
+            true,
+            None,
+        )
+        .unwrap();
+        join.accept(advisory.scope, &[], &[], true, None).unwrap();
+        assert_eq!(
+            join.thread_reply(if correct_reply {
+                "pending-thread"
+            } else {
+                "other"
+            }),
+            if correct_reply { Ok(()) } else { Err(()) }
+        );
+
+        let mut join = AdvisoryJoin::default();
+        join.accept(
+            AdvisoryScope::Turn {
+                thread_id: "owned-thread",
+                turn_id: "pending-turn",
+            },
+            &["owned-thread"],
+            &[],
+            false,
+            Some("owned-thread"),
+        )
+        .unwrap();
+        join.accept(
+            advisory.scope,
+            &["owned-thread"],
+            &[],
+            false,
+            Some("owned-thread"),
+        )
+        .unwrap();
+        assert_eq!(
+            join.turn_reply(
+                "owned-thread",
+                if correct_reply {
+                    "pending-turn"
+                } else {
+                    "other"
+                }
+            ),
+            if correct_reply { Ok(()) } else { Err(()) }
+        );
+    }
+}

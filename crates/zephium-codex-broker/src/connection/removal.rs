@@ -159,6 +159,9 @@ impl Connection {
     }
     fn removal_preflight(&self, scope: &Scope) -> Result<(), Fault> {
         self.current(scope)?;
+        if self.wake_deadline.is_some() {
+            return Err(Fault::Busy);
+        }
         if self.removal.is_some() {
             return Err(Fault::Busy);
         }

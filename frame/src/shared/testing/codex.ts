@@ -5,6 +5,7 @@ export function codexView(profile: string, patch: Partial<CodexViewV1> = {}): Co
     version: 1,
     profile,
     state: "signed_out",
+    runtime: "active",
     models: [],
     selection: null,
     page_selected: false,

@@ -206,6 +206,40 @@ pub(crate) async fn codex_select_model(
 }
 
 #[cfg(feature = "work-product")]
+pub(crate) fn page_dormant(
+    profile: zephium_core::ids::ProfileId,
+) -> Option<zephium_work_composition::page_assist::port::NativeDormantChoice> {
+    #[cfg(all(windows, feature = "windows-subscription-trial"))]
+    {
+        live::page_dormant(profile)
+    }
+    #[cfg(not(all(windows, feature = "windows-subscription-trial")))]
+    {
+        let _ = profile;
+        None
+    }
+}
+#[cfg(feature = "work-product")]
+pub(crate) async fn prepare_page(
+    profile: zephium_core::ids::ProfileId,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    deadline: std::time::Instant,
+) -> Result<
+    Option<Box<dyn zephium_work_composition::page_assist::port::NativeConversationDemand>>,
+    zephium_work_composition::page_assist::port::PageBackendError,
+> {
+    #[cfg(all(windows, feature = "windows-subscription-trial"))]
+    {
+        live::prepare_page(profile, cancel, deadline).await
+    }
+    #[cfg(not(all(windows, feature = "windows-subscription-trial")))]
+    {
+        let _ = (profile, cancel, deadline);
+        Ok(None)
+    }
+}
+
+#[cfg(feature = "work-product")]
 pub(crate) fn page_choice(
     profile: zephium_core::ids::ProfileId,
 ) -> Option<zephium_work_composition::page_assist::port::NativeConversationChoice> {

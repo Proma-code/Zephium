@@ -5,6 +5,11 @@ fn main() {
         let mode = args.get(1).and_then(|value| value.to_str());
         let result = match (mode, args.len()) {
             (Some("transport"), 2) => zephium_codex_broker::qualify_transport(),
+            (Some("dormant-original"), 4) => zephium_codex_broker::qualify_dormant_original(
+                std::path::Path::new(&args[2]),
+                std::path::Path::new(&args[3]),
+            ),
+            (Some("dormant-owner"), 2) => zephium_codex_broker::qualify_dormant_owner(),
             (Some("browser-owner"), 2) => zephium_codex_broker::qualify_browser_owner(),
             (Some("owner"), 2) => zephium_codex_broker::qualify_owner(),
             (Some("quota"), 2) => zephium_codex_broker::qualify_quota(),

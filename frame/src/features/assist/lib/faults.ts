@@ -296,7 +296,7 @@ export type AvailabilityView = {
 
 /** Why the page in front is not attached, and whether the conversation still goes on. */
 export function availabilityView(
-  availability: Exclude<PageAssistAvailabilityV1, "ready">,
+  availability: Exclude<PageAssistAvailabilityV1, "ready" | "dormant">,
 ): AvailabilityView {
   switch (availability) {
     case "ai_off":

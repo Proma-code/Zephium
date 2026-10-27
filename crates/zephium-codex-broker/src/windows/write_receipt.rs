@@ -114,7 +114,6 @@ fn draft_digest(model: &str, selection: EffortSelection, text: &str) -> [u8; 32]
 #[derive(Clone)]
 pub(crate) struct SessionStamp(Arc<()>);
 impl SessionStamp {
-    #[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
     pub(super) fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -342,6 +341,15 @@ struct RejectedInner {
     reason: Rejection,
 }
 impl NeverStarted {
+    /// Control-write proof only. It cannot become a turn/Skip receipt.
+    pub(super) fn consume_observation(
+        self,
+        stamp: &SessionStamp,
+        sequence: u64,
+    ) -> Option<UnsentObservation> {
+        (self.0.stamp.same(stamp) && self.0.sequence == sequence && self.0.binding.is_none())
+            .then_some(UnsentObservation(()))
+    }
     pub(super) fn expired(&self) -> bool {
         matches!(self.0.reason, Rejection::Expired)
     }
@@ -360,6 +368,7 @@ impl NeverStarted {
         })))
     }
 }
+pub(super) struct UnsentObservation(());
 /// Move-only scoped non-dispatch evidence, not a generic clean/settled token.
 pub(crate) struct UnsentTurn(Box<UnsentInner>);
 struct UnsentInner {
@@ -540,6 +549,107 @@ mod tests {
             WriteOutcome::Rejected(_)
         ));
         assert!(bytes.is_empty());
+    }
+    fn observation_frame(
+        stamp: &SessionStamp,
+        cancel: Arc<AtomicBool>,
+        deadline: Instant,
+    ) -> OwnedFrame {
+        OwnedFrame::new(
+            stamp.clone(),
+            77,
+            None,
+            b"{\"id\":7,\"method\":\"account/rateLimits/read\"}\n".to_vec(),
+            deadline,
+            Some(WriteFence::login(cancel)),
+        )
+    }
+    #[test]
+    fn quota_prewrite_rejection_requires_exact_session_sequence_and_no_turn_binding() {
+        let stamp = SessionStamp::new();
+        for bad in 0..3 {
+            let cancel = Arc::new(AtomicBool::new(true));
+            let mut bytes = Vec::new();
+            let WriteOutcome::Rejected(receipt) =
+                observation_frame(&stamp, cancel, Instant::now() + Duration::from_secs(10))
+                    .write(&mut bytes)
+            else {
+                panic!("expected rejected")
+            };
+            assert!(bytes.is_empty());
+            let other = SessionStamp::new();
+            assert_eq!(
+                receipt
+                    .consume_observation(
+                        if bad == 1 { &other } else { &stamp },
+                        if bad == 2 { 78 } else { 77 }
+                    )
+                    .is_some(),
+                bad == 0
+            );
+        }
+        let (_, turn) = frame(&stamp, &operation(), None, Instant::now());
+        assert!(turn
+            .reject_unqueued()
+            .consume_observation(&stamp, 1)
+            .is_none());
+    }
+    #[test]
+    fn quota_entered_write_cancellation_failure_and_lost_ack_never_mint_local_rejection() {
+        let stamp = SessionStamp::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut writer = CancelInsideWrite {
+            cancel: cancel.clone(),
+            bytes: Vec::new(),
+        };
+        assert!(matches!(
+            observation_frame(&stamp, cancel, Instant::now() + Duration::from_secs(10))
+                .write(&mut writer),
+            WriteOutcome::Written
+        ));
+        assert!(!writer.bytes.is_empty());
+        for partial in [false, true] {
+            let mut writer = Failing {
+                entered: false,
+                bytes: 0,
+                partial,
+            };
+            assert!(matches!(
+                observation_frame(
+                    &stamp,
+                    Arc::new(AtomicBool::new(false)),
+                    Instant::now() + Duration::from_secs(10)
+                )
+                .write(&mut writer),
+                WriteOutcome::EnteredFailure
+            ));
+            assert!(writer.entered);
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WriteOutcome>(1);
+        drop(tx);
+        assert!(rx.try_recv().is_err()); // No receipt can be consumed from loss.
+    }
+    #[test]
+    fn startup_action_cancellation_before_account_or_catalog_writer_sends_zero() {
+        for method in ["account/read", "model/list"] {
+            let stamp = SessionStamp::new();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let queued = OwnedFrame::new(
+                stamp.clone(),
+                1,
+                None,
+                serde_json::to_vec(&json!({"id":1,"method":method,"params":{}})).unwrap(),
+                Instant::now() + Duration::from_secs(10),
+                Some(WriteFence::login(cancel.clone())),
+            );
+            cancel.store(true, Ordering::Release);
+            let mut bytes = Vec::new();
+            assert!(matches!(
+                queued.write(&mut bytes),
+                WriteOutcome::Rejected(_)
+            ));
+            assert!(bytes.is_empty());
+        }
     }
     #[test]
     fn intent_is_same_session_and_operation_only_without_a_fake_rpc_id() {

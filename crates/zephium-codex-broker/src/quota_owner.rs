@@ -2,6 +2,7 @@
 //! account, model request or transport; a native owner supplies exact RPC tickets.
 use crate::{
     conversation::Scope,
+    demand_budget::{DemandBudget, Fault as DemandFault},
     quota::{AccountQuota, ReadTicket},
 };
 use serde_json::Value;
@@ -62,6 +63,7 @@ pub(crate) struct QuotaOwner {
     scheduled: bool,
     dirty: bool,
 }
+pub(crate) type BoundedRead = (u64, ReadTicket, Option<DemandBudget>);
 impl QuotaOwner {
     pub(crate) fn new(scope: Scope, profile_revision: u64) -> Self {
         Self {
@@ -133,6 +135,40 @@ impl QuotaOwner {
             self.dirty |= needed != observer.needs_refresh();
         }
     }
+    /// Capture the exact initiating context BEFORE cadence admission. Completing
+    /// account/catalog work cannot detach a scheduled follow-up from its bound.
+    pub(crate) fn begin_bounded(
+        &mut self,
+        queued: &mut Option<DemandBudget>,
+        followup: impl FnOnce() -> Result<Option<DemandBudget>, DemandFault>,
+        now: Instant,
+        at_ms: u64,
+    ) -> Result<Option<BoundedRead>, DemandFault> {
+        if !self.scheduled {
+            *queued = None;
+            return Ok(None);
+        }
+        if queued.is_none() {
+            match followup() {
+                Ok(action) => *queued = action,
+                Err(fault) => {
+                    self.abandon_manual(at_ms);
+                    return Err(fault);
+                }
+            }
+        }
+        if let Some(fault) = queued
+            .as_ref()
+            .and_then(|action| action.check(&self.scope, now).err())
+        {
+            *queued = None;
+            self.abandon_manual(at_ms);
+            return Err(fault);
+        }
+        Ok(self
+            .begin(now, at_ms)
+            .map(|(epoch, ticket)| (epoch, ticket, queued.take())))
+    }
     pub(crate) fn begin(&mut self, now: Instant, at_ms: u64) -> Option<(u64, ReadTicket)> {
         if !self.scheduled
             || self.reads >= MAX_CONNECTION_READS
@@ -179,6 +215,27 @@ impl QuotaOwner {
             self.dirty = true;
         }
     }
+    /// Retire one exact accepted observation without treating local cancellation
+    /// as provider success/failure. Cadence and connection budget are not reset.
+    pub(crate) fn abandon(&mut self, epoch: u64, ticket: ReadTicket, at_ms: u64) {
+        if epoch != self.epoch {
+            return;
+        }
+        if let Some(observer) = &mut self.observer {
+            let _ = observer.abandon_read(&self.scope, epoch, ticket, at_ms);
+            self.checking = false;
+            self.dirty = true;
+        }
+    }
+    /// An unissued manual action expired/cancelled. Do not convert it into an
+    /// automatic later read or claim that a provider attempt occurred.
+    pub(crate) fn abandon_manual(&mut self, at_ms: u64) {
+        self.scheduled = false;
+        if let Some(observer) = &mut self.observer {
+            observer.mark_stale(at_ms, 0);
+        }
+        self.dirty = true;
+    }
     pub(crate) fn updated(&mut self, params: &Value, at_ms: u64) {
         if let Some(observer) = &mut self.observer {
             self.scheduled = true;
@@ -196,6 +253,14 @@ impl QuotaOwner {
                 self.dirty = true;
             }
         }
+    }
+    /// Active tickets and unpublished projections must settle first. An unissued
+    /// future refresh has no writer obligation and is retired on consuming close.
+    pub(crate) fn quiescent(&self) -> bool {
+        !self.checking && !self.dirty
+    }
+    pub(crate) fn retire_for_dormant(&mut self) {
+        self.invalidate(false);
     }
     pub(crate) fn view(&self) -> QuotaView {
         QuotaView {
@@ -253,6 +318,146 @@ mod tests {
     }
     fn reading(used: f64) -> Value {
         json!({"rateLimits":{"limitId":"codex","primary":{"usedPercent":used,"windowDurationMins":300,"resetsAt":500000},"secondary":null,"planType":"plus"}})
+    }
+    #[test]
+    fn warm_check_cadence_keeps_action_after_catalog_completion() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        for cancelled in [false, true] {
+            let mut q = owner();
+            q.ready();
+            let now = Instant::now();
+            let (epoch, ticket) = q.begin(now, 100).unwrap();
+            q.complete(epoch, ticket, &reading(10.0), 100);
+            // A fresh Check invalidates/replaces the observer, but connection
+            // cadence remains. The actual actor uses this same begin helper.
+            q.invalidate(false);
+            q.ready();
+            let stop = Arc::new(AtomicBool::new(false));
+            let action = DemandBudget::new(
+                q.scope.clone(),
+                stop.clone(),
+                now + Duration::from_secs(if cancelled { 120 } else { 20 }),
+                now,
+            )
+            .unwrap();
+            let mut queued = None;
+            assert!(q
+                .begin_bounded(
+                    &mut queued,
+                    || Ok(Some(action)),
+                    now + Duration::from_secs(1),
+                    101
+                )
+                .unwrap()
+                .is_none());
+            assert!(queued.is_some());
+            // The catalog context is now gone; only the queued clone survives.
+            if cancelled {
+                stop.store(true, Ordering::Release);
+            }
+            assert!(q
+                .begin_bounded(
+                    &mut queued,
+                    || panic!("retained bound must win"),
+                    now + Duration::from_secs(31),
+                    131
+                )
+                .is_err());
+            assert!(queued.is_none());
+            assert_eq!(q.reads, 1);
+            assert!(!q.view().checking);
+            assert!(q
+                .begin_bounded(
+                    &mut queued,
+                    || Ok(None),
+                    now + Duration::from_secs(121),
+                    221
+                )
+                .unwrap()
+                .is_none());
+            assert_eq!(q.reads, 1);
+            assert!(!matches!(q.view().state, QuotaState::Available(_)));
+        }
+    }
+    #[test]
+    fn queued_followup_dispatch_transfers_same_bound_into_owned_read() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        let mut q = owner();
+        q.ready();
+        let now = Instant::now();
+        let (epoch, ticket) = q.begin(now, 100).unwrap();
+        q.complete(epoch, ticket, &reading(10.0), 100);
+        q.invalidate(false);
+        q.ready();
+        let original = now + Duration::from_secs(40);
+        let action = DemandBudget::new(
+            q.scope.clone(),
+            Arc::new(AtomicBool::new(false)),
+            original,
+            now,
+        )
+        .unwrap();
+        let mut queued = None;
+        assert!(q
+            .begin_bounded(
+                &mut queued,
+                || Ok(Some(action)),
+                now + Duration::from_secs(1),
+                101
+            )
+            .unwrap()
+            .is_none());
+        let (epoch, ticket, action) = q
+            .begin_bounded(
+                &mut queued,
+                || panic!("no new context"),
+                now + Duration::from_secs(30),
+                130,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(queued.is_none());
+        let action = action.unwrap();
+        assert_eq!(action.cap(now + Duration::from_secs(90)), original);
+        assert!(action.check(&q.scope, original).is_err());
+        q.abandon(epoch, ticket, 140);
+        assert!(!matches!(q.view().state, QuotaState::Available(_)));
+    }
+    #[test]
+    fn cancelled_manual_cadence_does_not_dispatch_or_reset_budget() {
+        let mut q = owner();
+        q.ready();
+        let now = Instant::now();
+        let (epoch, ticket) = q.begin(now, 100).unwrap();
+        q.complete(epoch, ticket, &reading(10.0), 100);
+        q.manual();
+        assert!(q.begin(now + Duration::from_secs(1), 101).is_none());
+        q.abandon_manual(102);
+        assert!(q.begin(now + Duration::from_secs(120), 220).is_none());
+        assert_eq!(q.reads, 1);
+        assert_eq!(q.view().last_attempt_at_ms, Some(100));
+        assert!(matches!(q.view().state, QuotaState::Stale { .. }));
+        q.manual();
+        assert!(q.begin(now + Duration::from_secs(120), 220).is_some());
+    }
+    #[test]
+    fn accepted_then_cancelled_observation_cannot_publish_late_values_or_auto_retry() {
+        let mut q = owner();
+        q.ready();
+        let now = Instant::now();
+        let (epoch, ticket) = q.begin(now, 100).unwrap();
+        q.complete(epoch, ticket, &reading(10.0), 100);
+        q.manual();
+        let (epoch, ticket) = q.begin(now + Duration::from_secs(30), 130).unwrap();
+        q.abandon(epoch, ticket, 131);
+        assert!(!q.view().checking);
+        assert!(matches!(q.view().state, QuotaState::Stale { .. }));
+        assert!(q.begin(now + Duration::from_secs(120), 220).is_none());
+        assert_eq!(q.reads, 2);
+        assert_eq!(q.view().last_attempt_at_ms, Some(130));
     }
     #[test]
     fn original_status_qualifier_accepts_only_current_empty_initial_projections() {
@@ -586,5 +791,29 @@ mod tests {
             Event::Quota,
         );
         assert!(quiet.is_empty());
+    }
+    #[test]
+    fn dormant_observation_readiness_includes_queued_refresh_and_unpublished_state() {
+        let mut q = owner();
+        assert!(!q.quiescent());
+        let _ = q.take_changed();
+        assert!(q.quiescent());
+        q.ready();
+        assert!(!q.quiescent());
+        let now = Instant::now();
+        let (epoch, ticket) = q.begin(now, 100).unwrap();
+        let _ = q.take_changed();
+        assert!(!q.quiescent());
+        q.complete(epoch, ticket, &reading(10.0), 100);
+        assert!(!q.quiescent());
+        let _ = q.take_changed();
+        assert!(q.quiescent());
+        q.manual();
+        assert!(!q.quiescent());
+        let _ = q.take_changed();
+        assert!(q.quiescent());
+        q.retire_for_dormant();
+        assert!(q.begin(now + INTERVAL, 30100).is_none());
+        assert!(matches!(q.view().state, QuotaState::Unavailable(_)));
     }
 }

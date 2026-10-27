@@ -3790,6 +3790,7 @@
   "codex_signed_out": "Not signed in to this Codex connection",
   "codex_signing_in": "Complete sign-in in your browser",
   "codex_connected": "The original Codex runtime reports signed in",
+  "codex_dormant": "Connected · Ready when needed",
   "codex_unavailable": "Codex is not available in this profile",
   "codex_recovery": "This Codex connection needs recovery before it can be opened. Your existing account records have not been deleted.",
   "codex_capability": "Browser actions use this browser’s permissions and confirmations. Work keeps its separately configured models.",

@@ -20,6 +20,8 @@ const CONTROL_BUDGET: Duration = Duration::from_secs(10);
 #[derive(Clone, Copy)]
 pub(super) enum Mode {
     #[cfg(feature = "native-fixtures")]
+    Dormant(crate::connection::dormant::fixtures::Scenario),
+    #[cfg(feature = "native-fixtures")]
     Browser(crate::connection::browser_fixtures::Scenario),
     #[cfg(feature = "native-fixtures")]
     Removal(crate::connection::removal_fixtures::Scenario),
@@ -71,6 +73,8 @@ pub(super) enum Mode {
 impl Mode {
     pub(super) fn args(self) -> &'static [&'static str] {
         match self {
+            #[cfg(feature = "native-fixtures")]
+            Self::Dormant(scenario) => scenario.args(),
             #[cfg(feature = "native-fixtures")]
             Self::Browser(scenario) => scenario.args(),
             #[cfg(feature = "native-fixtures")]
@@ -129,6 +133,7 @@ pub(super) struct FixtureImage {
     path: PathBuf,
     _source: File,
     _image: File,
+    _package: Option<File>,
 }
 impl FixtureImage {
     pub(super) fn path(&self) -> &Path {
@@ -136,6 +141,9 @@ impl FixtureImage {
     }
 
     fn copy_current(runtime: &RuntimePaths) -> Result<Self, &'static str> {
+        Self::copy_at(runtime.temp().join("codex-transport-helper.exe"), None)
+    }
+    fn copy_at(path: PathBuf, package: Option<File>) -> Result<Self, &'static str> {
         let source = std::env::current_exe().map_err(|_| "helper-source")?;
         crate::image::require_absolute_local(&source)?;
         let mut source = OpenOptions::new()
@@ -153,7 +161,6 @@ impl FixtureImage {
             return Err("helper-source-shape");
         }
         let expected_bytes = meta.len();
-        let path = runtime.temp().join("codex-transport-helper.exe");
         let mut target = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -225,6 +232,7 @@ impl FixtureImage {
             path,
             _source: source,
             _image: image,
+            _package: package,
         })
     }
 }
@@ -364,6 +372,22 @@ pub(crate) fn child(mode: &str) -> Result<(), &'static str> {
     }
     match mode {
         #[cfg(feature = "native-fixtures")]
+        mode @ ("dormant-first"
+        | "dormant-resume"
+        | "dormant-idle"
+        | "dormant-nonzero"
+        | "dormant-late-frame"
+        | "dormant-blocked"
+        | "dormant-pending-quota"
+        | "dormant-quota-no-reply"
+        | "dormant-quota-duplicate"
+        | "dormant-quota-foreign"
+        | "dormant-quota-account") => {
+            let scenario = crate::connection::dormant::fixtures::Scenario::parse(mode)
+                .ok_or("dormant-helper-mode")?;
+            crate::connection::fixture_peer::dormant_child(scenario)?;
+        }
+        #[cfg(feature = "native-fixtures")]
         mode @ ("browser-two-turns"
         | "browser-cold-resume"
         | "browser-cancel-input"
@@ -476,6 +500,27 @@ pub(crate) fn browser_session(
 ) -> Result<(Session, Arc<RuntimePaths>), &'static str> {
     fresh_runtime(Mode::Browser(scenario), RuntimePaths::fresh_managed()?)
 }
+#[cfg(feature = "native-fixtures")]
+pub(crate) fn dormant_session(
+    scenario: crate::connection::dormant::fixtures::Scenario,
+    lease: crate::profile::native::ProfileLease,
+    package: &Path,
+) -> Result<(Session, Arc<RuntimePaths>), &'static str> {
+    std::fs::create_dir(package).map_err(|_| "dormant-package-create")?;
+    let package_pin = crate::image::pin_directory(package)?;
+    let image = Arc::new(FixtureImage::copy_at(
+        package.join("codex-transport-helper.exe"),
+        Some(package_pin),
+    )?);
+    let runtime = Arc::new(RuntimePaths::persistent(lease)?);
+    let session = Session::spawn_image(
+        Image::Fixture(image, Mode::Dormant(scenario)),
+        runtime.clone(),
+    )
+    .map_err(|_| "dormant-helper-spawn")?;
+    Ok((session, runtime))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

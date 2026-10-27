@@ -58,7 +58,8 @@
   const selection = $derived(status?.selection ?? null);
   /** Rust said this conversation cannot talk; until it answers, the field is open to typing. */
   const off = $derived(!!status && !session.talks);
-  const busy = $derived(session.busy);
+  // Preparation has not committed a visible message, but Stop must still cancel its native owner.
+  const busy = $derived(session.busy || session.sending);
   const ready = $derived(!!draft.trim() && session.talks && !busy && !session.sending);
   const picking = $derived(session.picking !== null);
   const notice = $derived(session.notice ? faultView(session.notice).message : null);

@@ -29,6 +29,8 @@ use std::{
 };
 use zephium_core::codex_store as durable;
 mod browser_api;
+mod demand;
+pub(crate) mod dormant;
 pub use crate::browser_owner::LocalOutcome as BrowserLocalOutcome;
 pub use crate::connection_events::{ConversationKey, Event, ScopedEvent};
 use browser_api::BrowserAttempt;
@@ -36,6 +38,7 @@ pub use browser_api::{
     BrowserCommit, BrowserDraft, BrowserQuarantine, BrowserStartFailure, PreparedBrowser,
     RejectedBrowser, RejectedBrowserSettled,
 };
+pub use dormant::{DormantFailure, DormantFailureKind, DormantReceipt, DormantWakeFailure};
 
 pub use zephium_provider_accounts::codex::{AccountState, LoginUrl};
 /// The trusted native adapter binds one Store actor and profile at construction.
@@ -175,6 +178,12 @@ pub struct Connection {
     runtime: Option<Arc<RuntimePaths>>,
     removal: Option<removal::RemovalState>,
     removal_setup: Option<removal::AccountPreparation>,
+    wake_deadline: Option<Instant>,
+    wake_origin: Option<dormant::Identity>,
+    wake_cancel: Option<Arc<AtomicBool>>,
+    account_demand: Option<demand::AccountDemand>,
+    catalog_demand: Option<crate::demand_budget::DemandBudget>,
+    quota_demand: Option<crate::demand_budget::DemandBudget>,
     account: ManagedAccount,
     quota_owner: crate::quota_owner::QuotaOwner,
     catalog: Option<Catalog>,
@@ -200,6 +209,9 @@ pub(crate) struct NativePreparation {
     budget: PreparationBudget,
     removal: Option<removal::AccountPreparation>,
     existing_owner: Option<durable::Scope>,
+    expected_record: Option<Box<crate::profile::Record>>,
+    wake_deadline: Option<Instant>,
+    wake_cancel: Option<Arc<AtomicBool>>,
 }
 impl From<PreparationBudget> for NativePreparation {
     fn from(budget: PreparationBudget) -> Self {
@@ -207,12 +219,21 @@ impl From<PreparationBudget> for NativePreparation {
             budget,
             removal: None,
             existing_owner: None,
+            expected_record: None,
+            wake_deadline: None,
+            wake_cancel: None,
         }
     }
 }
 impl NativePreparation {
     fn check(&self, cancel: &AtomicBool) -> Result<(), Fault> {
         check(self.budget.deadline(), cancel)?;
+        if self.wake_deadline.is_some() != self.wake_cancel.is_some() {
+            return Err(Fault::Protocol);
+        }
+        if let Some(action_cancel) = &self.wake_cancel {
+            check(self.budget.deadline(), action_cancel)?;
+        }
         if let Some(setup) = &self.removal {
             setup.current()?;
         }
@@ -292,6 +313,40 @@ impl Connection {
             PreparationBudget::ordinary(Instant::now() + PREPARE).into(),
         )
     }
+    /// Explicit first demand only, bounded through fresh account/catalog by one
+    /// original caller deadline. Any existing canonical owner is reopened only;
+    /// fresh provisioning is possible only after exact absent-owner inspection.
+    pub fn open_for_demand(
+        profile: ProfileId,
+        epoch: u64,
+        mut associations: Box<dyn Associations>,
+        cached_release: Option<&str>,
+        cancel: &Arc<AtomicBool>,
+        absolute_deadline: Instant,
+    ) -> Result<Self, Fault> {
+        let budget = PreparationBudget::bounded(Instant::now(), absolute_deadline);
+        check(budget.deadline(), cancel)?;
+        let existing_owner = match associations.call(durable::Call::InspectOwner) {
+            durable::Reply::Owner(None) => None,
+            durable::Reply::Owner(Some(scope)) if scope.valid() => Some(scope),
+            _ => return Err(Fault::PersistenceUnavailable),
+        };
+        Self::open_with_budget(
+            profile,
+            epoch,
+            associations,
+            cached_release,
+            cancel,
+            NativePreparation {
+                budget,
+                removal: None,
+                existing_owner,
+                expected_record: None,
+                wake_deadline: Some(budget.deadline()),
+                wake_cancel: Some(cancel.clone()),
+            },
+        )
+    }
     /// Native explicit-removal setup only. Queue/preparation time consumes the
     /// same immutable obligation; this cannot extend it or select new rights.
     pub fn open_for_removal(
@@ -314,6 +369,9 @@ impl Connection {
                 budget: PreparationBudget::removal(Instant::now(), absolute_deadline),
                 removal: Some(setup),
                 existing_owner: None,
+                expected_record: None,
+                wake_deadline: None,
+                wake_cancel: None,
             },
         )
     }
@@ -330,15 +388,32 @@ impl Connection {
         // Removal must never provision a replacement for missing managed data.
         // Canonical ownership and existing held identity are joined before even
         // the disposable compatibility process or credential prerequisite.
-        let existing = if preparation.removal.is_some() {
+        let existing = if preparation.removal.is_some() || preparation.existing_owner.is_some() {
             let canonical = match associations.call(durable::Call::InspectOwner) {
                 durable::Reply::Owner(Some(value)) if value.valid() => value,
                 durable::Reply::Owner(_) => return Err(Fault::RecoveryRequired),
                 _ => return Err(Fault::PersistenceUnavailable),
             };
+            if preparation
+                .existing_owner
+                .is_some_and(|expected| expected != canonical)
+            {
+                return Err(Fault::ScopeChanged);
+            }
             preparation.check(cancel)?;
-            let lease = ProfileLease::open_existing_for_removal(profile, canonical.incarnation)
-                .map_err(|_| Fault::RecoveryRequired)?;
+            let lease = if preparation.wake_deadline.is_some() {
+                ProfileLease::open_existing_for_wake(profile, canonical.incarnation)
+            } else {
+                ProfileLease::open_existing_for_removal(profile, canonical.incarnation)
+            }
+            .map_err(|_| Fault::RecoveryRequired)?;
+            if preparation
+                .expected_record
+                .as_ref()
+                .is_some_and(|record| !crate::dormancy::same_home(record, &lease.record))
+            {
+                return Err(Fault::RecoveryRequired);
+            }
             Some((canonical, lease))
         } else {
             None
@@ -400,6 +475,13 @@ impl Connection {
         preparation.check(cancel)?;
         if lease.record.profile != profile || prepared.0.kind() != crate::pin::ImageKind::Cli {
             return Err(Fault::Policy);
+        }
+        if preparation
+            .expected_record
+            .as_ref()
+            .is_some_and(|record| !crate::dormancy::same_home(record, &lease.record))
+        {
+            return Err(Fault::RecoveryRequired);
         }
         let profile_scope = format!("{}-{}", profile.leaf(), hex(&lease.record.incarnation));
         let scope = Scope::new(
@@ -482,6 +564,12 @@ impl Connection {
             runtime: Some(runtime),
             removal: None,
             removal_setup: preparation.removal,
+            wake_deadline: preparation.wake_deadline,
+            wake_origin: None,
+            wake_cancel: preparation.wake_cancel,
+            account_demand: None,
+            catalog_demand: None,
+            quota_demand: None,
             account,
             quota_owner: Self::new_quota_owner(&scope),
             catalog: None,
@@ -558,14 +646,6 @@ impl Connection {
         self.next_id = self.next_id.checked_add(1).ok_or(Fault::Limit)?;
         Ok(self.next_id)
     }
-    fn send(
-        &mut self,
-        message: Value,
-        deadline: Instant,
-        cancel: &AtomicBool,
-    ) -> Result<(), Fault> {
-        self.send_fenced(message, deadline, cancel, None)
-    }
     fn send_fenced(
         &mut self,
         message: Value,
@@ -595,6 +675,19 @@ impl Connection {
         } else {
             (deadline, fence)
         };
+        let fence = if let Some(action_cancel) = &self.wake_cancel {
+            Some(match fence {
+                Some(value) => value
+                    .and_cancel(action_cancel.clone())
+                    .ok_or(Fault::Protocol)?,
+                None => windows::WriteFence::login(action_cancel.clone()),
+            })
+        } else {
+            fence
+        };
+        let deadline = self
+            .wake_deadline
+            .map_or(deadline, |limit| deadline.min(limit));
         check(deadline, cancel).or_else(|f| self.fail(f))?;
         let mut bytes = serde_json::to_vec(&message).map_err(|_| Fault::Protocol)?;
         let result = self
@@ -628,6 +721,9 @@ impl Connection {
     }
     pub fn login(&mut self, scope: &Scope, cancel: &Arc<AtomicBool>) -> Result<(), Fault> {
         self.ordinary_current(scope)?;
+        if self.wake_deadline.is_some() {
+            return Err(Fault::Busy);
+        }
         self.idle()?;
         self.login_fence = Some(windows::WriteFence::login(Arc::clone(cancel)));
         let event = self
@@ -635,7 +731,12 @@ impl Connection {
             .login(LoginAction::from_native_action(scope.clone()))
             .map_err(managed_fault)?;
         self.login_deadline = Some(Instant::now() + LOGIN);
-        self.account_deadline = Some(Instant::now() + RPC);
+        let deadline = Instant::now() + RPC;
+        self.account_deadline = Some(
+            self.account_demand
+                .as_ref()
+                .map_or(deadline, |action| action.budget.cap(deadline)),
+        );
         self.account_effect(event, cancel, &mut Vec::new())
     }
     pub fn cancel_login(&mut self, scope: &Scope, cancel: &AtomicBool) -> Result<(), Fault> {
@@ -645,6 +746,9 @@ impl Connection {
     }
     pub fn logout(&mut self, scope: &Scope, cancel: &AtomicBool) -> Result<(), Fault> {
         self.ordinary_current(scope)?;
+        if self.wake_deadline.is_some() {
+            return Err(Fault::Busy);
+        }
         self.idle()?;
         let event = self
             .account
@@ -658,10 +762,12 @@ impl Connection {
         cancel: &AtomicBool,
         out: &mut Vec<ScopedEvent>,
     ) -> Result<(), Fault> {
+        self.check_demand_actions()?;
         if event.scope() != &self.scope {
             return self.fail(Fault::ScopeChanged);
         }
         if event.invalidates_admission() {
+            self.quota_demand = None;
             self.quota_owner.invalidate(false);
             self.catalog = None;
             self.catalog_builder = None;
@@ -677,6 +783,23 @@ impl Connection {
                 }
                 if state == AccountState::SignedOut {
                     self.quota_owner.signed_out();
+                    self.complete_wake(cancel)?;
+                }
+                if matches!(
+                    state,
+                    AccountState::SignedOut
+                        | AccountState::ChatGpt
+                        | AccountState::ApiKey
+                        | AccountState::Other
+                        | AccountState::Failed
+                        | AccountState::Closed
+                        | AccountState::Cancelled
+                ) {
+                    if let Some(action) = self.account_demand.take() {
+                        if action.kind == demand::Kind::Check && state == AccountState::ChatGpt {
+                            self.catalog_demand = Some(action.budget);
+                        }
+                    }
                 }
                 self.account_deadline = None;
                 if !matches!(
@@ -690,6 +813,7 @@ impl Connection {
                 out.push(self.event(None, Event::Account(state)));
             }
             Effect::OpenBrowser(url) => {
+                self.account_demand = None;
                 self.account_deadline = None;
                 out.push(self.event(None, Event::OpenBrowser(url)));
             }
@@ -701,6 +825,7 @@ impl Connection {
         Ok(())
     }
     fn account_request(&mut self, cancel: &AtomicBool) -> Result<(), Fault> {
+        self.check_demand_actions()?;
         let id = self.id()?;
         let request = self
             .account
@@ -722,6 +847,10 @@ impl Connection {
                 .account_deadline
                 .get_or_insert_with(|| Instant::now() + RPC)
         };
+        let deadline = self
+            .account_demand
+            .as_ref()
+            .map_or(deadline, |action| action.budget.cap(deadline));
         self.pending.insert(
             id,
             Pending {
@@ -745,6 +874,7 @@ impl Connection {
             message.get("method").and_then(Value::as_str),
             Some("account/login/start" | "account/logout")
         ) {
+            self.check_demand_actions()?;
             check(deadline, cancel).or_else(|f| self.fail(f))?;
             let expected = self.association_scope;
             let updated = match self
@@ -770,6 +900,8 @@ impl Connection {
                     .map_err(removal::removal_fault)?;
             }
             self.association_scope = updated;
+            self.check_demand_actions()?;
+            check(deadline, cancel).or_else(|f| self.fail(f))?;
             self.conversations.clear();
             self.records.clear();
             self.settled_turns.clear();
@@ -793,20 +925,49 @@ impl Connection {
         } else {
             None
         };
+        let fence = if let Some(action) = &self.account_demand {
+            action
+                .budget
+                .check(&self.scope, Instant::now())
+                .map_err(demand::fault)?;
+            Some(match fence {
+                Some(value) => value
+                    .and_cancel(action.budget.cancel())
+                    .ok_or(Fault::Protocol)?,
+                None => windows::WriteFence::login(action.budget.cancel()),
+            })
+        } else {
+            fence
+        };
         self.send_fenced(message, deadline, cancel, fence)?;
         Ok(())
     }
     pub fn refresh_catalog(&mut self, scope: &Scope, cancel: &AtomicBool) -> Result<(), Fault> {
         self.ordinary_current(scope)?;
+        self.check_demand_actions()?;
         self.idle()?;
         if self.state() != AccountState::ChatGpt {
             return Err(Fault::NotConnected);
         }
         self.catalog = None;
         self.catalog_builder = Some(CatalogBuilder::new());
-        self.catalog_page(Instant::now() + RPC, cancel)
+        let deadline = Instant::now() + RPC;
+        let deadline = self
+            .catalog_demand
+            .as_ref()
+            .map_or(deadline, |action| action.cap(deadline));
+        self.catalog_page(
+            self.wake_deadline
+                .map_or(deadline, |limit| deadline.min(limit)),
+            cancel,
+        )
     }
     fn catalog_page(&mut self, deadline: Instant, cancel: &AtomicBool) -> Result<(), Fault> {
+        self.check_demand_actions()?;
+        let deadline = self
+            .catalog_demand
+            .as_ref()
+            .map_or(deadline, |action| action.cap(deadline));
         let cursor = self
             .catalog_builder
             .as_ref()
@@ -821,7 +982,16 @@ impl Connection {
                 deadline,
             },
         );
-        self.send(wire::model_list(id, cursor.as_deref()), deadline, cancel)
+        let fence = self
+            .catalog_demand
+            .as_ref()
+            .map(|action| windows::WriteFence::login(action.cancel()));
+        self.send_fenced(
+            wire::model_list(id, cursor.as_deref()),
+            deadline,
+            cancel,
+            fence,
+        )
     }
     /// A new key is admitted only for a genuinely new empty Page conversation.
     /// Existing history resumes only from the same profile/grant Store association;
@@ -1522,8 +1692,11 @@ impl Connection {
         }
     }
     fn poll_inner(&mut self, cancel: &AtomicBool, out: &mut Vec<ScopedEvent>) -> Result<(), Fault> {
+        self.check_demand_actions()?;
         self.quota_tick();
-        let mut deadline = self.deadline;
+        let mut deadline = self
+            .wake_deadline
+            .map_or(self.deadline, |limit| self.deadline.min(limit));
         if let Some(browser) = &self.browser {
             if !browser.owner.draining() {
                 deadline = deadline.min(
@@ -1620,6 +1793,7 @@ impl Connection {
         cancel: &AtomicBool,
         out: &mut Vec<ScopedEvent>,
     ) -> Result<(), Fault> {
+        self.check_demand_actions()?;
         let pending = self.pending.remove(&id).ok_or(Fault::Protocol)?;
         match pending.kind {
             PendingKind::Quota(quota) => self.quota_reply(quota, pending.deadline, result),
@@ -1671,6 +1845,9 @@ impl Connection {
                         .ok_or(Fault::Protocol)?
                         .finish()
                         .map_err(|_| Fault::Protocol)?;
+                    self.complete_wake(cancel)?;
+                    self.check_demand_actions()?;
+                    self.catalog_demand = None;
                     out.push(self.event(None, Event::Catalog(catalog.clone())));
                     self.catalog = Some(catalog);
                 }
@@ -2097,6 +2274,9 @@ impl Connection {
         self.catalog_builder = None;
         self.prompt = None;
         self.pending.clear();
+        self.account_demand = None;
+        self.catalog_demand = None;
+        self.quota_demand = None;
         if fault == Fault::Timeout {
             let _ = self.account.timeout(&self.scope);
         }

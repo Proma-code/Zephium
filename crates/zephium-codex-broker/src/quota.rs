@@ -209,6 +209,21 @@ impl AccountQuota {
         Ok(Applied::Current)
     }
 
+    /// Local observation cancellation/rejection is not a provider result. The
+    /// exact ticket is consumed without minting freshness or a provider fault.
+    pub(crate) fn abandon_read(
+        &mut self,
+        scope: &Scope,
+        epoch: u64,
+        ticket: ReadTicket,
+        at_ms: u64,
+    ) -> Result<(), Fault> {
+        self.finish_ticket(scope, epoch, ticket)?;
+        self.refresh_needed = true;
+        self.projection.mark_stale(at_ms, 0);
+        Ok(())
+    }
+
     /// Returns true only on the transition to a needed refresh. Repeated updates
     /// coalesce; begin_read's independent cadence/budget still applies. The
     /// actor schedules this only on its existing live, authenticated owner.

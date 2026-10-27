@@ -257,3 +257,80 @@ test("disposed quota read cannot republish a retired profile's observation", asy
   expect(native.quota).toHaveBeenCalledTimes(1);
   expect(native.logout).not.toHaveBeenCalled();
 });
+
+test("dormant observation never wakes; explicit quota refresh uses only its native intent", async () => {
+  native.read.mockResolvedValue({ ...connected(), runtime: "dormant" });
+  const s = owner();
+  await s.start();
+  await vi.advanceTimersByTimeAsync(10000);
+  expect(s.view?.runtime).toBe("dormant");
+  expect(native.read).toHaveBeenCalledTimes(1);
+  for (const command of [native.check, native.connect, native.models, native.quota, native.select])
+    expect(command).not.toHaveBeenCalled();
+  expect(await s.refreshQuota()).toBe(true);
+  expect(native.quota).toHaveBeenCalledExactlyOnceWith(profile);
+  expect(native.connect).not.toHaveBeenCalled();
+  expect(native.check).not.toHaveBeenCalled();
+});
+
+test("runtime preparation polls only observations while retaining account state", async () => {
+  native.read.mockResolvedValue({ ...connected(), runtime: "preparing" });
+  const s = owner();
+  await s.start();
+  native.read.mockResolvedValue({ ...connected(), runtime: "dormant" });
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(s.view?.state).toBe("connected");
+  expect(s.view?.runtime).toBe("dormant");
+  await vi.advanceTimersByTimeAsync(10000);
+  expect(native.read).toHaveBeenCalledTimes(2);
+  for (const command of [native.check, native.connect, native.models, native.quota, native.select])
+    expect(command).not.toHaveBeenCalled();
+});
+
+test("timed-out explicit wake reconciles once without replay or an event", async () => {
+  native.read.mockResolvedValue({ ...connected(), runtime: "dormant" });
+  native.check.mockImplementation(() => new Promise(() => {}));
+  const s = owner();
+  await s.start();
+  native.read.mockResolvedValue({ ...connected(), runtime: "preparing" });
+  const checking = s.refresh();
+  await vi.advanceTimersByTimeAsync(20001);
+  expect(await checking).toBe(false);
+  expect(native.check).toHaveBeenCalledExactlyOnceWith(profile);
+  expect(native.read).toHaveBeenCalledTimes(2);
+  expect(s.view?.runtime).toBe("preparing");
+  native.read.mockResolvedValue({ ...connected(), runtime: "active" });
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(native.read).toHaveBeenCalledTimes(3);
+  expect(s.view?.runtime).toBe("active");
+  await vi.advanceTimersByTimeAsync(10000);
+  expect(native.read).toHaveBeenCalledTimes(3);
+  expect(native.check).toHaveBeenCalledTimes(1);
+  for (const command of [native.connect, native.models, native.quota, native.select])
+    expect(command).not.toHaveBeenCalled();
+});
+
+test("wake timeout reconciliation cannot replace a newer action or disposed profile", async () => {
+  native.read.mockResolvedValue({ ...connected(), runtime: "dormant" });
+  native.check.mockImplementation(() => new Promise(() => {}));
+  const s = owner();
+  await s.start();
+  let finish!: (view: CodexViewV1) => void;
+  native.read.mockImplementation(() => new Promise((resolve) => (finish = resolve)));
+  const checking = s.refresh();
+  await vi.advanceTimersByTimeAsync(20001);
+  expect(await checking).toBe(false);
+  expect(native.read).toHaveBeenCalledTimes(2);
+  native.quota.mockResolvedValue({ ...connected(), runtime: "active" });
+  expect(await s.refreshQuota()).toBe(true);
+  finish({ ...connected(), runtime: "preparing" });
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(s.view?.runtime).toBe("active");
+  expect(native.check).toHaveBeenCalledTimes(1);
+  expect(native.quota).toHaveBeenCalledTimes(1);
+  s.dispose();
+  await vi.advanceTimersByTimeAsync(10000);
+  expect(s.view).toBeNull();
+  expect(native.read).toHaveBeenCalledTimes(2);
+});

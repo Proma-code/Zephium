@@ -12,6 +12,16 @@ pub enum CodexStateV1 {
     Connected,
     RecoveryRequired,
 }
+/// Process lifecycle is independent from the retained account observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexRuntimeV1 {
+    Active,
+    Preparing,
+    /// The previous owner physically settled; explicit intent performs a fresh admission.
+    Dormant,
+    Unavailable,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum CodexFaultV1 {
@@ -58,13 +68,14 @@ pub struct CodexViewV1 {
     pub version: u16,
     pub profile: String,
     pub state: CodexStateV1,
+    pub runtime: CodexRuntimeV1,
     pub models: Vec<CodexModelV1>,
     pub selection: Option<CodexSelectionV1>,
     /// Persisted backend intent, independent from current runtime/account availability.
     pub page_selected: bool,
     pub login_attempt: Option<String>,
     pub error: Option<CodexFaultV1>,
-    /// Current integration does not expose executor/browser tools or Ultra.
+    /// Current active runtime tool qualification; not a cached dormant permission.
     pub text_only: bool,
     /// Original account observation only; never model admission or API billing.
     pub quota: crate::codex_quota::CodexQuotaViewV1,
@@ -75,6 +86,7 @@ impl CodexViewV1 {
             version: 1,
             profile,
             state: CodexStateV1::Unavailable,
+            runtime: CodexRuntimeV1::Unavailable,
             models: Vec::new(),
             selection: None,
             page_selected: false,
@@ -192,10 +204,31 @@ mod tests {
         assert_ne!(default, none);
         assert!(serde_json::from_str::<CodexEffortSelectionV1>("null").is_err());
         assert!(serde_json::from_str::<CodexEffortSelectionV1>("\"none\"").is_err());
-        assert!(serde_json::from_value::<CodexEffortSelectionV1>(
-            serde_json::json!({"kind":"explicit","effort":"ultra"})
-        )
-        .is_err());
+        assert!(
+            serde_json::from_value::<CodexEffortSelectionV1>(
+                serde_json::json!({"kind":"explicit","effort":"ultra"})
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn dormant_runtime_is_not_signed_out_or_fresh_tool_authority() {
+        let mut view = CodexViewV1::unavailable("synthetic-profile".into());
+        view.state = CodexStateV1::Connected;
+        view.runtime = CodexRuntimeV1::Dormant;
+        let value = serde_json::to_value(&view).unwrap();
+        assert_eq!(value["state"], "connected");
+        assert_eq!(value["runtime"], "dormant");
+        assert_eq!(
+            serde_json::from_value::<CodexViewV1>(value.clone()).unwrap(),
+            view
+        );
+        let mut missing = value.clone();
+        missing.as_object_mut().unwrap().remove("runtime");
+        assert!(serde_json::from_value::<CodexViewV1>(missing).is_err());
+        let mut unknown = value;
+        unknown["runtime"] = serde_json::json!("ready");
+        assert!(serde_json::from_value::<CodexViewV1>(unknown).is_err());
     }
     #[test]
     fn projection_and_commands_never_carry_auth_or_process_authority() {
@@ -213,6 +246,7 @@ mod tests {
             assert!(!CodexCommand::owns(command));
         }
         assert_eq!(value["text_only"], true);
+        assert_eq!(value["runtime"], "unavailable");
         // Documentation may explain why Ultra is absent. Its wire value must
         // not be accepted or generated as an effort variant.
         assert!(serde_json::from_str::<CodexEffortV1>("\"ultra\"").is_err());

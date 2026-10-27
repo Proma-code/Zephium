@@ -47,7 +47,9 @@ mod framing;
 use framing::{Frames, MAX_FRAME_BYTES};
 mod write_fence;
 pub(crate) use write_fence::WriteFence;
+mod dormant_quota;
 mod write_receipt;
+use dormant_quota::DormantQuotaDrain;
 pub(crate) use write_receipt::{
     BrowserInputIntent, MatchedUnsent, TurnHistory, TurnIntent, TurnOperation, TurnWrite,
     UnsentTurn,
@@ -265,6 +267,12 @@ fn environment(runtime: &RuntimePaths) -> Result<Vec<u16>, Fault> {
 pub(crate) struct TurnSendFailure {
     pub(crate) fault: Fault,
     pub(crate) never_started: Option<UnsentTurn>,
+    observation_rejected: Option<write_receipt::UnsentObservation>,
+}
+
+pub(crate) enum QuotaWrite {
+    Written,
+    Rejected,
 }
 
 struct WriteRequest {
@@ -299,19 +307,24 @@ pub(crate) struct Session {
 #[cfg(all(debug_assertions, feature = "native-fixtures"))]
 pub(crate) struct FixtureBrowserReceipt {
     stamp: SessionStamp,
+    image: Arc<fixtures::FixtureImage>,
 }
 impl Session {
     #[cfg(all(debug_assertions, feature = "native-fixtures"))]
     pub(crate) fn fixture_browser_receipt(&self) -> Option<FixtureBrowserReceipt> {
-        matches!(self._image, Image::Fixture(_, fixtures::Mode::Browser(_))).then(|| {
-            FixtureBrowserReceipt {
-                stamp: self.write_stamp.clone(),
+        match &self._image {
+            Image::Fixture(image, fixtures::Mode::Browser(_) | fixtures::Mode::Dormant(_)) => {
+                Some(FixtureBrowserReceipt {
+                    stamp: self.write_stamp.clone(),
+                    image: image.clone(),
+                })
             }
-        })
+            _ => None,
+        }
     }
     #[cfg(all(debug_assertions, feature = "native-fixtures"))]
     pub(crate) fn owns_fixture_browser(&self, receipt: &FixtureBrowserReceipt) -> bool {
-        matches!(self._image, Image::Fixture(_, fixtures::Mode::Browser(_)))
+        matches!(&self._image, Image::Fixture(image, fixtures::Mode::Browser(_) | fixtures::Mode::Dormant(_)) if Arc::ptr_eq(image, &receipt.image))
             && self.write_stamp.same(&receipt.stamp)
     }
     pub(crate) fn owns_original_image(&self, expected: &Arc<PinnedImage>) -> bool {
@@ -531,6 +544,32 @@ impl Session {
                 failure.fault
             })
     }
+    /// Fixed observation only. Preserve an owner only from the same actual
+    /// pre-write rejection receipt, never from a timeout/cancel error category.
+    pub(crate) fn send_quota_read(
+        &mut self,
+        id: u64,
+        deadline: Instant,
+        service_stop: &AtomicBool,
+        fence: Option<WriteFence>,
+    ) -> Result<QuotaWrite, Fault> {
+        let bytes=serde_json::to_vec(&serde_json::json!({"id":id,"method":"account/rateLimits/read","params":crate::quota::AccountQuota::read_params()}))
+            .map_err(|_| Fault::Frame)?;
+        match self.send_owned(bytes, None, deadline, service_stop, fence) {
+            Ok(()) => Ok(QuotaWrite::Written),
+            Err(failure)
+                if failure.observation_rejected.is_some()
+                    && !self.settled
+                    && !service_stop.load(Ordering::Acquire) =>
+            {
+                Ok(QuotaWrite::Rejected)
+            }
+            Err(failure) => {
+                self.settle_physical();
+                Err(failure.fault)
+            }
+        }
+    }
 
     /// Issued only after the owning Connection validates current scope/grant
     /// and exact history. Reserving an intent sends no bytes or provider RPC.
@@ -578,6 +617,7 @@ impl Session {
             return Err(TurnSendFailure {
                 fault: Fault::Frame,
                 never_started: None,
+                observation_rejected: None,
             });
         }
         let (ticket, bytes) = turn.into_parts();
@@ -601,6 +641,7 @@ impl Session {
             return Err(TurnSendFailure {
                 fault: Fault::Frame,
                 never_started: None,
+                observation_rejected: None,
             });
         }
         let (sequence, binding) = if let Some(ticket) = turn {
@@ -613,6 +654,7 @@ impl Session {
                 return Err(TurnSendFailure {
                     fault: Fault::Frame,
                     never_started: None,
+                    observation_rejected: None,
                 });
             }
             (ticket.sequence, Some(ticket.binding))
@@ -622,6 +664,7 @@ impl Session {
                 return Err(TurnSendFailure {
                     fault: Fault::Writer,
                     never_started: None,
+                    observation_rejected: None,
                 });
             };
             self.write_sequence = sequence;
@@ -685,6 +728,7 @@ impl Session {
                     _ => TurnSendFailure {
                         fault,
                         never_started: None,
+                        observation_rejected: None,
                     },
                 });
             }
@@ -703,6 +747,7 @@ impl Session {
                     return Err(TurnSendFailure {
                         fault: Fault::Writer,
                         never_started: None,
+                        observation_rejected: None,
                     });
                 }
                 Err(mpsc::TryRecvError::Empty) =>
@@ -723,10 +768,17 @@ impl Session {
         binding: Option<&TurnBinding>,
         receipt: write_receipt::NeverStarted,
     ) -> TurnSendFailure {
+        let (never_started, observation_rejected) = match binding {
+            Some(binding) => (receipt.consume(&self.write_stamp, sequence, binding), None),
+            None => (
+                None,
+                receipt.consume_observation(&self.write_stamp, sequence),
+            ),
+        };
         TurnSendFailure {
             fault,
-            never_started: binding
-                .and_then(|binding| receipt.consume(&self.write_stamp, sequence, binding)),
+            never_started,
+            observation_rejected,
         }
     }
 
@@ -842,9 +894,33 @@ impl Session {
         self.finish_cancellable(deadline, &AtomicBool::new(false))
     }
     pub(crate) fn finish_cancellable(
+        self,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<Exit, Fault> {
+        self.finish_owned(deadline, cancel, None)
+    }
+    /// Only a Connection's exact expired quota tombstones may enter this mode.
+    /// All writes already completed synchronously; no new frame can be queued
+    /// after the consuming call. Ordinary finish retains its strict semantics.
+    pub(crate) fn finish_dormant_quota(
+        self,
+        deadline: Instant,
+        scope: &crate::conversation::Scope,
+        expired: Vec<(u64, u64)>,
+    ) -> Result<Exit, Fault> {
+        let drain = DormantQuotaDrain::new(self.write_stamp.clone(), scope.clone(), expired)
+            .ok_or(Fault::Frame)?;
+        if !drain.joins(&self.write_stamp, scope) {
+            return Err(Fault::Frame);
+        }
+        self.finish_owned(deadline, &AtomicBool::new(false), Some(drain))
+    }
+    fn finish_owned(
         mut self,
         deadline: Instant,
         cancel: &AtomicBool,
+        mut quota: Option<DormantQuotaDrain>,
     ) -> Result<Exit, Fault> {
         if self.settled {
             // A prior transport fault already forced cleanup. Ignoring that
@@ -860,6 +936,15 @@ impl Session {
                 return self.fail(Fault::Timeout);
             }
             self.drain()?;
+            if let Some(quota) = &mut quota {
+                while let Some(mut frame) = self.frames.pop() {
+                    let result = quota.observe(&frame);
+                    frame.fill(0);
+                    if result.is_err() {
+                        return self.fail(Fault::Frame);
+                    }
+                }
+            }
             if self.exited()? && self.job.empty()? && self.stdout.is_none() && self.stderr.is_none()
             {
                 break;

@@ -16,6 +16,7 @@ const states = [
   "connected",
   "recovery_required",
 ];
+const runtimes = ["active", "preparing", "dormant", "unavailable"];
 const faults = [
   "runtime_missing",
   "runtime_unsupported",
@@ -49,6 +50,8 @@ export function validCodexView(view: unknown): view is CodexViewV1 {
     !bounded(view.profile, 128) ||
     typeof view.state !== "string" ||
     !states.includes(view.state) ||
+    typeof view.runtime !== "string" ||
+    !runtimes.includes(view.runtime) ||
     typeof view.text_only !== "boolean" ||
     typeof view.page_selected !== "boolean" ||
     !Array.isArray(view.models) ||

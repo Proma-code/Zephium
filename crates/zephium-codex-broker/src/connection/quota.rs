@@ -10,6 +10,7 @@ pub(super) struct QuotaPending {
     /// None is an expired known-ID tombstone. The actual eventual reply is
     /// discarded once, never reassociated with a replacement account/read.
     pub(super) ticket: Option<ReadTicket>,
+    pub(super) action: Option<crate::demand_budget::DemandBudget>,
 }
 impl Connection {
     pub fn quota(&self, scope: &Scope) -> Result<QuotaView, Fault> {
@@ -56,31 +57,99 @@ impl Connection {
             return Ok(());
         }
         let now = Instant::now();
-        let Some((epoch, ticket)) = self.quota_owner.begin(now, wall_ms()) else {
-            return Ok(());
+        let followup = self.catalog_demand.clone();
+        let scope = self.scope.clone();
+        let wake_cancel = self.wake_cancel.as_ref();
+        let wake_deadline = self.wake_deadline;
+        let admitted = self.quota_owner.begin_bounded(
+            &mut self.quota_demand,
+            || {
+                if let Some(action) = followup {
+                    Ok(Some(action))
+                } else {
+                    crate::demand_budget::DemandBudget::from_wake(
+                        scope,
+                        wake_cancel,
+                        wake_deadline,
+                        now,
+                    )
+                }
+            },
+            now,
+            wall_ms(),
+        );
+        let (epoch, ticket, action) = match admitted {
+            Ok(Some(value)) => value,
+            Ok(None) => return Ok(()),
+            Err(crate::demand_budget::Fault::Scope) => return self.fail(Fault::Protocol),
+            Err(_) => return Ok(()),
         };
         let id = self.id()?;
         let deadline = (now + RPC).min(self.deadline);
+        let deadline = self
+            .wake_deadline
+            .map_or(deadline, |limit| deadline.min(limit));
+        let deadline = action
+            .as_ref()
+            .map_or(deadline, |action| action.cap(deadline));
+        let fence = action
+            .as_ref()
+            .map(|action| windows::WriteFence::login(action.cancel()));
         self.pending.insert(
             id,
             Pending {
                 kind: PendingKind::Quota(QuotaPending {
                     epoch,
                     ticket: Some(ticket),
+                    action,
                 }),
                 deadline,
             },
         );
-        // A broken pipe/process is still an owner custody failure. Only the
-        // observed result/parse/deadline is nonfatal, not a failed transport.
-        self.send(serde_json::json!({"id":id,"method":"account/rateLimits/read","params":crate::quota::AccountQuota::read_params()}), deadline, cancel)
+        // Only this fixed observational sender can consume a same-Session
+        // pre-write rejection receipt without poisoning model/account custody.
+        let result = self
+            .session
+            .as_mut()
+            .ok_or(Fault::Closed)?
+            .send_quota_read(id, deadline, cancel, fence)
+            .map_err(transport);
+        match result {
+            Ok(windows::QuotaWrite::Written) => Ok(()),
+            Ok(windows::QuotaWrite::Rejected) => {
+                let Some(Pending {
+                    kind: PendingKind::Quota(mut pending),
+                    ..
+                }) = self.pending.remove(&id)
+                else {
+                    return self.fail(Fault::Protocol);
+                };
+                if let Some(ticket) = pending.ticket.take() {
+                    self.quota_owner.abandon(pending.epoch, ticket, wall_ms());
+                }
+                self.quota_owner.abandon_manual(wall_ms());
+                Ok(())
+            }
+            Err(fault) => self.fail(fault),
+        }
     }
     pub(super) fn quota_tick(&mut self) {
         let now = Instant::now();
         let at = wall_ms();
         for pending in self.pending.values_mut() {
             if let PendingKind::Quota(quota) = &mut pending.kind {
-                if now >= pending.deadline {
+                if quota
+                    .action
+                    .as_ref()
+                    .is_some_and(|action| action.check(&self.scope, now).is_err())
+                {
+                    if let Some(ticket) = quota.ticket.take() {
+                        self.quota_owner.abandon(quota.epoch, ticket, at);
+                    }
+                    // Exact owned tombstone now eligible for the separately
+                    // reviewed inert close drain; no new RPC or ID reuse.
+                    pending.deadline = pending.deadline.min(now);
+                } else if now >= pending.deadline {
                     if let Some(ticket) = quota.ticket.take() {
                         self.quota_owner
                             .failed(quota.epoch, ticket, QuotaFault::TimedOut, at);
@@ -99,6 +168,14 @@ impl Connection {
         let Some(ticket) = pending.ticket else {
             return;
         };
+        if pending
+            .action
+            .as_ref()
+            .is_some_and(|action| action.check(&self.scope, Instant::now()).is_err())
+        {
+            self.quota_owner.abandon(pending.epoch, ticket, wall_ms());
+            return;
+        }
         if Instant::now() >= deadline {
             self.quota_owner
                 .failed(pending.epoch, ticket, QuotaFault::TimedOut, wall_ms());
@@ -123,7 +200,7 @@ impl Connection {
         self.publish_quota();
     }
 }
-fn wall_ms() -> u64 {
+pub(super) fn wall_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()

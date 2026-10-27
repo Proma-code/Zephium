@@ -1,7 +1,7 @@
 //! Local queue capacity and move-only turn ownership. No provider authority.
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc, Mutex,
+    mpsc, Arc, Mutex, MutexGuard, Weak,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -10,6 +10,73 @@ pub(super) enum Error {
     Busy,
     Closed,
 }
+/// Cancellation-only joins for the same caller bits retained by native writers.
+/// Registration and permanent retirement share one lock; neither grants work.
+#[derive(Default)]
+pub(super) struct Cancellations(Mutex<(bool, Vec<Weak<AtomicBool>>)>);
+impl Cancellations {
+    pub(super) fn register(&self, cancel: &Arc<AtomicBool>) -> Result<(), Error> {
+        let mut state = self.0.lock().map_err(|_| Error::Closed)?;
+        if state.0 {
+            cancel.store(true, Ordering::Release);
+            return Err(Error::Closed);
+        }
+        state.1.retain(|value| value.strong_count() != 0);
+        if state
+            .1
+            .iter()
+            .any(|value| value.ptr_eq(&Arc::downgrade(cancel)))
+        {
+            return Ok(());
+        }
+        if state.1.len() >= 64 {
+            return Err(Error::Busy);
+        }
+        state.1.push(Arc::downgrade(cancel));
+        Ok(())
+    }
+    pub(super) fn retire(&self) {
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        state.0 = true;
+        for cancel in state.1.iter().filter_map(Weak::upgrade) {
+            cancel.store(true, Ordering::Release);
+        }
+        state.1.clear();
+    }
+}
+
+/// Local, move-only transfer. Until committed, early return or unwind restores
+/// the exact value under the original lock. Never hold this across native I/O.
+pub(super) struct Transfer<'a, T> {
+    slot: MutexGuard<'a, Option<T>>,
+    value: Option<T>,
+}
+impl<'a, T> Transfer<'a, T> {
+    pub(super) fn take(slot: &'a Mutex<Option<T>>) -> Result<Option<Self>, Error> {
+        let mut slot = slot.lock().map_err(|_| Error::Closed)?;
+        let Some(value) = slot.take() else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            slot,
+            value: Some(value),
+        }))
+    }
+    pub(super) fn value(&self) -> &T {
+        self.value.as_ref().expect("uncommitted local transfer")
+    }
+    pub(super) fn commit(mut self) -> T {
+        self.value.take().expect("uncommitted local transfer")
+    }
+}
+impl<T> Drop for Transfer<'_, T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            *self.slot = Some(value);
+        }
+    }
+}
+
 struct State {
     gate: Mutex<()>,
     capacity: usize,
@@ -17,6 +84,7 @@ struct State {
     turn: Arc<Semaphore>,
     browser_turn: Arc<AtomicBool>,
     ready: AtomicBool,
+    parked: AtomicBool,
 }
 pub(super) struct Queue<T> {
     sender: mpsc::SyncSender<Envelope<T>>,
@@ -35,6 +103,23 @@ pub(super) struct Reserved {
     state: Arc<State>,
     capacity: OwnedSemaphorePermit,
     turn: Turn,
+}
+/// An explicit, unsent Reply owns the same physical lane while a newly opened
+/// runtime is preparing. It cannot be handed off until current readiness is
+/// observed and this exact value is refined into Reserved.
+pub(super) struct Demand(Reserved);
+
+/// The same queue gate is sealed while its owner attempts healthy retirement.
+/// Dropping this value stays closed. Only a returned, unchanged native owner
+/// may explicitly reopen it after a NotReady result.
+pub(super) struct Parking(Arc<State>);
+impl Parking {
+    pub(super) fn reopen(self) {
+        let Ok(_guard) = self.0.gate.lock() else {
+            return;
+        };
+        self.0.parked.store(false, Ordering::Release);
+    }
 }
 /// The actor owns this through terminal AND original thread closure. Waiting
 /// caller completion/cancellation is deliberately not represented here.
@@ -125,6 +210,7 @@ pub(super) fn channel<T>(capacity: usize) -> (Queue<T>, Receiver<T>) {
         turn: Arc::new(Semaphore::new(1)),
         browser_turn: Arc::new(AtomicBool::new(false)),
         ready: AtomicBool::new(false),
+        parked: AtomicBool::new(false),
     });
     (
         Queue {
@@ -138,6 +224,9 @@ impl<T> Queue<T> {
     /// Every command, not only turns, consumes the same physical queue budget.
     pub(super) fn enqueue(&self, value: T, revocation: bool) -> Result<(), Error> {
         let _guard = self.state.gate.lock().map_err(|_| Error::Closed)?;
+        if self.state.parked.load(Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
         if !revocation
             && (self.state.turn.available_permits() == 0
                 || self.state.browser_turn.load(Ordering::Acquire))
@@ -168,6 +257,7 @@ impl<T> Queue<T> {
         let _guard = self.state.gate.lock().map_err(|_| Error::Closed)?;
         if self.state.turn.available_permits() == 0
             || self.state.browser_turn.load(Ordering::Acquire)
+            || self.state.parked.load(Ordering::Acquire)
         {
             return Err(Error::Busy);
         }
@@ -180,7 +270,10 @@ impl<T> Queue<T> {
         let Ok(_guard) = self.state.gate.lock() else {
             return;
         };
-        self.state.ready.store(ready, Ordering::Release);
+        self.state.ready.store(
+            ready && !self.state.parked.load(Ordering::Acquire),
+            Ordering::Release,
+        );
     }
     pub(super) fn reserve(&self) -> Result<Reserved, Error> {
         self.reserve_mode(TurnMode::Text)
@@ -189,8 +282,41 @@ impl<T> Queue<T> {
         self.reserve_mode(TurnMode::Browser)
     }
     fn reserve_mode(&self, mode: TurnMode) -> Result<Reserved, Error> {
+        self.reserve_local(mode, true)
+    }
+    pub(super) fn demand_browser(&self) -> Result<Demand, Error> {
+        self.reserve_local(TurnMode::Browser, false).map(Demand)
+    }
+    pub(super) fn demand_command(&self) -> Result<Demand, Error> {
+        self.reserve_local(TurnMode::Text, false).map(Demand)
+    }
+    /// Consume an explicit non-model wake demand into this SAME queue without
+    /// exposing a drop-then-enqueue gap to parking or another caller. It confers
+    /// no native action authority; the receiving owner still checks the command.
+    pub(super) fn handoff_command(&self, demand: Demand, value: T) -> Result<(), Error> {
+        let _guard = self.state.gate.lock().map_err(|_| Error::Closed)?;
+        if !Arc::ptr_eq(&self.state, &demand.0.state)
+            || self.state.parked.load(Ordering::Acquire)
+            || demand.0.turn.browser.is_some()
+        {
+            return Err(Error::Closed);
+        }
+        let Demand(Reserved { capacity, turn, .. }) = demand;
+        self.state.ready.store(false, Ordering::Release);
+        let result = self
+            .sender
+            .try_send(Envelope {
+                value,
+                _capacity: capacity,
+            })
+            .map_err(|_| Error::Closed);
+        drop(turn);
+        result
+    }
+    fn reserve_local(&self, mode: TurnMode, require_ready: bool) -> Result<Reserved, Error> {
         let _guard = self.state.gate.try_lock().map_err(|_| Error::Busy)?;
-        if !self.state.ready.load(Ordering::Acquire)
+        if (require_ready && !self.state.ready.load(Ordering::Acquire))
+            || self.state.parked.load(Ordering::Acquire)
             || self.state.queue.available_permits() != self.state.capacity
             || self.state.browser_turn.load(Ordering::Acquire)
         {
@@ -223,6 +349,39 @@ impl<T> Queue<T> {
             },
         })
     }
+    pub(super) fn refine_demand(&self, demand: Demand) -> Result<Reserved, (Error, Demand)> {
+        let Ok(_guard) = self.state.gate.try_lock() else {
+            return Err((Error::Busy, demand));
+        };
+        if !Arc::ptr_eq(&self.state, &demand.0.state) || self.state.parked.load(Ordering::Acquire) {
+            return Err((Error::Closed, demand));
+        }
+        if !self.state.ready.load(Ordering::Acquire)
+            || self.state.queue.available_permits() != self.state.capacity - 1
+        {
+            return Err((Error::Busy, demand));
+        }
+        Ok(demand.0)
+    }
+    /// No queued command or reserved capacity can cross this transition.
+    /// `quiescent` is a nonblocking local ownership check; no I/O/queue call.
+    pub(super) fn try_park(&self, quiescent: impl FnOnce() -> bool) -> Result<Parking, Error> {
+        let _guard = self.state.gate.try_lock().map_err(|_| Error::Busy)?;
+        if self.state.parked.load(Ordering::Acquire)
+            || self.state.queue.available_permits() != self.state.capacity
+            || self.state.turn.available_permits() != 1
+            || self.state.browser_turn.load(Ordering::Acquire)
+            || !quiescent()
+        {
+            return Err(Error::Busy);
+        }
+        self.state.parked.store(true, Ordering::Release);
+        self.state.ready.store(false, Ordering::Release);
+        Ok(Parking(self.state.clone()))
+    }
+    pub(super) fn is_parked(&self) -> bool {
+        self.state.parked.load(Ordering::Acquire)
+    }
     /// Observational lifecycle only. The worker closes ordinary readiness
     /// before checking this under the same gate, preventing an exit from
     /// stranding a pre-say reservation or a synchronous committed handoff.
@@ -247,7 +406,9 @@ impl<T> Queue<T> {
         let Ok(_guard) = self.state.gate.try_lock() else {
             return false;
         };
-        Arc::ptr_eq(&self.state, &reserved.state) && self.state.ready.load(Ordering::Acquire)
+        Arc::ptr_eq(&self.state, &reserved.state)
+            && !self.state.parked.load(Ordering::Acquire)
+            && self.state.ready.load(Ordering::Acquire)
     }
     /// One read-only owner inspection for the exact held reservation, before
     /// Page commits a visible reply. It uses this same queue's temporary
@@ -255,7 +416,7 @@ impl<T> Queue<T> {
     /// This is not a generic bypass of occupied-turn command admission.
     pub(super) fn inspect_reserved(&self, reserved: &Reserved, value: T) -> Result<(), Error> {
         let _guard = self.state.gate.try_lock().map_err(|_| Error::Busy)?;
-        if !Arc::ptr_eq(&self.state, &reserved.state) {
+        if !Arc::ptr_eq(&self.state, &reserved.state) || self.state.parked.load(Ordering::Acquire) {
             return Err(Error::Closed);
         }
         if !self.state.ready.load(Ordering::Acquire)
@@ -288,7 +449,7 @@ impl<T> Queue<T> {
         // closed receiver is now an unknown handoff, not an unsent reservation.
         reserved.turn.committed = true;
         let _guard = self.state.gate.lock().map_err(|_| Error::Closed)?;
-        if !Arc::ptr_eq(&self.state, &reserved.state) {
+        if !Arc::ptr_eq(&self.state, &reserved.state) || self.state.parked.load(Ordering::Acquire) {
             return Err(Error::Closed);
         }
         self.state.ready.store(false, Ordering::Release);
@@ -754,5 +915,215 @@ mod tests {
         let turn = queue.reserve().unwrap();
         assert_eq!(queue.enqueue("another selection", false), Err(Error::Busy));
         drop(turn);
+    }
+
+    #[test]
+    fn local_transfer_restores_exact_custody_until_committed_once() {
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Token(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Token {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        let slot = Mutex::new(Some(Token(drops.clone())));
+        {
+            let transfer = Transfer::take(&slot).unwrap().unwrap();
+            assert!(Arc::ptr_eq(&transfer.value().0, &drops));
+            assert!(matches!(
+                slot.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            // Local validation failure/early return restores, without cloning.
+        }
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        let token = Transfer::take(&slot).unwrap().unwrap().commit();
+        assert!(Transfer::take(&slot).unwrap().is_none());
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        drop(token);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+    #[test]
+    fn local_transfer_unwind_restores_value_without_claiming_native_settlement() {
+        let token = Arc::new(());
+        let slot = Mutex::new(Some(token.clone()));
+        assert!(std::panic::catch_unwind(|| {
+            let _transfer = Transfer::take(&slot).unwrap().unwrap();
+            panic!("local preparation failed");
+        })
+        .is_err());
+        let restored = slot.lock().unwrap_or_else(|error| error.into_inner());
+        assert!(Arc::ptr_eq(restored.as_ref().unwrap(), &token));
+    }
+
+    #[test]
+    fn action_cancellation_registration_and_retirement_are_one_permanent_join() {
+        let cancellations = Arc::new(Cancellations::default());
+        let first = Arc::new(AtomicBool::new(false));
+        cancellations.register(&first).unwrap();
+        cancellations.register(&first).unwrap();
+        let second = Arc::new(AtomicBool::new(false));
+        let owned = cancellations.clone();
+        let token = second.clone();
+        let registering = std::thread::spawn(move || owned.register(&token));
+        cancellations.retire();
+        let _ = registering.join().unwrap();
+        assert!(first.load(Ordering::Acquire));
+        assert!(second.load(Ordering::Acquire));
+        let late = Arc::new(AtomicBool::new(false));
+        assert_eq!(cancellations.register(&late), Err(Error::Closed));
+        assert!(late.load(Ordering::Acquire));
+    }
+    #[test]
+    fn action_cancellation_registry_is_bounded_and_does_not_keep_actions_alive() {
+        let cancellations = Cancellations::default();
+        let tokens: Vec<_> = (0..64).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        for token in &tokens {
+            cancellations.register(token).unwrap();
+        }
+        assert_eq!(
+            cancellations.register(&Arc::new(AtomicBool::new(false))),
+            Err(Error::Busy)
+        );
+        let weak = Arc::downgrade(&tokens[0]);
+        drop(tokens);
+        assert!(weak.upgrade().is_none());
+        assert!(cancellations
+            .register(&Arc::new(AtomicBool::new(false)))
+            .is_ok());
+    }
+
+    #[test]
+    fn command_wake_handoff_has_no_unowned_gap_for_parking_or_a_turn() {
+        let (queue, receiver) = channel::<&str>(2);
+        let demand = queue.demand_command().unwrap();
+        assert!(matches!(queue.try_park(|| true), Err(Error::Busy)));
+        assert_eq!(queue.enqueue("other", false), Err(Error::Busy));
+        queue.handoff_command(demand, "quota").unwrap();
+        assert!(matches!(queue.try_park(|| true), Err(Error::Busy)));
+        assert!(matches!(queue.demand_browser(), Err(Error::Busy)));
+        assert_eq!(receiver.try_recv().unwrap(), "quota");
+        // Receiving is not native settlement: the owner's independent predicate
+        // remains false until the actual read has settled.
+        assert!(matches!(queue.try_park(|| false), Err(Error::Busy)));
+        assert!(queue.try_park(|| true).is_ok());
+    }
+    #[test]
+    fn browser_demand_cannot_be_consumed_as_an_observation_command() {
+        let (queue, receiver) = channel::<u8>(2);
+        let demand = queue.demand_browser().unwrap();
+        assert_eq!(queue.handoff_command(demand, 1), Err(Error::Closed));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(!queue.browser_occupied());
+        assert!(queue.try_park(|| true).is_ok());
+    }
+    #[test]
+    fn command_wake_cannot_cross_queue_identity_or_reopen_retired_queue() {
+        let (old, _old_receiver) = channel::<u8>(2);
+        let (fresh, receiver) = channel::<u8>(2);
+        let demand = old.demand_command().unwrap();
+        assert_eq!(fresh.handoff_command(demand, 1), Err(Error::Closed));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        drop(old.try_park(|| true).unwrap());
+        fresh.set_ready(true);
+        assert!(matches!(old.demand_command(), Err(Error::Busy)));
+        assert!(fresh.demand_command().is_ok());
+    }
+
+    #[test]
+    fn parking_requires_all_command_capacity_not_only_an_idle_turn() {
+        let (queue, receiver) = channel::<u8>(2);
+        queue.set_ready(true);
+        queue.enqueue(1, false).unwrap();
+        assert!(matches!(queue.try_park(|| true), Err(Error::Busy)));
+        assert!(!queue.is_parked());
+        assert_eq!(receiver.try_recv().unwrap(), 1);
+        // The actor must independently prove the received operation settled.
+        assert!(matches!(queue.try_park(|| false), Err(Error::Busy)));
+        let parked = queue.try_park(|| true).unwrap();
+        assert!(queue.is_parked());
+        assert_eq!(queue.enqueue(2, false), Err(Error::Closed));
+        assert_eq!(queue.enqueue(3, true), Err(Error::Closed));
+        queue.set_ready(true);
+        assert!(matches!(queue.reserve_browser(), Err(Error::Busy)));
+        assert!(matches!(queue.demand_browser(), Err(Error::Busy)));
+        assert_eq!(
+            queue.retire_if_idle(|| panic!("retirement while parked")),
+            Err::<(), _>(Error::Busy)
+        );
+        parked.reopen();
+        assert!(!queue.is_parked());
+        assert!(matches!(queue.reserve(), Err(Error::Busy)));
+        queue.set_ready(true);
+        assert!(queue.reserve().is_ok());
+    }
+
+    #[test]
+    fn unsent_wake_demand_owns_same_turn_and_capacity_until_current_refinement() {
+        let (queue, _receiver) = channel::<()>(2);
+        let demand = queue.demand_browser().unwrap();
+        assert!(matches!(queue.try_park(|| true), Err(Error::Busy)));
+        assert_eq!(queue.enqueue((), false), Err(Error::Busy));
+        let (error, demand) = match queue.refine_demand(demand) {
+            Err(value) => value,
+            Ok(_) => panic!("unready demand became reservation"),
+        };
+        assert_eq!(error, Error::Busy);
+        queue.set_ready(true);
+        let reserved = queue.refine_demand(demand).unwrap_or_else(|_| panic!());
+        assert!(queue.validate(&reserved));
+        assert!(matches!(queue.try_park(|| true), Err(Error::Busy)));
+        drop(reserved);
+        assert!(queue.try_park(|| true).is_ok());
+    }
+
+    #[test]
+    fn dropped_unsent_demand_releases_but_committed_browser_loss_still_blocks_parking() {
+        let (queue, receiver) = channel::<Turn>(2);
+        drop(queue.demand_browser().unwrap());
+        let parked = queue.try_park(|| true).unwrap();
+        parked.reopen();
+        queue.set_ready(true);
+        let demand = queue.demand_browser().unwrap();
+        let reserved = queue.refine_demand(demand).unwrap_or_else(|_| panic!());
+        queue.handoff(reserved, |turn| turn).unwrap();
+        assert!(matches!(queue.try_park(|| true), Err(Error::Busy)));
+        drop(receiver.try_recv().unwrap());
+        assert!(queue.browser_handoff_lost());
+        assert!(matches!(queue.try_park(|| true), Err(Error::Busy)));
+    }
+
+    #[test]
+    fn foreign_demand_never_refines_or_releases_the_held_owner_lane() {
+        let (first, _first_receiver) = channel::<()>(2);
+        let (second, _second_receiver) = channel::<()>(2);
+        first.set_ready(true);
+        second.set_ready(true);
+        let demand = first.demand_browser().unwrap();
+        let (error, demand) = match second.refine_demand(demand) {
+            Err(value) => value,
+            Ok(_) => panic!("foreign demand accepted"),
+        };
+        assert_eq!(error, Error::Closed);
+        assert!(matches!(first.try_park(|| true), Err(Error::Busy)));
+        drop(demand);
+        assert!(first.try_park(|| true).is_ok());
+        assert!(second.try_park(|| true).is_ok());
+    }
+
+    #[test]
+    fn dropped_parking_guard_never_reopens_after_unknown_retirement() {
+        let (queue, _receiver) = channel::<()>(2);
+        drop(queue.try_park(|| true).unwrap());
+        queue.set_ready(true);
+        assert!(queue.is_parked());
+        assert_eq!(queue.enqueue((), true), Err(Error::Closed));
+        assert!(matches!(queue.demand_browser(), Err(Error::Busy)));
     }
 }

@@ -308,6 +308,32 @@ impl Conversation {
     pub fn phase(&self) -> Phase {
         self.phase
     }
+    /// No attached original thread or unresolved reducer work in this owner.
+    /// A cold Store reconstruction has never attached a thread in this session;
+    /// an opened thread requires both real unsubscribe and closure receipts.
+    #[cfg(any(
+        test,
+        all(
+            windows,
+            any(feature = "native-fixtures", feature = "trial-integration")
+        )
+    ))]
+    pub(crate) fn ready_to_dormant(&self, scope: &Scope) -> bool {
+        self.scope == *scope
+            && self.pending.is_empty()
+            && self.active.is_none()
+            && self.early.is_empty()
+            && self.early_bytes == 0
+            && match self.phase {
+                Phase::New => self.thread.is_none() && self.generation == 0,
+                Phase::Closed => {
+                    self.thread.is_some()
+                        && ((self.generation == 0 && self.choice.is_none())
+                            || (self.close_seen && self.unsubscribe_ack))
+                }
+                _ => false,
+            }
+    }
     pub fn thread_id(&self) -> Option<&str> {
         self.thread.as_deref()
     }

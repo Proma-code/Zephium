@@ -2442,7 +2442,7 @@ async fn native_text_is_exact_and_has_no_page_history_tools_or_cost() {
     let model = status.model.unwrap();
     assert_eq!(model.name, "Original Name");
     assert_eq!(model.source, PageAssistModelSourceV1::Codex);
-    assert_eq!(model.capabilities, PageAssistCapabilitiesV1::TextOnly);
+    assert_eq!(model.capabilities, Some(PageAssistCapabilitiesV1::TextOnly));
     assert_eq!(model.effort.as_deref(), Some("minimal"));
     assert!(
         status.page.is_none()

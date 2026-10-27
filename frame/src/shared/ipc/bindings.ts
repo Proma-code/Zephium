@@ -1938,21 +1938,23 @@ export type PageAssistAttachmentV1 =
  *  Whether the page in front can be read now. Anything but `ready` means the
  *  page is not attached; the conversation itself still works.
  */
-export type PageAssistAvailabilityV1 = "ready" |
+export type PageAssistAvailabilityV1 = "ready" | 
+/**  Local draft context is available; the original client must be freshly admitted on send. */
+"dormant" | 
 /**  AI is switched off in Settings. */
-"ai_off" |
+"ai_off" | 
 /**  Private windows never send pages to a model. */
-"private" |
+"private" | 
 /**  Not a web page: internal pages, new tab, files, extension pages, PDFs. */
-"not_web" |
+"not_web" | 
 /**  Banks, payments, health and government sites are never read. */
-"sensitive" |
+"sensitive" | 
 /**  No model is set up: no Zephium account and no key. */
-"no_model" |
+"no_model" | 
 /**  The page is still loading; ask again when it settles. */
-"loading" |
+"loading" | 
 /**  This platform cannot read pages yet. */
-"unsupported" |
+"unsupported" | 
 /**  The tab is gone or the service is not running. */
 "unavailable";
 
@@ -2159,8 +2161,11 @@ export type PageAssistModelV1 = {
 	hosted: boolean,
 	/**  Actual backend, not inferred from the display name. */
 	source: PageAssistModelSourceV1,
-	/**  Capabilities are known before reading any page context. */
-	capabilities: PageAssistCapabilitiesV1,
+	/**
+	 *  Freshly observed runtime capability; absent for a dormant original client.
+	 *  Local draft context is not a provider or tool admission.
+	 */
+	capabilities: PageAssistCapabilitiesV1 | null,
 	/**  The effort it runs at, such as "high"; null when it has none. */
 	effort: string | null,
 };

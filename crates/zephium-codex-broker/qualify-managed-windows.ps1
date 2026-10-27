@@ -64,6 +64,19 @@ Assert-Receipts $output @(
     'codex-browser-local-receipt-loss-quarantined',
     'codex-browser-duplicate-request-no-effect'
 )
+$output=@(& $fixture dormant-owner); $code=$LASTEXITCODE; $output | Write-Output
+if ($code -ne 0) { throw 'Synthetic healthy dormant-owner qualification failed.' }
+Assert-Receipts $output @(
+    'codex-dormant-package-release-same-thread-wake',
+    'codex-dormant-nonzero-not-healthy',
+    'codex-dormant-late-frame-not-healthy',
+    'codex-dormant-forced-close-not-healthy',
+    'codex-dormant-expired-quota-late-reply-inert',
+    'codex-dormant-expired-quota-absent-unknown',
+    'codex-dormant-quota-duplicate-refused',
+    'codex-dormant-quota-foreign-refused',
+    'codex-dormant-quota-account-change-refused'
+)
 $output=@(& $fixture quota); $code=$LASTEXITCODE; $output | Write-Output
 if ($code -ne 0) { throw 'Synthetic observational quota qualification failed.' }
 Assert-Receipts $output @(
@@ -141,3 +154,11 @@ foreach ($pin in $pins) {
 # This proves startup/config/account absence and physical teardown for both
 # releases plus same-image experimental Browser schema export/cleanup, not real
 # login, model responses, Page effects or cross-version authenticated turns.
+
+$output=@(& $fixture dormant-original (Join-Path $root 'codex-0.163.0.exe') (Join-Path $root 'codex-0.164.0.exe'))
+$code=$LASTEXITCODE; $output | Write-Output
+if ($code -ne 0) { throw 'Original credential-free dormant image/home wake qualification failed.' }
+Assert-Receipts $output @('codex-dormant-original-0.163.0-to-0.164.0')
+# The original pair proves fresh authenticated image admission, package-pin
+# release, unchanged managed home/grant and fresh signed-out account read only.
+# Same-thread continuity is synthetic above; no authenticated original turn runs.

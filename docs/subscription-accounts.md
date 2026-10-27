@@ -30,6 +30,14 @@ Compatible runtime changes preserve the same managed home and original thread
 associations. A genuinely unsupported runtime must not delete the account,
 convert credentials, replay an uncertain message or fabricate continued history.
 
+An idle connection releases its executable and package handles only after the
+original process, pending operations and browser effects have settled. The
+account and saved threads remain in the same managed home. Passive status reads
+do not restart the client; a new message or explicit account/quota refresh obtains
+fresh verified runtime admission. Stop also cancels this preparation before a
+message is added, preserving the draft. A faulted or uncertain owner is not
+reported as healthy idle state, and no uncertain message is retried automatically.
+
 Quota is original Codex account data, not API billing. The view preserves the
 source, observation time and any reported windows. Missing values remain unknown;
 a failed refresh can leave a previous reading marked stale. Refreshing quota

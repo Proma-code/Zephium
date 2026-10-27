@@ -24,9 +24,13 @@
     onexit: () => void;
   } = $props();
 
-  const page = $derived(status.availability === "ready" ? status.page : null);
+  const page = $derived(
+    status.availability === "ready" || status.availability === "dormant" ? status.page : null,
+  );
   const away = $derived(
-    status.availability === "ready" ? null : availabilityView(status.availability),
+    status.availability === "ready" || status.availability === "dormant"
+      ? null
+      : availabilityView(status.availability),
   );
   const starts = $derived(page ? startsFor(status.suggestions) : []);
   const greeting = $derived(

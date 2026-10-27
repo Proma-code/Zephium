@@ -18,11 +18,14 @@ const faults: Record<CodexFaultV1, () => string> = {
 export const codexFault = (fault: CodexFaultV1) => faults[fault]();
 /** Observed native capability, not a renderer permission or a connection-state guess. */
 export function codexCapability(view: CodexViewV1 | null): string | null {
-  if (view?.state !== "connected") return null;
+  if (view?.state !== "connected" || view.runtime !== "active") return null;
   return view.text_only ? m.codex_browser_unavailable() : m.codex_browser_ready();
 }
 export function codexStatus(view: CodexViewV1 | null): string {
   if (!view) return m.codex_loading();
+  if (view.runtime === "preparing") return m.codex_preparing();
+  if (view.state === "connected" && view.runtime === "dormant") return m.codex_dormant();
+  if (view.state === "connected" && view.runtime === "unavailable") return m.codex_unavailable();
   return {
     unavailable: m.codex_unavailable,
     preparing: m.codex_preparing,

@@ -204,7 +204,35 @@ impl NativeConversationReservation for BrowserReservation {
         })
     }
 }
+struct BrowserDemand(Arc<BrowserFixture>);
+impl NativeConversationDemand for BrowserDemand {
+    fn reserve_browser(
+        self: Box<Self>,
+        expected: NativeConversationChoice,
+        draft: NativeConversationDraft,
+        manifest: NativeBrowserManifest,
+    ) -> BoxFuture<'static, Result<Box<dyn NativeConversationReservation>, PageBackendError>> {
+        Box::pin(async move {
+            BrowserModels(self.0)
+                .reserve_native_browser(&profile(), expected, draft, manifest)
+                .await
+        })
+    }
+}
 impl ModelSource for BrowserModels {
+    fn prepare_reply<'a>(
+        &'a self,
+        _: &'a ProfileId,
+        _: Arc<AtomicBool>,
+        _: std::time::Instant,
+    ) -> BoxFuture<'a, Result<Option<Box<dyn NativeConversationDemand>>, PageBackendError>> {
+        Box::pin(async {
+            Ok(Some(
+                Box::new(BrowserDemand(self.0.clone())) as Box<dyn NativeConversationDemand>
+            ))
+        })
+    }
+
     fn entry<'a>(&'a self, _: &'a ProfileId) -> BoxFuture<'a, Option<PageBackendChoice>> {
         Box::pin(async move {
             // Only post-commit availability is held; pre-say admission remains
@@ -1111,7 +1139,7 @@ async fn browser_choice_capability_is_preserved_without_text_fallback() {
     let status = h.service.status(SPACE, Some(TAB)).await;
     assert_eq!(
         status.model.unwrap().capabilities,
-        PageAssistCapabilitiesV1::Page
+        Some(PageAssistCapabilitiesV1::Page)
     );
     let before = status.conversation.clone();
     let refusal = h
@@ -1673,3 +1701,6 @@ async fn public_ask_keeps_ordinary_model_browser_path_unchanged() {
         matches!(&h.blocks().await[0], PageAssistBlockV1::Text { text, .. } if text == "Ordinary model answer")
     );
 }
+
+#[path = "native_preparation.rs"]
+mod preparation_tests;

@@ -1,5 +1,5 @@
 //! Logical startup timing, not process or account authority. Physical custody
-//! still drains after expiry; no later stage may renew a removal obligation.
+//! still drains after expiry; no later stage may renew a removal or wake obligation.
 use std::time::{Duration, Instant};
 const PREPARATION: Duration = Duration::from_secs(120);
 const RPC: Duration = Duration::from_secs(60);
@@ -7,20 +7,23 @@ const RPC: Duration = Duration::from_secs(60);
 #[derive(Clone, Copy)]
 pub(crate) struct PreparationBudget {
     stage: Instant,
-    removal_limit: Option<Instant>,
+    absolute_limit: Option<Instant>,
 }
 impl PreparationBudget {
     pub(crate) fn ordinary(deadline: Instant) -> Self {
         Self {
             stage: deadline,
-            removal_limit: None,
+            absolute_limit: None,
         }
     }
     pub(crate) fn removal(now: Instant, original_limit: Instant) -> Self {
+        Self::bounded(now, original_limit)
+    }
+    pub(crate) fn bounded(now: Instant, original_limit: Instant) -> Self {
         let limit = (now + PREPARATION).min(original_limit);
         Self {
             stage: limit,
-            removal_limit: Some(limit),
+            absolute_limit: Some(limit),
         }
     }
     pub(crate) fn deadline(self) -> Instant {
@@ -29,7 +32,7 @@ impl PreparationBudget {
     pub(crate) fn next_rpc(self, now: Instant) -> Self {
         let stage = now + RPC;
         Self {
-            stage: self.removal_limit.map_or(stage, |limit| stage.min(limit)),
+            stage: self.absolute_limit.map_or(stage, |limit| stage.min(limit)),
             ..self
         }
     }
@@ -86,6 +89,22 @@ mod tests {
                 .next_rpc(now + Duration::from_secs(178))
                 .deadline(),
             now + Duration::from_secs(238)
+        );
+    }
+    #[test]
+    fn dormant_wake_discovery_schema_account_and_catalog_share_one_absolute_cap() {
+        let start = Instant::now();
+        let limit = start + PREPARATION;
+        let discovery = PreparationBudget::bounded(start + Duration::from_secs(80), limit);
+        let schema = discovery.next_rpc(start + Duration::from_secs(100));
+        let account = schema.next_rpc(start + Duration::from_secs(115));
+        let catalog = account.next_rpc(start + Duration::from_secs(119));
+        assert_eq!(catalog.deadline(), limit);
+        assert_eq!(
+            catalog
+                .next_rpc(start + Duration::from_secs(121))
+                .deadline(),
+            limit
         );
     }
 }

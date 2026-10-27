@@ -75,7 +75,7 @@ export class CodexSession {
     this.view = view;
     this.observationFailed = false;
     this.pendingLogin = view.state === "signing_in";
-    if (!this.pendingLogin && view.state !== "preparing") {
+    if (!this.pendingLogin && view.state !== "preparing" && view.runtime !== "preparing") {
       this.ownedAttempt = null;
       this.pollDeadline = null;
       this.pollingPaused = false;
@@ -94,7 +94,11 @@ export class CodexSession {
 
   private schedulePoll() {
     this.clearTimer();
-    if (!this.active || (!this.signingIn && this.view?.state !== "preparing") || this.pollingPaused)
+    if (
+      !this.active ||
+      (!this.signingIn && this.view?.state !== "preparing" && this.view?.runtime !== "preparing") ||
+      this.pollingPaused
+    )
       return;
     this.pollDeadline ??= Date.now() + POLL_WINDOW;
     if (Date.now() >= this.pollDeadline) {
@@ -151,6 +155,7 @@ export class CodexSession {
       return false;
     const sequence = ++this.sequence;
     const generation = this.generation;
+    const observingWake = this.view?.runtime === "dormant" || this.view?.runtime === "preparing";
     this.busy = action;
     this.observationFailed = false;
     this.clearTimer();
@@ -163,7 +168,9 @@ export class CodexSession {
     this.busy = null;
     const adopted = result.state === "received" && this.adopt(result.value);
     if (!adopted) this.observationFailed = true;
-    if (this.readAgain) {
+    // A slow explicit wake may outlive this renderer's observation. Reconcile
+    // once even if its Preparing event was missed; Account never wakes/replays.
+    if (this.readAgain || (observingWake && result.state === "timeout")) {
       this.readAgain = false;
       void this.read();
     } else this.schedulePoll();

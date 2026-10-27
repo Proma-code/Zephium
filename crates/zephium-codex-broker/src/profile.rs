@@ -231,6 +231,25 @@ mod tests {
         }
     }
     #[test]
+    fn dormant_wake_requires_the_exact_original_registration_not_just_incarnation() {
+        let original = sample();
+        assert!(crate::dormancy::same_home(&original, &original));
+        for changed in 0..8 {
+            let mut held = original.clone();
+            match changed {
+                0 => held.profile = ProfileId::from_native([9; 16]).unwrap(),
+                1 => held.incarnation[0] ^= 1,
+                2 => held.owner[0] ^= 1,
+                3 => held.nodes[0].file[0] ^= 1,
+                4 => held.nodes[1].volume += 1,
+                5 => held.config[0] ^= 1,
+                6 => held.environments[0] ^= 1,
+                _ => held.version += 1,
+            }
+            assert!(!crate::dormancy::same_home(&original, &held));
+        }
+    }
+    #[test]
     fn exact_record_roundtrip_and_native_scope_binding() {
         let value = sample();
         let bytes = value.encode().unwrap();

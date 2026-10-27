@@ -163,6 +163,27 @@ impl RuntimePaths {
             Custody::Temporary(_) => unreachable!("persistent custody checked"),
         }
     }
+    pub(crate) fn persistent_identity(&self) -> Option<(crate::profile::ProfileId, [u8; 16])> {
+        self.persistent_record()
+            .map(|record| (record.profile, record.incarnation))
+    }
+    pub(crate) fn persistent_record(&self) -> Option<&crate::profile::Record> {
+        match &self._custody {
+            Custody::Persistent(lease) => Some(&lease.record),
+            Custody::Temporary(_) => None,
+        }
+    }
+    pub(crate) fn verify_dormant_clean(&self) -> Result<(), &'static str> {
+        if self.active.load(Ordering::Acquire) {
+            return Err("runtime-active");
+        }
+        match &self._custody {
+            Custody::Persistent(lease) => lease
+                .verify_clean_for_dormant()
+                .map_err(|_| "runtime-not-clean"),
+            Custody::Temporary(_) => Err("runtime-not-persistent"),
+        }
+    }
     pub(crate) fn begin_connection(&self) -> Result<(), &'static str> {
         // A failed DIRTY write deliberately leaves active=true: this exact runtime
         // cannot be retried after uncertain I/O, even if no child was created.

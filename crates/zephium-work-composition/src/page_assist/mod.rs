@@ -9,6 +9,7 @@ mod fault;
 mod native_browser;
 mod native_budget;
 pub mod port;
+mod preparation;
 pub use zephium_page_assist as core;
 mod readout;
 pub mod steps;
@@ -188,6 +189,8 @@ struct State {
     /// Changes when a Space leaves/reopens a conversation, including A→B→A.
     current_epochs: HashMap<String, Arc<()>>,
     running: HashMap<String, Running>,
+    /// Uncommitted explicit asks; lifecycle only, never native admission.
+    preparing: HashMap<String, preparation::Preparing>,
     /// Entered native browser owners outlive cancelled/dropped UI waiters.
     native_owners: HashMap<(String, u32), agent::BrowserOwner>,
     /// The structure of each tab's latest read, for suggestions.
@@ -334,12 +337,13 @@ impl PageAssist {
         }
     }
 
-    async fn availability(&self, facts: Option<&TabFacts>) -> PageAssistAvailabilityV1 {
+    /// Page-local safety alone. It does not observe or wake a provider.
+    fn local_availability(&self, facts: Option<&TabFacts>) -> PageAssistAvailabilityV1 {
         let Some(facts) = facts else {
             return PageAssistAvailabilityV1::Unavailable;
         };
         let site = site_of(facts.url.as_deref());
-        let mut policy = PolicyFacts {
+        policy::availability(&PolicyFacts {
             ai_enabled: self.ports().settings.ai_enabled(&facts.profile),
             private: facts.private,
             url: facts.url.as_deref(),
@@ -350,11 +354,52 @@ impl PageAssist {
             loading: facts.loading,
             has_model: true,
             supported: self.ports().page.supported(),
-        };
-        if policy::availability(&policy) == PageAssistAvailabilityV1::Ready {
-            policy.has_model = self.ports().models.entry(&facts.profile).await.is_some();
+        })
+    }
+
+    /// Active reply/tool admission never accepts retained dormant metadata.
+    async fn availability(&self, facts: Option<&TabFacts>) -> PageAssistAvailabilityV1 {
+        let local = self.local_availability(facts);
+        if local != PageAssistAvailabilityV1::Ready {
+            return local;
         }
-        policy::availability(&policy)
+        let Some(facts) = facts else {
+            return PageAssistAvailabilityV1::Unavailable;
+        };
+        if self.ports().models.entry(&facts.profile).await.is_some() {
+            PageAssistAvailabilityV1::Ready
+        } else {
+            PageAssistAvailabilityV1::NoModel
+        }
+    }
+
+    /// A parked runtime does not revoke the browser's own local draft controls.
+    /// Neither observation below may wake a runtime or reserve/send a model.
+    async fn draft_availability(&self, facts: Option<&TabFacts>) -> PageAssistAvailabilityV1 {
+        let active = self.availability(facts).await;
+        if active != PageAssistAvailabilityV1::NoModel {
+            return active;
+        }
+        let Some(facts) = facts else {
+            return PageAssistAvailabilityV1::Unavailable;
+        };
+        if self.ports().models.dormant(&facts.profile).await.is_some() {
+            PageAssistAvailabilityV1::Dormant
+        } else {
+            active
+        }
+    }
+
+    fn draft_scope_current(&self, space: &str, tab: &str, captured: &TabFacts) -> bool {
+        self.ports().tabs.profile(space) == Some(captured.profile)
+            && captured.space.as_deref().is_none_or(|s| s == space)
+            && self.ports().page.facts(tab).is_some_and(|facts| {
+                facts.profile == captured.profile
+                    && facts.epoch == captured.epoch
+                    && facts.space == captured.space
+                    && facts.url == captured.url
+                    && self.local_availability(Some(&facts)) == PageAssistAvailabilityV1::Ready
+            })
     }
 
     fn new_id(&self) -> String {
@@ -375,7 +420,11 @@ impl PageAssist {
             let Some(oldest) = state
                 .live
                 .iter()
-                .filter(|(id, _)| !shown.contains(id) && !state.running.contains_key(*id))
+                .filter(|(id, _)| {
+                    !shown.contains(id)
+                        && !state.running.contains_key(*id)
+                        && !state.preparing.contains_key(*id)
+                })
                 .min_by_key(|(_, live)| live.touched)
                 .map(|(id, _)| id.clone())
             else {
@@ -403,7 +452,14 @@ impl PageAssist {
                     }
                     Some(id)
                 }
-                _ => None,
+                _ => {
+                    if let Some(id) = state.current.get(space) {
+                        if let Some(preparing) = state.preparing.get(id) {
+                            preparing.cancel.cancel(CancelReason::Gone);
+                        }
+                    }
+                    None
+                }
             }
         };
         if let Some(id) = existing {
@@ -437,8 +493,17 @@ impl PageAssist {
     /// Everything the panel shows for `space` with `tab` in front.
     pub async fn status(&self, space: &str, tab: Option<&str>) -> PageAssistStatusV1 {
         let facts = tab.and_then(|tab| self.ports().page.facts(tab));
-        let availability = self.availability(facts.as_ref()).await;
         let profile = self.profile_for(space, facts.as_ref());
+        let availability = if profile
+            .is_some_and(|profile| self.ports().tabs.profile(space) != Some(profile))
+            || facts
+                .as_ref()
+                .is_some_and(|facts| facts.space.as_deref().is_some_and(|s| s != space))
+        {
+            PageAssistAvailabilityV1::Unavailable
+        } else {
+            self.draft_availability(facts.as_ref()).await
+        };
         let mut status = PageAssistStatusV1 {
             version: VERSION,
             space: space.to_owned(),
@@ -460,7 +525,10 @@ impl PageAssist {
         let Some(profile) = profile else {
             return status;
         };
-        if facts.as_ref().is_some_and(|facts| facts.private)
+        if self.ports().tabs.profile(space) != Some(profile)
+            || facts.as_ref().is_some_and(|facts| {
+                facts.private || facts.space.as_deref().is_some_and(|s| s != space)
+            })
             || !self.ports().settings.ai_enabled(&profile)
         {
             return status;
@@ -486,7 +554,7 @@ impl PageAssist {
                         == zephium_core::work::model::WorkModelProvider::Cloud,
                     name: choice.entry.display_name,
                     source: PageAssistModelSourceV1::Model,
-                    capabilities: PageAssistCapabilitiesV1::Page,
+                    capabilities: Some(PageAssistCapabilitiesV1::Page),
                     effort: choice
                         .effort
                         .filter(|_| choice.entry.supports.reasoning)
@@ -497,23 +565,63 @@ impl PageAssist {
                     name: choice.name,
                     hosted: false,
                     source: choice.source,
-                    capabilities: choice.capabilities,
+                    capabilities: Some(choice.capabilities),
                     effort: choice.effort,
                 },
             });
+        if status.model.is_none() {
+            status.model =
+                self.ports()
+                    .models
+                    .dormant(&profile)
+                    .await
+                    .map(|choice| PageAssistModelV1 {
+                        id: choice.id,
+                        name: choice.name,
+                        hosted: false,
+                        source: choice.source,
+                        capabilities: None,
+                        effort: choice.effort,
+                    });
+        }
+        if matches!(
+            availability,
+            PageAssistAvailabilityV1::Ready
+                | PageAssistAvailabilityV1::Dormant
+                | PageAssistAvailabilityV1::NoModel
+        ) {
+            status.availability = match &status.model {
+                Some(model) if model.capabilities.is_none() => PageAssistAvailabilityV1::Dormant,
+                Some(_) => PageAssistAvailabilityV1::Ready,
+                None => PageAssistAvailabilityV1::NoModel,
+            };
+        }
+        if self.ports().tabs.profile(space) != Some(profile)
+            || !self.ports().settings.ai_enabled(&profile)
+        {
+            status.model = None;
+            status.availability = PageAssistAvailabilityV1::Unavailable;
+            return status;
+        }
         if status
             .model
             .as_ref()
-            .is_some_and(|model| model.capabilities == PageAssistCapabilitiesV1::TextOnly)
+            .is_some_and(|model| model.capabilities == Some(PageAssistCapabilitiesV1::TextOnly))
         {
             // Plain original-client chat needs no page availability or reads.
             status.availability = PageAssistAvailabilityV1::Ready;
             return status;
         }
-        let (Some(tab), Some(facts), PageAssistAvailabilityV1::Ready) = (tab, facts, availability)
-        else {
+        let (Some(tab), Some(facts)) = (tab, facts) else {
             return status;
         };
+        if !matches!(
+            status.availability,
+            PageAssistAvailabilityV1::Ready | PageAssistAvailabilityV1::Dormant
+        ) || !self.draft_scope_current(space, tab, &facts)
+        {
+            return status;
+        }
         let url = facts.url.clone().unwrap_or_default();
         let site = site_of(Some(&url));
         status.page = Some(PageAssistPageV1 {
@@ -540,7 +648,10 @@ impl PageAssist {
         let traits = match cached {
             Some(traits) => Some(traits),
             None => match self.ports().page.read(tab, facts.epoch).await {
-                Ok(readout) if readout.epoch == facts.epoch => {
+                Ok(readout)
+                    if readout.epoch == facts.epoch
+                        && self.draft_scope_current(space, tab, &facts) =>
+                {
                     let read = readout::page_read(
                         "a",
                         site.as_deref().unwrap_or_default(),
@@ -556,6 +667,12 @@ impl PageAssist {
                 _ => None,
             },
         };
+        if !self.draft_scope_current(space, tab, &facts) {
+            status.can_pick = false;
+            status.page = None;
+            status.availability = PageAssistAvailabilityV1::Unavailable;
+            return status;
+        }
         let room = site
             .as_deref()
             .is_some_and(|site| self.site_has_room(&facts.profile, site, 0));
@@ -567,6 +684,13 @@ impl PageAssist {
             .await
             .map(|selection| text::bounded(&text::clean(&selection), PAGE_ASSIST_MAX_EXCERPT_CHARS))
             .filter(|selection| !selection.is_empty());
+        if !self.draft_scope_current(space, tab, &facts) {
+            status.selection = None;
+            status.suggestions.clear();
+            status.can_pick = false;
+            status.page = None;
+            status.availability = PageAssistAvailabilityV1::Unavailable;
+        }
         status
     }
 
@@ -671,6 +795,7 @@ impl PageAssist {
     ) -> Result<(u32, TurnTask), PageAssistFaultV1> {
         if request.text.len() > PAGE_ASSIST_MAX_QUESTION_BYTES
             || request.attachments.len() > PAGE_ASSIST_MAX_ATTACHMENTS
+            || (request.text.trim().is_empty() && request.suggestion.is_none())
         {
             return Err(PageAssistFaultV1::Invalid);
         }
@@ -691,6 +816,16 @@ impl PageAssist {
                 live.conversation.messages().is_empty(),
             )
         };
+        let mut preparation = preparation::Preparation::begin(self, &space, &request.conversation)?;
+        if !Arc::ptr_eq(&preparation.revision, &revision)
+            || current_epoch
+                .as_ref()
+                .is_none_or(|epoch| !Arc::ptr_eq(epoch, &preparation.current_epoch))
+        {
+            return Err(PageAssistFaultV1::NativeConversation {
+                fault: PageAssistNativeFaultV1::ScopeChanged,
+            });
+        }
         if self
             .state()
             .native_owners
@@ -702,12 +837,46 @@ impl PageAssist {
         if !self.ports().settings.ai_enabled(&profile) {
             return Err(PageAssistFaultV1::AiOff);
         }
-        let backend = self
-            .ports()
-            .models
-            .entry(&profile)
-            .await
-            .ok_or(PageAssistFaultV1::NoModel)?;
+        let demand = if browser {
+            preparation
+                .wait_until(
+                    preparation.deadline,
+                    self.ports().models.prepare_reply(
+                        &profile,
+                        preparation.cancel.native.clone(),
+                        preparation.deadline,
+                    ),
+                )
+                .await?
+                .map_err(preparation::backend_fault)?
+        } else {
+            None
+        };
+        if demand.is_some() {
+            preparation.native_demand();
+        }
+        let backend = preparation
+            .wait(self.ports().models.entry(&profile))
+            .await?
+            .ok_or_else(|| {
+                if demand.is_some() {
+                    PageAssistFaultV1::NativeConversation {
+                        fault: PageAssistNativeFaultV1::ScopeChanged,
+                    }
+                } else {
+                    PageAssistFaultV1::NoModel
+                }
+            })?;
+        if browser
+            && demand.is_some()
+            && !matches!(&backend, PageBackendChoice::NativeConversation(_))
+        {
+            // A demand cannot migrate across a source change or be replaced by
+            // a new native reservation after the owner was allowed to park.
+            return Err(PageAssistFaultV1::NativeConversation {
+                fault: PageAssistNativeFaultV1::ScopeChanged,
+            });
+        }
         let words = match &backend {
             PageBackendChoice::NativeConversation(_) => {
                 if !browser && (request.suggestion.is_some() || !request.attachments.is_empty()) {
@@ -762,44 +931,34 @@ impl PageAssist {
                 text: words.clone(),
             };
             let reserve = if browser {
-                self.ports().models.reserve_native_browser(
-                    &profile,
-                    expected.clone(),
-                    draft,
-                    NativeBrowserManifest::page_v1(),
-                )
+                demand
+                    .ok_or(PageAssistFaultV1::NativeConversation {
+                        fault: PageAssistNativeFaultV1::ScopeChanged,
+                    })?
+                    .reserve_browser(expected.clone(), draft, NativeBrowserManifest::page_v1())
             } else {
                 self.ports()
                     .models
                     .reserve_native(&profile, expected.clone(), draft)
             };
-            match tokio::time::timeout(NATIVE_RESERVE_TIMEOUT, reserve).await {
-                Ok(Ok(reservation)) => Some(reservation),
-                Ok(Err(PageBackendError::Busy)) => return Err(PageAssistFaultV1::Busy),
-                Ok(Err(PageBackendError::NativeConversation(fault))) => {
-                    return Err(PageAssistFaultV1::NativeConversation { fault })
-                }
-                Ok(Err(PageBackendError::Model(error))) => {
-                    return Err(fault::model_fault(error, false))
-                }
-                Err(_) => {
-                    return Err(PageAssistFaultV1::NativeConversation {
-                        fault: PageAssistNativeFaultV1::Timeout,
-                    })
-                }
-            }
+            Some(
+                preparation
+                    .wait_until(std::time::Instant::now() + NATIVE_RESERVE_TIMEOUT, reserve)
+                    .await?
+                    .map_err(preparation::backend_fault)?,
+            )
         } else {
             None
         };
         let mut admitted = Vec::new();
         let mut shown = Vec::new();
         for attach in &request.attachments {
-            let (inner, view) = self.admit(profile, attach).await?;
+            let (inner, view) = preparation.wait(self.admit(profile, attach)).await??;
             admitted.push(inner);
             shown.push(view);
         }
         let conversation = request.conversation.clone();
-        let cancel = Arc::new(Cancel::default());
+        let cancel = preparation.cancel.clone();
         let leased = Arc::new(AtomicBool::new(false));
         let took_over = Arc::new(AtomicBool::new(false));
         let title = request
@@ -844,6 +1003,7 @@ impl PageAssist {
             {
                 return Err(PageAssistFaultV1::Busy);
             }
+            preparation.commit(&mut state)?;
             let Some(live) = state.live.get_mut(&conversation) else {
                 return Err(PageAssistFaultV1::Invalid);
             };
@@ -930,11 +1090,14 @@ impl PageAssist {
     /// Stops the Space's running reply.
     pub fn stop(&self, space: &str) -> bool {
         let state = self.state();
-        let Some(running) = state
-            .current
-            .get(space)
-            .and_then(|id| state.running.get(id))
-        else {
+        let Some(id) = state.current.get(space) else {
+            return false;
+        };
+        if let Some(preparing) = state.preparing.get(id) {
+            preparing.cancel.cancel(CancelReason::Stopped);
+            return true;
+        }
+        let Some(running) = state.running.get(id) else {
             return false;
         };
         running.cancel.cancel(CancelReason::Stopped);
@@ -1234,6 +1397,9 @@ impl PageAssist {
     pub fn close(&self, space: &str) {
         let current = self.state().current.get(space).cloned();
         if let Some(conversation) = current {
+            if let Some(preparing) = self.state().preparing.get(&conversation) {
+                preparing.cancel.cancel(CancelReason::Gone);
+            }
             self.release_marks(&conversation);
         }
         let picks: Vec<(String, u64)> = self.state().picks.drain().map(|(key, _)| key).collect();
@@ -1250,6 +1416,9 @@ impl PageAssist {
             state.current.remove(space)
         };
         if let Some(conversation) = current {
+            if let Some(preparing) = self.state().preparing.remove(&conversation) {
+                preparing.cancel.cancel(CancelReason::Gone);
+            }
             if let Some(running) = self.state().running.remove(&conversation) {
                 running.cancel.cancel(CancelReason::Gone);
             }
@@ -1269,7 +1438,17 @@ impl PageAssist {
                 .map(|live| (live.profile, live.conversation.is_empty()))
         };
         match profile {
-            Some((_, true)) => return true,
+            Some((_, true)) => {
+                let state = self.state();
+                if let Some(preparing) = state
+                    .current
+                    .get(space)
+                    .and_then(|id| state.preparing.get(id))
+                {
+                    preparing.cancel.cancel(CancelReason::Gone);
+                }
+                return true;
+            }
             Some(_) => {}
             None => return false,
         }
@@ -1404,14 +1583,26 @@ impl PageAssist {
         let Some(facts) = self.ports().page.facts(tab) else {
             return failed(PageAssistFaultV1::Unavailable);
         };
-        if facts.space.as_deref().is_some_and(|s| s != space) {
+        if self.ports().tabs.profile(space) != Some(facts.profile)
+            || facts.space.as_deref().is_some_and(|s| s != space)
+        {
             return failed(PageAssistFaultV1::Invalid);
         }
-        if let Some(fault) = policy::refusal(self.availability(Some(&facts)).await) {
-            return failed(fault);
+        let availability = self.draft_availability(Some(&facts)).await;
+        if availability != PageAssistAvailabilityV1::Dormant {
+            if let Some(fault) = policy::refusal(availability) {
+                return failed(fault);
+            }
+        }
+        if !self.draft_scope_current(space, tab, &facts) {
+            return failed(PageAssistFaultV1::PageChanged);
         }
         match self.ports().page.pick(tab, facts.epoch).await {
             Ok(pick) => {
+                if !self.draft_scope_current(space, tab, &facts) {
+                    self.ports().page.pick_clear(tab, pick.pick);
+                    return failed(PageAssistFaultV1::PageChanged);
+                }
                 let host = host_of(facts.url.as_deref().unwrap_or_default());
                 let label = text::bounded(&text::clean(&pick.label), 64);
                 let label = if label.is_empty() {
@@ -1537,6 +1728,10 @@ impl PageAssist {
                 running.cancel.cancel(CancelReason::Gone);
             }
             state.running.clear();
+            for preparing in state.preparing.values() {
+                preparing.cancel.cancel(CancelReason::Gone);
+            }
+            state.preparing.clear();
             let events: Vec<PageAssistChangedV1> = state
                 .current
                 .values()

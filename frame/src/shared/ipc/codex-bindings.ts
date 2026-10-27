@@ -46,8 +46,9 @@ export type CodexQuotaViewV1 = {
 	source: CodexQuotaSourceV1,
 	state: CodexQuotaStateV1,
 	/**
-	 *  Native live account epoch, encoded exactly without JavaScript u64 loss.
-	 *  Scope/account retirement clears old data before a different epoch appears.
+	 *  Original quota observation's account epoch, without JavaScript u64 loss.
+	 *  Healthy dormancy may retain it only as stale reading provenance. A new
+	 *  owner, account or profile clears it before projecting another epoch.
 	 */
 	account_epoch: string | null,
 	checking: boolean,
@@ -76,6 +77,11 @@ export type CodexQuotaWindowV1 = {
 	resets_at_ms: string | null,
 };
 
+/**  Process lifecycle is independent from the retained account observation. */
+export type CodexRuntimeV1 = "active" | "preparing" | 
+/**  The previous owner physically settled; explicit intent performs a fresh admission. */
+"dormant" | "unavailable";
+
 export type CodexSelectionV1 = {
 	model: string,
 	effort: CodexEffortChoice,
@@ -87,13 +93,14 @@ export type CodexViewV1 = {
 	version: number,
 	profile: string,
 	state: CodexStateV1,
+	runtime: CodexRuntimeV1,
 	models: CodexModelV1[],
 	selection: CodexSelectionV1 | null,
 	/**  Persisted backend intent, independent from current runtime/account availability. */
 	page_selected: boolean,
 	login_attempt: string | null,
 	error: CodexFaultV1 | null,
-	/**  Current integration does not expose executor/browser tools or Ultra. */
+	/**  Current active runtime tool qualification; not a cached dormant permission. */
 	text_only: boolean,
 	/**  Original account observation only; never model admission or API billing. */
 	quota: CodexQuotaViewV1,

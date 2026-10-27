@@ -402,6 +402,38 @@ impl ProfileLease {
             lock: Mutex::new(lock),
         })
     }
+    /// Existing-only wake shares the exact observational lease reconstruction.
+    /// No missing node, legacy record, or prior incarnation may be provisioned.
+    pub(crate) fn open_existing_for_wake(
+        profile: ProfileId,
+        incarnation: [u8; 16],
+    ) -> Result<Self, Error> {
+        Self::open_existing_for_removal(profile, incarnation)
+    }
+    #[cfg(all(debug_assertions, feature = "native-fixtures"))]
+    pub(crate) fn fixture_existing_for_wake(
+        parent: &Path,
+        profile: ProfileId,
+        incarnation: [u8; 16],
+    ) -> Result<Self, Error> {
+        let owner = owner_sid()?;
+        Self::existing_for_removal_under(
+            &parent.join("removal-owned-parent"),
+            profile,
+            incarnation,
+            &owner,
+            &[],
+        )
+    }
+    /// Read the same held exclusive lease after graceful physical settlement.
+    /// This does not repair DIRTY or create a new successful-close observation.
+    pub(crate) fn verify_clean_for_dormant(&self) -> Result<(), Error> {
+        let mut lock = self.lock.lock().map_err(|_| Error::Invalid)?;
+        if read_bounded(&mut lock, 8)?.as_slice() != CLEAN {
+            return Err(Error::RecoveryRequired);
+        }
+        Ok(())
+    }
     pub(crate) fn dirty(&self) -> Result<(), Error> {
         let mut lock = self.lock.lock().map_err(|_| Error::Invalid)?;
         if read_bounded(&mut lock, 8)?.as_slice() != CLEAN {

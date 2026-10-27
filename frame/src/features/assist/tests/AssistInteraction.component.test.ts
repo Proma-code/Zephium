@@ -398,3 +398,29 @@ test("an immediate ChatGPT refusal preserves the draft and exposes its finite di
   await expect.element(field).toHaveValue("Keep this message");
   expect(native.ask).toHaveBeenCalledTimes(1);
 });
+
+test("native preparation exposes Stop and Escape without clearing an unadmitted draft", async () => {
+  let finish!: (value: PageAssistAskResponseV1) => void;
+  native.ask.mockReturnValueOnce(
+    new Promise((resolve) => {
+      finish = resolve;
+    }),
+  );
+  const { screen, field } = await open(
+    status([], {
+      availability: "dormant",
+      model: { ...status().model!, source: "codex", capabilities: null },
+    }),
+  );
+  await field.fill("Keep my draft");
+  await userEvent.keyboard("{Enter}");
+  await expect.poll(() => native.ask.mock.calls.length).toBe(1);
+  await expect.element(screen.getByRole("button", { name: "Stop" })).toBeVisible();
+  await userEvent.keyboard("{Escape}");
+  await expect.poll(() => native.stop.mock.calls.length).toBe(1);
+  await expect.element(field).toHaveValue("Keep my draft");
+  finish({ reply: null, fault: { reason: "native_conversation", fault: "cancelled" } });
+  await expect.element(screen.getByRole("button", { name: "Send" })).toBeVisible();
+  await expect.element(field).toHaveValue("Keep my draft");
+  expect(native.ask).toHaveBeenCalledTimes(1);
+});

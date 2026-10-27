@@ -894,3 +894,186 @@ fn explicit_none_then_cold_default_keeps_same_thread_and_requires_fresh_nullable
         matches!(reducer.begin_turn(&scope(),5).unwrap(), Command::StartTurn {choice,..} if choice.selection() == EffortSelection::Default)
     );
 }
+
+#[test]
+fn dormant_thread_predicate_requires_real_close_or_never_attached_store_state() {
+    let scope = scope();
+    let foreign = Scope::new("other".into(), [2; 16], 1).unwrap();
+    let fresh = Conversation::new(scope.clone());
+    assert!(fresh.ready_to_dormant(&scope));
+    assert!(!fresh.ready_to_dormant(&foreign));
+    let cold = Conversation::from_cold_store(scope.clone(), "original-thread".into()).unwrap();
+    assert!(cold.ready_to_dormant(&scope));
+    let mut live = ready();
+    assert!(!live.ready_to_dormant(&scope));
+    live.begin_unsubscribe(&scope, 2).unwrap();
+    assert!(!live.ready_to_dormant(&scope));
+    live.reply(&scope, 2, &json!({"status":"unsubscribed"}))
+        .unwrap();
+    assert!(!live.ready_to_dormant(&scope));
+    live.notification(
+        &scope,
+        "thread/closed",
+        &json!({"threadId":"original-thread"}),
+    )
+    .unwrap();
+    assert!(live.ready_to_dormant(&scope));
+    live.early.push(("turn/started".into(), json!({})));
+    assert!(!live.ready_to_dormant(&scope));
+}
+
+#[test]
+fn compaction_before_turn_ack_is_inert_until_the_original_turn_is_joined() {
+    let mut c = ready();
+    c.begin_turn(&scope(), 2).unwrap();
+    for method in ["item/started", "item/completed"] {
+        assert!(
+            notify(
+                &mut c,
+                method,
+                json!({"threadId":"original-thread","turnId":"original-turn",
+                "item":{"type":"contextCompaction","id":"compact-before-ack"}}),
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+    assert_eq!(c.phase(), Phase::StartingTurn);
+    assert_eq!(
+        c.reply(&scope(), 2, &turn_reply()).unwrap(),
+        vec![Event::TurnStarted {
+            turn_id: "original-turn".into()
+        }]
+    );
+    assert_eq!(c.phase(), Phase::Running);
+    let result = final_result(
+        notify(
+            &mut c,
+            "turn/completed",
+            terminal(
+                vec![message(
+                    "answer",
+                    "Still the original turn",
+                    json!("final_answer"),
+                )],
+                "summary",
+                "completed",
+            ),
+        )
+        .unwrap(),
+    );
+    assert_eq!(result.outcome, Outcome::Completed);
+    assert_eq!(result.final_response(), Some("Still the original turn"));
+    assert_eq!(result.messages.len(), 1);
+}
+
+#[test]
+fn completed_only_compaction_after_answer_never_finishes_or_replaces_the_turn() {
+    let mut c = running();
+    let answer = message("answer", "Retained answer", json!("final_answer"));
+    assert!(matches!(
+        notify(
+            &mut c,
+            "item/completed",
+            json!({"threadId":"original-thread","turnId":"original-turn","item":answer}),
+        )
+        .unwrap()
+        .as_slice(),
+        [Event::ItemCompleted(_)]
+    ));
+    // Installing an already-built background candidate can emit only completed.
+    assert!(
+        notify(
+            &mut c,
+            "item/completed",
+            json!({"threadId":"original-thread","turnId":"original-turn",
+            "item":{"type":"contextCompaction","id":"installed-candidate"}}),
+        )
+        .unwrap()
+        .is_empty()
+    );
+    assert_eq!(c.phase(), Phase::Running);
+    let result = final_result(
+        notify(
+            &mut c,
+            "turn/completed",
+            terminal(vec![], "notLoaded", "completed"),
+        )
+        .unwrap(),
+    );
+    assert_eq!(result.outcome, Outcome::Completed);
+    assert_eq!(result.final_response(), Some("Retained answer"));
+    assert_eq!(result.messages.len(), 1);
+}
+
+#[test]
+fn compaction_in_terminal_items_is_not_answer_text_or_an_action() {
+    for view in ["summary", "full"] {
+        for with_answer in [false, true] {
+            let mut c = running();
+            let mut items = Vec::new();
+            if with_answer {
+                items.push(message("answer", "Only this answer", json!("final_answer")));
+            }
+            items.push(json!({"type":"contextCompaction","id":"summary-compaction"}));
+            let result = final_result(
+                notify(&mut c, "turn/completed", terminal(items, view, "completed")).unwrap(),
+            );
+            assert_eq!(result.outcome, Outcome::Completed);
+            assert_eq!(
+                result.final_response(),
+                with_answer.then_some("Only this answer")
+            );
+            assert_eq!(result.messages.len(), usize::from(with_answer));
+        }
+    }
+}
+
+#[test]
+fn compaction_usage_estimate_may_shrink_without_rewriting_original_total_usage() {
+    let mut c = running();
+    let measured = json!({"totalTokens":1000,"inputTokens":900,"cachedInputTokens":700,
+        "cacheWriteInputTokens":0,"outputTokens":100,"reasoningOutputTokens":20});
+    // Original recompute_token_usage emits an estimated last.totalTokens with
+    // all component counters zero, not an additive or certified per-turn bill.
+    let estimate = json!({"totalTokens":120,"inputTokens":0,"cachedInputTokens":0,
+        "cacheWriteInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0});
+    for last in [&measured, &estimate] {
+        assert!(
+            notify(
+                &mut c,
+                "thread/tokenUsage/updated",
+                json!({"threadId":"original-thread","turnId":"original-turn",
+                "tokenUsage":{"total":measured,"last":last,"modelContextWindow":128000}}),
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+    assert_eq!(c.phase(), Phase::Running);
+    let result = final_result(
+        notify(
+            &mut c,
+            "turn/completed",
+            terminal(
+                vec![message(
+                    "answer",
+                    "Answer after compaction",
+                    json!("final_answer"),
+                )],
+                "summary",
+                "completed",
+            ),
+        )
+        .unwrap(),
+    );
+    assert_eq!(result.final_response(), Some("Answer after compaction"));
+    assert_eq!(
+        result.usage,
+        Some(UsageSnapshot {
+            total: usage(&measured).unwrap(),
+            last: usage(&estimate).unwrap(),
+            model_context_window: Some(128000),
+        })
+    );
+}

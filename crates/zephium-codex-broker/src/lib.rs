@@ -309,3 +309,38 @@ pub fn qualify_browser_owner() -> Result<(), &'static str> {
 ))]
 #[path = "connection/events.rs"]
 mod connection_events;
+
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
+mod dormancy;
+
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
+mod demand_budget;
+
+#[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
+pub fn qualify_dormant_owner() -> Result<(), &'static str> {
+    connection::dormant::fixtures::qualify()
+}
+
+#[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
+pub fn qualify_dormant_original(
+    first: &std::path::Path,
+    second: &std::path::Path,
+) -> Result<(), &'static str> {
+    connection::dormant::fixtures::qualify_original(first, second)
+}
+
+#[cfg(all(test, not(windows)))]
+#[path = "windows/dormant_quota.rs"]
+mod dormant_quota;

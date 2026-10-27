@@ -2,7 +2,7 @@
 //! model request or caller-defined transcript. Parent invokes separate typed mode.
 use serde_json::{json, Value};
 use std::io::{BufRead, Read, Write};
-const THREAD: &str = "synthetic-owned-thread";
+pub(super) const THREAD: &str = "synthetic-owned-thread";
 const MODEL: &str = "synthetic-owned-model";
 const LIMIT: u64 = 1024 * 1024;
 #[derive(Clone, Copy)]
@@ -135,6 +135,14 @@ impl<R: BufRead, W: Write> Peer<R, W> {
         self.bootstrap_account(catalog, true)
     }
     fn bootstrap_account(&mut self, catalog: bool, chatgpt: bool) -> Result<(), &'static str> {
+        self.bootstrap_account_with_read(catalog, chatgpt, false)
+    }
+    fn bootstrap_account_with_read(
+        &mut self,
+        catalog: bool,
+        chatgpt: bool,
+        malformed_read: bool,
+    ) -> Result<(), &'static str> {
         let expected: Value =
             serde_json::from_slice(&crate::wire::initialize()).map_err(|_| "transcript-init")?;
         let id = self.expect(expected)?;
@@ -164,6 +172,10 @@ impl<R: BufRead, W: Write> Peer<R, W> {
             .expect(crate::compatibility::feature_request(1).map_err(|_| "transcript-features")?)?;
         self.reply(id, crate::config::synthetic_features())?;
         let id = self.expect(json!({"method":"account/read","params":{"refreshToken":false}}))?;
+        if malformed_read {
+            self.reply(id, json!({"account":7,"requiresOpenaiAuth":true}))?;
+            return Ok(());
+        }
         self.reply(
             id,
             json!({"account":if chatgpt { json!({"type":"chatgpt"}) } else { Value::Null },"requiresOpenaiAuth":true}),
@@ -787,4 +799,79 @@ impl<R: BufRead, W: Write> Peer<R, W> {
         self.close_without_turn()?;
         self.usage_tail(turn)
     }
+}
+
+pub(crate) fn dormant_child(
+    scenario: super::dormant::fixtures::Scenario,
+) -> Result<(), &'static str> {
+    use super::dormant::fixtures::Scenario;
+    let mut peer = Peer {
+        input: std::io::BufReader::new(std::io::stdin()),
+        output: std::io::stdout(),
+        last: 0,
+        had_first_turn: matches!(scenario, Scenario::Resume),
+        withhold_open: false,
+        default_choices: false,
+        pending_quota: None,
+        malformed_quota: false,
+        refused_quota: false,
+        home: std::env::var("CODEX_HOME").map_err(|_| "dormant-helper-home")?,
+        cwd: std::env::current_dir()
+            .map_err(|_| "dormant-helper-cwd")?
+            .to_str()
+            .ok_or("dormant-helper-cwd")?
+            .to_owned(),
+    };
+    let turns = matches!(scenario, Scenario::First | Scenario::Resume);
+    peer.bootstrap_account_with_read(
+        turns,
+        turns || scenario.quota(),
+        matches!(scenario, Scenario::WakeReadInvalid),
+    )?;
+    if turns {
+        let resumed = matches!(scenario, Scenario::Resume);
+        let text = if resumed {
+            "synthetic second $skill_two"
+        } else {
+            "synthetic first $skill_one"
+        };
+        let turn = if resumed { "turn-two" } else { "turn-one" };
+        peer.opened(resumed, text, false)?;
+        let id=peer.expect(json!({"method":"turn/start","params":{"threadId":THREAD,"input":[{"type":"text","text":text,"text_elements":[]}],"model":MODEL,"effort":"high","environments":[]}}))?;
+        peer.reply(
+            id,
+            json!({"turn":{"id":turn,"status":"inProgress","error":null}}),
+        )?;
+        peer.complete(turn, "synthetic dormant continuation", "completed")?;
+    }
+    if peer.read()?.is_some() {
+        return Err("dormant-helper-unexpected-replay");
+    }
+    if scenario.quota() {
+        let id = peer.pending_quota.take().ok_or("dormant-quota-owned-id")?;
+        match scenario {
+            Scenario::QuotaNoReply => (),
+            Scenario::QuotaForeign => peer.reply(
+                id + 1,
+                Peer::<std::io::BufReader<std::io::Stdin>, std::io::Stdout>::quota_reading(),
+            )?,
+            Scenario::QuotaAccount => peer.note("account/updated", json!({"authMode":null}))?,
+            _ => {
+                peer.reply(
+                    id,
+                    Peer::<std::io::BufReader<std::io::Stdin>, std::io::Stdout>::quota_reading(),
+                )?;
+                if matches!(scenario, Scenario::QuotaDuplicate) {
+                    peer.reply(id, json!({}))?;
+                }
+            }
+        }
+    }
+    match scenario {
+        Scenario::Nonzero => std::process::exit(7),
+        Scenario::LateFrame => peer.note("account/updated", json!({"authMode":null}))?,
+        Scenario::Blocked => std::thread::sleep(std::time::Duration::from_secs(60)),
+        _ => (),
+    }
+    Ok(())
 }

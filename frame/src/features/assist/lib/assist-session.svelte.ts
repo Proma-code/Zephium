@@ -81,7 +81,10 @@ export class AssistSession {
 
   /** The page in front can go along with a message. */
   get attachable(): boolean {
-    return this.status?.availability === "ready" && !!this.status.page;
+    return (
+      (this.status?.availability === "ready" || this.status?.availability === "dormant") &&
+      !!this.status.page
+    );
   }
 
   get pageAttached(): boolean {
@@ -274,7 +277,10 @@ export class AssistSession {
   /** True when Rust admitted the message; what it says arrives as events. */
   async ask(text: string, suggestion: PageAssistSuggestionV1 | null = null): Promise<boolean> {
     const native = this.status?.model?.source === "codex";
-    const nativePage = native && this.status?.model?.capabilities === "page";
+    const nativePage =
+      native &&
+      (this.status?.model?.capabilities === "page" ||
+        (this.status?.availability === "dormant" && this.status.model?.capabilities === null));
     const words = native ? text : text.trim().slice(0, MESSAGE_LIMIT);
     if (
       native &&

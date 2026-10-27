@@ -7,6 +7,8 @@ mod browser;
 mod browser_reservation;
 #[path = "browser_worker.rs"]
 mod browser_worker;
+#[path = "dormant.rs"]
+mod dormant;
 #[path = "removal.rs"]
 mod removal;
 use super::*;
@@ -56,6 +58,16 @@ struct Service {
     browser_quarantine: Mutex<Vec<browser_worker::Quarantine>>,
     join: Mutex<Option<JoinHandle<()>>>,
     removal: Mutex<Option<Arc<removal::Operation>>>,
+    dormant: Mutex<Option<dormant::Custody>>,
+    startup: Option<dormant::Startup>,
+    cancellations: admission::Cancellations,
+}
+#[derive(Default)]
+struct SpawnPlan {
+    removal: Option<Arc<removal::Operation>>,
+    local_only: bool,
+    startup: Option<dormant::Startup>,
+    demand_mode: Option<admission::TurnMode>,
 }
 struct LoginAttempt {
     id: String,
@@ -67,6 +79,8 @@ enum Command {
     Logout,
     Models,
     Quota,
+    Account,
+    Action(dormant::Action),
     Removal(Arc<removal::Operation>),
     RemovalLocal(removal::LocalRequest),
     Select(Box<SelectionCall>),
@@ -147,39 +161,19 @@ impl Registry {
             && !service.done.load(Ordering::Acquire)
             && self.scope(&service.profile.to_string()) == Some(service.epoch)
     }
-    fn service(
-        self: &Arc<Self>,
+    /// Passive observation never starts a runtime or consumes dormant custody.
+    fn observed_service(
+        &self,
         profile: ProfileId,
         epoch: u64,
-        retry_completed: bool,
     ) -> Result<Arc<Service>, CodexFaultV1> {
         if !self.removals.admission_open() || self.removals.contains(profile) {
             return Err(CodexFaultV1::RecoveryRequired);
         }
-        let mut services = self
-            .services
-            .lock()
-            .map_err(|_| CodexFaultV1::Unavailable)?;
         if self.scope(&profile.to_string()) != Some(epoch) {
             return Err(CodexFaultV1::ScopeChanged);
         }
-        if !self.removals.admission_open() || self.removals.contains(profile) {
-            return Err(CodexFaultV1::RecoveryRequired);
-        }
-        if let Some(service) = services.get(&profile) {
-            if service.epoch == epoch && (!service.done.load(Ordering::Acquire) || !retry_completed)
-            {
-                return Ok(service.clone());
-            }
-            if !service.fully_settled() {
-                return Err(CodexFaultV1::Busy);
-            }
-        }
-        services.retain(|_, service| !service.fully_settled());
-        if services.len() >= 64 {
-            return Err(CodexFaultV1::Busy);
-        }
-        self.spawn_service(&mut services, profile, epoch, None, false)
+        observed_owner(&self.services, profile)
     }
     fn spawn_service(
         self: &Arc<Self>,
@@ -189,9 +183,44 @@ impl Registry {
         removal: Option<Arc<removal::Operation>>,
         local_only: bool,
     ) -> Result<Arc<Service>, CodexFaultV1> {
+        self.spawn_started(
+            services,
+            profile,
+            epoch,
+            SpawnPlan {
+                removal,
+                local_only,
+                ..Default::default()
+            },
+        )
+        .map(|(service, _)| service)
+    }
+    fn spawn_started(
+        self: &Arc<Self>,
+        services: &mut HashMap<ProfileId, Arc<Service>>,
+        profile: ProfileId,
+        epoch: u64,
+        plan: SpawnPlan,
+    ) -> Result<(Arc<Service>, Option<admission::Demand>), CodexFaultV1> {
+        let SpawnPlan {
+            removal,
+            local_only,
+            startup,
+            demand_mode,
+        } = plan;
         let (queue, receiver) = admission::channel(32);
         let mut view = CodexViewV1::unavailable(profile.to_string());
-        view.state = CodexStateV1::Preparing;
+        if let Some(previous) = startup
+            .as_ref()
+            .and_then(|start| start.previous.lock().ok()?.clone())
+        {
+            view = previous.snapshot();
+        } else {
+            view.state = CodexStateV1::Preparing;
+        }
+        view.runtime = CodexRuntimeV1::Preparing;
+        view.text_only = true;
+        view.quota = Default::default();
         view.error = None;
         view.page_selected = page_requested(profile);
         let service = Arc::new(Service {
@@ -208,7 +237,25 @@ impl Registry {
             browser_quarantine: Mutex::new(Vec::new()),
             join: Mutex::new(None),
             removal: Mutex::new(removal),
+            dormant: Mutex::new(None),
+            startup,
+            cancellations: admission::Cancellations::default(),
         });
+        if let Some(startup) = &service.startup {
+            service
+                .cancellations
+                .register(&startup.cancel)
+                .map_err(|_| CodexFaultV1::Unavailable)?;
+        }
+        // Reserve before starting a worker: even an immediately ready owner
+        // cannot park between explicit preparation and its caller's reservation.
+        let demand = match demand_mode {
+            Some(admission::TurnMode::Browser) => Some(service.queue.demand_browser()),
+            Some(admission::TurnMode::Text) => Some(service.queue.demand_command()),
+            None => None,
+        }
+        .transpose()
+        .map_err(|_| CodexFaultV1::Busy)?;
         let owned = service.clone();
         let registry = Arc::downgrade(self);
         let join = std::thread::Builder::new()
@@ -230,7 +277,10 @@ impl Registry {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(join);
         services.insert(profile, service.clone());
-        Ok(service)
+        // Wake is a truthful observable phase before any slow image/probe work
+        // finishes. A renderer timing out its wait can reconcile by passive read.
+        notify_models(&service, &Arc::downgrade(self));
+        Ok((service, demand))
     }
 }
 /// Called only after the owned worker returned or unwound. Original physical
@@ -250,6 +300,7 @@ fn worker_returned(service: &Service, panicked: bool) {
         &mut service.settling.lock().unwrap_or_else(|e| e.into_inner()),
     );
     service.done.store(true, Ordering::Release);
+    dormant::publish_returned(service, panicked);
 }
 
 /// The same transfer runs in both the ordinary and retired queue drains. It
@@ -315,6 +366,7 @@ impl Service {
             .is_ok()
     }
     fn retire_ordinary(&self) {
+        self.cancellations.retire();
         self.account_revision.store(0, Ordering::Release);
         self.queue.set_ready(false);
         if let Ok(login) = self.login.lock() {
@@ -331,6 +383,7 @@ impl Service {
         }
     }
     fn request_stop(&self) {
+        self.cancellations.retire();
         // Zero is a terminal admission revision for this exact Service. No
         // later state notification may resurrect a queued writer's fence.
         self.account_revision.store(0, Ordering::Release);
@@ -340,6 +393,9 @@ impl Service {
             }
         }
         self.stop.store(true, Ordering::Release);
+        if let Some(startup) = &self.startup {
+            startup.cancel.store(true, Ordering::Release);
+        }
         self.queue.set_ready(false);
         if let Ok(login) = self.login.lock() {
             if let Some(login) = login.as_ref() {
@@ -360,8 +416,15 @@ impl Service {
             || self.done.load(Ordering::Acquire)
             || self.account_revision.load(Ordering::Acquire) == 0
         {
-            view.quota = Default::default();
+            if view.runtime == CodexRuntimeV1::Dormant && !self.stop.load(Ordering::Acquire) {
+                dormant::stale_quota(&mut view.quota);
+            } else {
+                view.quota = Default::default();
+            }
             view.text_only = true;
+            if view.runtime != CodexRuntimeV1::Dormant {
+                view.runtime = CodexRuntimeV1::Unavailable;
+            }
         }
         view
     }
@@ -396,6 +459,7 @@ impl Service {
 fn set_fault(service: &Service, fault: CodexFaultV1) {
     if let Ok(mut view) = service.view.lock() {
         view.error = Some(fault);
+        view.runtime = CodexRuntimeV1::Unavailable;
         view.state = if fault == CodexFaultV1::RecoveryRequired {
             CodexStateV1::RecoveryRequired
         } else {
@@ -578,6 +642,11 @@ fn catalog(service: &Service, catalog: &Catalog) {
 
 fn state(service: &Service, value: AccountState) {
     if let Ok(mut view) = service.view.lock() {
+        if view.runtime == CodexRuntimeV1::Preparing {
+            // A newly observed account can never inherit a previous process's
+            // quota epoch as its current reading, even if both say ChatGpt.
+            view.quota = Default::default();
+        }
         if value == AccountState::Unknown {
             let _ = service.advance_revision();
         }
@@ -672,13 +741,7 @@ fn worker(
             operation.deadline,
         )
     } else {
-        Connection::open(
-            profile,
-            service.epoch,
-            persistence,
-            cached_release.as_deref(),
-            &service.stop,
-        )
+        dormant::open(service, profile, persistence, cached_release.as_deref())
     };
     let mut connection = match opened {
         Ok(connection) => connection,
@@ -695,17 +758,28 @@ fn worker(
     if let (Some(store), Some(version)) = (APP_STORE.get(), connection.release_version()) {
         let _ = store.set_app_setting(RUNTIME_HINT.into(), version.to_owned());
     }
+    refresh_selection(service);
     let scope = connection.scope().clone();
     let mut active: Option<Active> = None;
     let mut rejected_browser = None;
     let mut retired_command = None;
     let mut removal_active: Option<Arc<removal::Operation>> = None;
     let mut models_requested = false;
+    let mut preparing = service.startup.is_some();
+    let mut preparation_fault = None;
     let mut published = service.snapshot();
     loop {
         if service.stop.load(Ordering::Acquire)
             || registry.upgrade().is_none_or(|r| !r.current(service))
         {
+            if preparing {
+                let cancelled = AtomicBool::new(true);
+                let error = connection
+                    .poll(&scope, &cancelled)
+                    .err()
+                    .unwrap_or(Fault::ScopeChanged);
+                preparation_fault = Some(error);
+            }
             break;
         }
         if removal::attach_preparation(service, &mut connection, &scope).is_err() {
@@ -751,6 +825,8 @@ fn worker(
                 let ordinary_retired = service.removal.lock().is_ok_and(|value| value.is_some());
                 let result = match command {
                     Command::RemovalLocal(_) => Err(Fault::Busy),
+                    Command::Action(_) if ordinary_retired => Err(Fault::ScopeChanged),
+                    Command::Action(action) => action.run(service, &mut connection, &scope),
                     Command::PrepareBrowser(call) => {
                         browser_reservation::prepare(service, &mut connection, &scope, *call);
                         Ok(())
@@ -771,7 +847,9 @@ fn worker(
                         let _ = call.result.send(Err(CodexFaultV1::ScopeChanged));
                         Ok(())
                     }
-                    Command::Models | Command::Quota | Command::Logout if ordinary_retired => {
+                    Command::Models | Command::Quota | Command::Account | Command::Logout
+                        if ordinary_retired =>
+                    {
                         Ok(())
                     }
                     Command::Login(attempt) => {
@@ -824,6 +902,7 @@ fn worker(
                         }
                         connection.logout(&scope, &service.stop)
                     }
+                    Command::Account => connection.read_account(&scope, &service.stop),
                     Command::Models => connection.refresh_catalog(&scope, &service.stop),
                     Command::Quota => {
                         let result = connection.request_quota_refresh(&scope, &service.stop);
@@ -1004,13 +1083,19 @@ fn worker(
                 }
             }
         }
-        let (events, poll_fault) = match connection.poll(&scope, &service.stop) {
-            Ok(events) => (events, None),
-            Err(error) => (
-                connection.take_failure_events(&scope).unwrap_or_default(),
-                Some(error),
-            ),
-        };
+        let preparation_cancel = service
+            .startup
+            .as_ref()
+            .filter(|_| preparing)
+            .map(|start| start.cancel.as_ref());
+        let (events, poll_fault) =
+            match connection.poll(&scope, preparation_cancel.unwrap_or(&service.stop)) {
+                Ok(events) => (events, None),
+                Err(error) => (
+                    connection.take_failure_events(&scope).unwrap_or_default(),
+                    Some(error),
+                ),
+            };
         for event in events {
             if event.scope() != &scope {
                 service.request_stop();
@@ -1045,7 +1130,11 @@ fn worker(
                         .is_none_or(|operation| !operation.begun())
                         && matches!(account, AccountState::Cancelled | AccountState::Unknown)
                     {
-                        let _ = removal::read_account(service, &mut connection, &scope);
+                        let _ = if let Some(cancel) = preparation_cancel {
+                            connection.read_account(&scope, cancel)
+                        } else {
+                            removal::read_account(service, &mut connection, &scope)
+                        };
                     }
                     if matches!(account, AccountState::ChatGpt | AccountState::SignedOut) {
                         if let Ok(mut login) = service.login.lock() {
@@ -1193,6 +1282,9 @@ fn worker(
             }
         }
         if let Some(error) = poll_fault {
+            if preparing {
+                preparation_fault = Some(error);
+            }
             deliver_failure(&mut active, page_fault(error));
             set_fault(service, fault(error));
             break;
@@ -1205,9 +1297,17 @@ fn worker(
                 AccountState::Unknown | AccountState::Cancelled
             )
         {
-            match removal::read_account(service, &mut connection, &scope) {
+            let result = if let Some(cancel) = preparation_cancel {
+                connection.read_account(&scope, cancel)
+            } else {
+                removal::read_account(service, &mut connection, &scope)
+            };
+            match result {
                 Ok(()) | Err(Fault::Busy) => {}
                 Err(error) => {
+                    if preparing {
+                        preparation_fault = Some(error);
+                    }
                     set_fault(service, fault(error));
                     break;
                 }
@@ -1218,19 +1318,33 @@ fn worker(
             && !models_requested
             && connection.catalog().is_none()
         {
-            match connection.refresh_catalog(&scope, &service.stop) {
+            match connection.refresh_catalog(&scope, preparation_cancel.unwrap_or(&service.stop)) {
                 Ok(()) => models_requested = true,
                 Err(Fault::Busy) => {}
                 Err(error) => {
+                    if preparing {
+                        preparation_fault = Some(error);
+                    }
                     set_fault(service, fault(error));
                     break;
                 }
             }
         }
+        let initialized = connection.state() == AccountState::SignedOut
+            || (connection.state() == AccountState::ChatGpt && connection.catalog().is_some());
+        if initialized {
+            preparing = false;
+        }
         // This comes from the held original Session's sealed schema proof,
         // never from account Connected, model names, or a caller preference.
         if let Ok(mut view) = service.view.lock() {
-            view.text_only = !connection.browser_capable(&scope)
+            view.runtime = if initialized {
+                CodexRuntimeV1::Active
+            } else {
+                CodexRuntimeV1::Preparing
+            };
+            view.text_only = !initialized
+                || !connection.browser_capable(&scope)
                 || service.stop.load(Ordering::Acquire)
                 || service.account_revision.load(Ordering::Acquire) == 0;
         }
@@ -1245,7 +1359,29 @@ fn worker(
             published = next;
             notify_models(service, registry);
         }
+        if active.is_none() && !preparing && connection.ready_to_dormant(&scope) {
+            match dormant::park(service, connection, &scope) {
+                Ok(None) => return,
+                Ok(Some(owner)) => connection = *owner,
+                Err(owner) => {
+                    connection = *owner;
+                    if service.queue.is_parked() {
+                        break;
+                    }
+                }
+            }
+        }
         std::thread::sleep(Duration::from_millis(10));
+    }
+    if let Some(error) = preparation_fault {
+        match dormant::capture_failed_wake(service, connection, &scope, error) {
+            Ok(()) => {
+                service.request_stop();
+                notify_models(service, registry);
+                return;
+            }
+            Err(owner) => connection = *owner,
+        }
     }
     if connection.browser_settlement_pending()
         || service.queue.browser_occupied()
@@ -1521,6 +1657,14 @@ pub(super) async fn commit_page_selection(
     expected: page_choice::Snapshot,
     selection: page_choice::Selection,
 ) -> Result<page_choice::Reply, CodexFaultV1> {
+    commit_page_selection_held(profile, expected, selection, None).await
+}
+async fn commit_page_selection_held(
+    profile: ProfileId,
+    expected: page_choice::Snapshot,
+    selection: page_choice::Selection,
+    demand: Option<dormant::Demand>,
+) -> Result<page_choice::Reply, CodexFaultV1> {
     if expected.profile != profile || !expected.valid() || !selection.valid() {
         return Err(CodexFaultV1::Invalid);
     }
@@ -1565,15 +1709,34 @@ pub(super) async fn commit_page_selection(
             if !registry.current(&owner) {
                 return Err(CodexFaultV1::ScopeChanged);
             }
+            let deadline =
+                demand
+                    .as_ref()
+                    .map_or(Instant::now() + Duration::from_secs(8), |demand| {
+                        demand
+                            .deadline()
+                            .min(Instant::now() + Duration::from_secs(8))
+                    });
+            if Instant::now() >= deadline {
+                return Err(CodexFaultV1::Timeout);
+            }
             let (result, receive) = tokio::sync::oneshot::channel();
             {
                 let mut view = owner.view.lock().map_err(|_| CodexFaultV1::Unavailable)?;
-                owner.enqueue(Command::Select(Box::new(SelectionCall {
+                let command = Command::Select(Box::new(SelectionCall {
                     expected,
                     selection,
-                    deadline: Instant::now() + Duration::from_secs(8),
+                    deadline,
                     result,
-                })))?;
+                }));
+                if let Some(demand) = demand {
+                    if !Arc::ptr_eq(&owner, &demand.service()) {
+                        return Err(CodexFaultV1::ScopeChanged);
+                    }
+                    demand.command(command)?;
+                } else {
+                    owner.enqueue(command)?;
+                }
                 // Only after actual local queue admission. A Busy rejection cannot
                 // retire a still-running choice or pretend a new one was stored.
                 if !owner.advance_revision() {
@@ -1582,7 +1745,7 @@ pub(super) async fn commit_page_selection(
                 }
                 view.error = None;
             }
-            tokio::time::timeout(Duration::from_secs(8), receive)
+            tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), receive)
                 .await
                 .map_err(|_| CodexFaultV1::OutcomeUnknown)?
                 .map_err(|_| CodexFaultV1::OutcomeUnknown)??
@@ -1593,6 +1756,22 @@ pub(super) async fn commit_page_selection(
         return Err(CodexFaultV1::OutcomeUnknown);
     }
     Ok(receipt)
+}
+
+fn passive_command(command: CodexCommand) -> bool {
+    matches!(command, CodexCommand::Account | CodexCommand::CancelLogin)
+}
+/// Read-only lookup: no factory, receipt consumption, or queue admission.
+fn observed_owner(
+    services: &Mutex<HashMap<ProfileId, Arc<Service>>>,
+    profile: ProfileId,
+) -> Result<Arc<Service>, CodexFaultV1> {
+    services
+        .lock()
+        .map_err(|_| CodexFaultV1::Unavailable)?
+        .get(&profile)
+        .cloned()
+        .ok_or(CodexFaultV1::Unavailable)
 }
 
 pub(super) async fn dispatch(
@@ -1614,16 +1793,37 @@ pub(super) async fn dispatch(
     if registry.scope(&expected) != Some(epoch) {
         return CodexViewV1::unavailable(expected);
     }
-    let candidate = if command == CodexCommand::RefreshQuota {
-        // Quota observation must never start/restart an owner or an auth ceremony.
-        current_service(profile).ok_or(CodexFaultV1::Unavailable)
+    let mut wake_demand = None;
+    let candidate = if passive_command(command) {
+        registry.observed_service(profile, epoch)
     } else {
-        registry.service(profile, epoch, command == CodexCommand::CheckConnection)
+        match dormant::prepare(
+            profile,
+            Arc::new(AtomicBool::new(false)),
+            Instant::now() + Duration::from_secs(120),
+            admission::TurnMode::Text,
+            command == CodexCommand::CheckConnection,
+        )
+        .await
+        {
+            Ok(demand) => {
+                let service = demand.service();
+                wake_demand = Some(demand);
+                Ok(service)
+            }
+            Err(error) => Err(error),
+        }
     };
     let service = match candidate {
         Ok(service) => service,
         Err(error) => {
-            let mut view = CodexViewV1::unavailable(expected);
+            let mut view = registry
+                .services
+                .lock()
+                .ok()
+                .and_then(|owners| owners.get(&profile).cloned())
+                .map(|owner| owner.snapshot())
+                .unwrap_or_else(|| CodexViewV1::unavailable(expected));
             view.error = Some(error);
             return view;
         }
@@ -1647,7 +1847,7 @@ pub(super) async fn dispatch(
             None => page_choice::Selection::Model(prior.model.clone()),
         };
         let wanted = prior.updated(desired.clone());
-        let receipt = commit_page_selection(profile, prior, desired).await;
+        let receipt = commit_page_selection_held(profile, prior, desired, wake_demand.take()).await;
         if registry.scope(&profile.to_string()) != Some(epoch) {
             return CodexViewV1::unavailable(expected);
         }
@@ -1675,7 +1875,8 @@ pub(super) async fn dispatch(
     let mut admission_view = None;
     let mut rollback_view = None;
     let operation = match command {
-        CodexCommand::Account | CodexCommand::CheckConnection => None,
+        CodexCommand::Account => None,
+        CodexCommand::CheckConnection => Some(Command::Account),
         CodexCommand::Connect => {
             if let Some(id) = attempt.filter(|s| valid_attempt(s)) {
                 let cancel = Arc::new(AtomicBool::new(false));
@@ -1765,7 +1966,13 @@ pub(super) async fn dispatch(
         return view;
     }
     if let Some(operation) = operation {
-        if let Err(view) = enqueue_admitted(&service, operation, admission_view, rollback_view) {
+        if let Err(view) = enqueue_demand_admitted(
+            &service,
+            operation,
+            admission_view,
+            rollback_view,
+            wake_demand.take(),
+        ) {
             return view;
         }
     } else {
@@ -1779,18 +1986,32 @@ pub(super) async fn dispatch(
 /// Queue admission and its exact never-enqueued rollback run while the same
 /// presentation lock is held; account observations cannot interpose. This is
 /// local queue evidence only, never proof of an original process write result.
+#[cfg(test)]
 fn enqueue_admitted(
+    service: &Service,
+    operation: Command,
+    view: Option<MutexGuard<'_, CodexViewV1>>,
+    previous: Option<CodexViewV1>,
+) -> Result<(), CodexViewV1> {
+    enqueue_demand_admitted(service, operation, view, previous, None)
+}
+fn enqueue_demand_admitted(
     service: &Service,
     operation: Command,
     mut view: Option<MutexGuard<'_, CodexViewV1>>,
     previous: Option<CodexViewV1>,
+    demand: Option<dormant::Demand>,
 ) -> Result<(), CodexViewV1> {
     let unsent_login = if let Command::Login(login) = &operation {
         Some(login.id.clone())
     } else {
         None
     };
-    if let Err(error) = service.enqueue(operation) {
+    let admitted = match demand {
+        Some(demand) => demand.command(operation),
+        None => service.enqueue(operation),
+    };
+    if let Err(error) = admitted {
         if let Some(view) = view.as_mut() {
             if let Some(previous) = previous {
                 **view = previous;
@@ -1817,27 +2038,19 @@ fn enqueue_admitted(
 // Only a validated native Page profile with persisted Codex selection may
 // reserve on demand. No renderer path/ID is accepted and no auth is initiated.
 fn page_service(profile: ProfileId) -> Option<Arc<Service>> {
-    if let Some(service) = current_service(profile) {
-        return Some(service);
-    }
-    if !read_selection(profile)
-        .is_ok_and(|snapshot| snapshot.backend == page_choice::Backend::Codex)
-    {
-        // An uncertain preference is unavailable, not permission to start an
-        // original runtime on behalf of a supposedly retained native choice.
-        return None;
-    }
-    let registry = REGISTRY.get()?;
-    let epoch = registry.scope(&profile.to_string())?;
-    registry.service(profile, epoch, false).ok()
+    current_service(profile)
 }
+
 fn current_service(profile: ProfileId) -> Option<Arc<Service>> {
     let registry = REGISTRY.get()?;
     let service = registry.services.lock().ok()?.get(&profile)?.clone();
     registry.current(&service).then_some(service)
 }
 fn choice_from_view(view: &CodexViewV1) -> Option<NativeConversationChoice> {
-    if view.state != CodexStateV1::Connected || !view.page_selected {
+    if view.runtime != CodexRuntimeV1::Active
+        || view.state != CodexStateV1::Connected
+        || !view.page_selected
+    {
         return None;
     }
     let selected = view.selection.as_ref()?;
@@ -1862,6 +2075,16 @@ fn choice_from_view(view: &CodexViewV1) -> Option<NativeConversationChoice> {
             CodexEffortSelectionV1::Explicit(value) => Some(effort(value).as_str().into()),
         },
     })
+}
+pub(super) fn page_dormant(profile: ProfileId) -> Option<NativeDormantChoice> {
+    dormant::page_choice(profile)
+}
+pub(super) async fn prepare_page(
+    profile: ProfileId,
+    cancel: Arc<AtomicBool>,
+    deadline: Instant,
+) -> Result<Option<Box<dyn NativeConversationDemand>>, PageBackendError> {
+    dormant::prepare_page(profile, cancel, deadline).await
 }
 pub(super) fn page_choice(profile: ProfileId) -> Option<NativeConversationChoice> {
     let service = page_service(profile)?;
@@ -1966,6 +2189,61 @@ fn reserve_page_value(
         reserved: Some(reserved),
     })
 }
+fn reservation_from_held(
+    service: Arc<Service>,
+    expected: NativeConversationChoice,
+    draft: NativeConversationDraft,
+    reserved: admission::Reserved,
+) -> Result<Reservation, PageBackendError> {
+    if expected.capabilities != zephium_ipc::page_assist::PageAssistCapabilitiesV1::Page {
+        return Err(PageBackendError::NativeConversation(
+            PageAssistNativeFaultV1::UnsupportedInput,
+        ));
+    }
+    let snapshot = read_selection(service.profile)
+        .map_err(|_| PageBackendError::NativeConversation(PageAssistNativeFaultV1::Unavailable))?;
+    if snapshot.backend != page_choice::Backend::Codex
+        || snapshot.revision != service.selection_revision.load(Ordering::Acquire)
+    {
+        return Err(PageBackendError::NativeConversation(
+            PageAssistNativeFaultV1::ScopeChanged,
+        ));
+    }
+    let (selection, account_revision) = {
+        let view = service
+            .view
+            .try_lock()
+            .map_err(|_| PageBackendError::Busy)?;
+        let login = service
+            .login
+            .try_lock()
+            .map_err(|_| PageBackendError::Busy)?;
+        let revision = service.account_revision.load(Ordering::Acquire);
+        if revision == 0 || login.is_some() || choice_from_view(&view).as_ref() != Some(&expected) {
+            return Err(PageBackendError::NativeConversation(
+                PageAssistNativeFaultV1::ScopeChanged,
+            ));
+        }
+        (
+            view.selection.clone().ok_or(PageBackendError::Busy)?,
+            revision,
+        )
+    };
+    let value = Reservation {
+        service,
+        account_revision,
+        selection_revision: snapshot.revision,
+        selection,
+        choice: expected,
+        draft,
+        reserved: Some(reserved),
+    };
+    value
+        .validate()
+        .map_err(PageBackendError::NativeConversation)?;
+    Ok(value)
+}
+
 struct Reservation {
     account_revision: u64,
     selection_revision: u64,
@@ -2111,6 +2389,7 @@ mod tests {
         let (queue, receiver) = admission::channel(1);
         let mut view = CodexViewV1::unavailable(profile.to_string());
         view.state = CodexStateV1::SignedOut;
+        view.runtime = CodexRuntimeV1::Active;
         view.error = None;
         (
             Service {
@@ -2127,6 +2406,9 @@ mod tests {
                 browser_quarantine: Mutex::new(Vec::new()),
                 join: Mutex::new(None),
                 removal: Mutex::new(None),
+                dormant: Mutex::new(None),
+                startup: None,
+                cancellations: admission::Cancellations::default(),
             },
             receiver,
         )
@@ -2164,6 +2446,23 @@ mod tests {
             })
             .unwrap();
         receive
+    }
+
+    #[test]
+    fn passive_account_and_cancel_without_owner_do_not_create_a_service() {
+        let profile = ProfileId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+        let owners = Mutex::new(HashMap::new());
+        for command in [CodexCommand::Account, CodexCommand::CancelLogin] {
+            assert!(passive_command(command));
+            assert!(matches!(
+                observed_owner(&owners, profile),
+                Err(CodexFaultV1::Unavailable)
+            ));
+            assert!(owners.lock().unwrap().is_empty());
+        }
+        for command in [CodexCommand::CheckConnection, CodexCommand::RefreshQuota] {
+            assert!(!passive_command(command));
+        }
     }
 
     #[test]
@@ -2534,6 +2833,29 @@ mod tests {
         ));
     }
     #[test]
+    fn service_retirement_synchronously_cancels_registered_action_fences() {
+        for removal_retirement in [false, true] {
+            let (service, _receiver) = owned_service();
+            let cancel = Arc::new(AtomicBool::new(false));
+            service.cancellations.register(&cancel).unwrap();
+            // Retirement must not need the view lock or a worker-loop turn.
+            let _view = service.view.lock().unwrap();
+            if removal_retirement {
+                service.retire_ordinary();
+            } else {
+                service.request_stop();
+            }
+            assert!(cancel.load(Ordering::Acquire));
+            let late = Arc::new(AtomicBool::new(false));
+            assert_eq!(
+                service.cancellations.register(&late),
+                Err(admission::Error::Closed)
+            );
+            assert!(late.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
     fn retired_or_failed_owner_never_projects_cached_current_quota() {
         use zephium_ipc::codex_quota::{CodexQuotaStateV1, CodexQuotaViewV1};
         for retirement in 0..4 {
@@ -2751,6 +3073,93 @@ mod tests {
             Err(admission::Error::Busy)
         ));
     }
+    #[test]
+    fn dormant_quota_keeps_exact_historical_reading_but_never_current_or_checking() {
+        use zephium_ipc::codex_quota::*;
+        let mut reading = CodexQuotaViewV1 {
+            state: CodexQuotaStateV1::Current,
+            account_epoch: Some("41".into()),
+            observed_at_ms: Some("1700000000000".into()),
+            attempted_at_ms: Some("1700000000010".into()),
+            checking: true,
+            buckets: vec![CodexQuotaBucketV1 {
+                id: Some("original".into()),
+                name: None,
+                plan: Some(CodexQuotaPlanV1::Plus),
+                windows: vec![],
+            }],
+            ..Default::default()
+        };
+        let original = reading.clone();
+        dormant::stale_quota(&mut reading);
+        assert_eq!(reading.state, CodexQuotaStateV1::Stale);
+        assert!(!reading.checking);
+        assert!(reading.refresh_needed);
+        assert_eq!(reading.account_epoch, original.account_epoch);
+        assert_eq!(reading.observed_at_ms, original.observed_at_ms);
+        assert_eq!(reading.attempted_at_ms, original.attempted_at_ms);
+        assert_eq!(reading.buckets, original.buckets);
+        for state in [
+            CodexQuotaStateV1::NotChecked,
+            CodexQuotaStateV1::Unavailable,
+            CodexQuotaStateV1::Error,
+        ] {
+            let mut unobserved = CodexQuotaViewV1 {
+                state,
+                ..Default::default()
+            };
+            dormant::stale_quota(&mut unobserved);
+            assert_eq!(unobserved.state, state);
+            assert!(!unobserved.refresh_needed);
+        }
+        let (service, _receiver) = owned_service();
+        {
+            let mut view = service.view.lock().unwrap();
+            view.runtime = CodexRuntimeV1::Preparing;
+            view.quota = reading;
+        }
+        state(&service, AccountState::ChatGpt);
+        assert!(service.snapshot().quota.buckets.is_empty());
+        assert!(service.snapshot().quota.account_epoch.is_none());
+    }
+
+    #[test]
+    fn retained_connected_metadata_is_not_fresh_dormant_or_preparing_admission() {
+        let (reservation, _receiver) = test_reservation();
+        let service = &reservation.service;
+        for runtime in [
+            CodexRuntimeV1::Dormant,
+            CodexRuntimeV1::Preparing,
+            CodexRuntimeV1::Unavailable,
+        ] {
+            service.view.lock().unwrap().runtime = runtime;
+            let view = service.snapshot();
+            assert_eq!(view.state, CodexStateV1::Connected);
+            assert!(view.selection.is_some());
+            assert!(choice_from_view(&view).is_none());
+            assert!(reservation.validate_current(true).is_err());
+        }
+    }
+    #[test]
+    fn physical_worker_done_alone_never_publishes_healthy_dormant_observation() {
+        let (service, _receiver) = owned_service();
+        assert!(!dormant::retained(&service));
+        worker_returned(&service, false);
+        assert!(service.done.load(Ordering::Acquire));
+        assert_ne!(service.snapshot().runtime, CodexRuntimeV1::Dormant);
+        assert_eq!(service.snapshot().runtime, CodexRuntimeV1::Unavailable);
+    }
+    #[test]
+    fn retired_service_clears_runtime_capability_and_cannot_publish_cached_connected() {
+        let (reservation, _receiver) = test_reservation();
+        let service = &reservation.service;
+        service.request_stop();
+        let view = service.snapshot();
+        assert_eq!(view.runtime, CodexRuntimeV1::Unavailable);
+        assert!(view.text_only);
+        assert!(choice_from_view(&view).is_none());
+    }
+
     #[test]
     fn reservation_rechecks_scope_and_same_model_account_revision_without_io() {
         let (reservation, _receiver) = test_reservation();
