@@ -1,13 +1,16 @@
-//! One reply's cumulative native-browser budget. Only Page's actual human-wait
-//! sites own transition authority; the native actor receives a read-only view.
+//! One reply's elapsed native-browser task budget, not per-model-call time or
+//! per-child CPU. Runtime includes provider silence, context, tools, and retries;
+//! only Page's actual human-wait sites may pause it. Actor/writer views share the
+//! original clock and cannot renew or grant a wait.
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
-const ACTIVE: Duration = Duration::from_secs(90);
-const HUMAN: Duration = Duration::from_secs(300);
-const TOTAL: Duration = Duration::from_secs(390);
+// Explicit Page-native product policy, not equivalence to the legacy model loop.
+const TASK_RUNTIME_LIMIT: Duration = Duration::from_secs(30 * 60);
+const HUMAN_WAIT_LIMIT: Duration = Duration::from_secs(5 * 60);
+const TASK_WALL_LIMIT: Duration = Duration::from_secs(35 * 60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeBudgetFault {
@@ -57,7 +60,10 @@ impl State {
             Phase::Human { .. } => self.human = self.human.saturating_add(elapsed),
         }
         self.last = now;
-        if now.duration_since(self.start) >= TOTAL || self.active >= ACTIVE || self.human >= HUMAN {
+        if now.duration_since(self.start) >= TASK_WALL_LIMIT
+            || self.active >= TASK_RUNTIME_LIMIT
+            || self.human >= HUMAN_WAIT_LIMIT
+        {
             return self.refuse(NativeBudgetFault::Expired);
         }
         Ok(())
@@ -66,13 +72,13 @@ impl State {
     fn deadline(&mut self, now: Instant) -> Result<Instant, NativeBudgetFault> {
         self.advance(now)?;
         let remaining = match self.phase {
-            Phase::Active => ACTIVE - self.active,
-            Phase::Human { .. } => HUMAN - self.human,
+            Phase::Active => TASK_RUNTIME_LIMIT - self.active,
+            Phase::Human { .. } => HUMAN_WAIT_LIMIT - self.human,
         };
         let Some(phase_deadline) = now.checked_add(remaining) else {
             return self.refuse(NativeBudgetFault::InvalidTransition);
         };
-        let Some(absolute) = self.start.checked_add(TOTAL) else {
+        let Some(absolute) = self.start.checked_add(TASK_WALL_LIMIT) else {
             return self.refuse(NativeBudgetFault::InvalidTransition);
         };
         Ok(phase_deadline.min(absolute))
@@ -136,7 +142,7 @@ impl NativeBudgetView {
             if let Some(fault) = state.fault {
                 return Err(fault);
             }
-            match state.start.checked_add(TOTAL) {
+            match state.start.checked_add(TASK_WALL_LIMIT) {
                 Some(deadline) => Ok(deadline),
                 None => state.refuse(NativeBudgetFault::InvalidTransition),
             }
@@ -301,14 +307,25 @@ mod tests {
     }
 
     #[test]
+    fn named_task_policy_is_elapsed_runtime_plus_bounded_human_wait() {
+        assert_eq!(TASK_RUNTIME_LIMIT, Duration::from_secs(1800));
+        assert_eq!(HUMAN_WAIT_LIMIT, Duration::from_secs(300));
+        assert_eq!(TASK_WALL_LIMIT, Duration::from_secs(2100));
+        assert_eq!(TASK_RUNTIME_LIMIT + HUMAN_WAIT_LIMIT, TASK_WALL_LIMIT);
+    }
+
+    #[test]
     fn active_deadline_never_restarts_when_observed_or_cloned() {
         let start = Instant::now();
         let budget = NativeBudget::new_at(start);
         let view = budget.view();
-        assert_eq!(view.deadline_at(at(start, 40)), Ok(at(start, 90)));
-        assert_eq!(view.clone().deadline_at(at(start, 89)), Ok(at(start, 90)));
+        assert_eq!(view.deadline_at(at(start, 120)), Ok(at(start, 1800)));
         assert_eq!(
-            view.deadline_at(at(start, 90)),
+            view.clone().deadline_at(at(start, 1799)),
+            Ok(at(start, 1800))
+        );
+        assert_eq!(
+            view.deadline_at(at(start, 1800)),
             Err(NativeBudgetFault::Expired)
         );
     }
@@ -331,10 +348,10 @@ mod tests {
         second.finish_at(at(start, 349)).unwrap();
         assert_eq!(
             budget.view().deadline_at(at(start, 350)),
-            Ok(at(start, 389))
+            Ok(at(start, 2099))
         );
         assert_eq!(
-            budget.view().deadline_at(at(start, 389)),
+            budget.view().deadline_at(at(start, 2099)),
             Err(NativeBudgetFault::Expired)
         );
     }
@@ -362,11 +379,11 @@ mod tests {
         let start = Instant::now();
         let budget = NativeBudget::new_at(start);
         let _wait = budget
-            .wait_at(HumanWaitKind::Confirmation, at(start, 89))
+            .wait_at(HumanWaitKind::Confirmation, at(start, 1799))
             .unwrap();
-        assert!(budget.view().deadline_at(at(start, 388)).unwrap() <= at(start, 390));
+        assert!(budget.view().deadline_at(at(start, 2098)).unwrap() <= at(start, 2100));
         assert_eq!(
-            budget.view().deadline_at(at(start, 390)),
+            budget.view().deadline_at(at(start, 2100)),
             Err(NativeBudgetFault::Expired)
         );
     }
@@ -440,7 +457,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(20)).await;
         wait.finish().unwrap();
         view.changed().await;
-        assert_eq!(view.deadline().unwrap(), now() + ACTIVE);
+        assert_eq!(view.deadline().unwrap(), now() + TASK_RUNTIME_LIMIT);
         budget.seal();
         view.changed().await;
         assert_eq!(view.deadline(), Err(NativeBudgetFault::Closed));
@@ -452,15 +469,21 @@ mod tests {
         let budget = NativeBudget::new_at(start);
         let actor = budget.view();
         let writer = actor.clone();
-        assert_eq!(actor.hard_deadline().unwrap(), at(start, 390));
+        assert_eq!(actor.hard_deadline().unwrap(), at(start, 2100));
         let wait = budget
-            .wait_at(HumanWaitKind::Confirmation, at(start, 80))
+            .wait_at(HumanWaitKind::Confirmation, at(start, 1790))
             .unwrap();
-        assert_eq!(writer.hard_deadline().unwrap(), at(start, 390));
-        assert_eq!(writer.deadline_at(at(start, 95)).unwrap(), at(start, 380));
-        wait.finish_at(at(start, 100)).unwrap();
-        assert_eq!(writer.deadline_at(at(start, 100)).unwrap(), at(start, 110));
-        assert_eq!(writer.hard_deadline().unwrap(), at(start, 390));
+        assert_eq!(writer.hard_deadline().unwrap(), at(start, 2100));
+        assert_eq!(
+            writer.deadline_at(at(start, 1805)).unwrap(),
+            at(start, 2090)
+        );
+        wait.finish_at(at(start, 1820)).unwrap();
+        assert_eq!(
+            writer.deadline_at(at(start, 1820)).unwrap(),
+            at(start, 1830)
+        );
+        assert_eq!(writer.hard_deadline().unwrap(), at(start, 2100));
         budget.seal();
         assert_eq!(writer.hard_deadline(), Err(NativeBudgetFault::Closed));
     }
@@ -471,11 +494,11 @@ mod tests {
         let budget = NativeBudget::new_at(start);
         let writer = budget.view();
         let wait = budget
-            .wait_at(HumanWaitKind::Takeover, at(start, 80))
+            .wait_at(HumanWaitKind::Takeover, at(start, 1790))
             .unwrap();
-        let queued_deadline = writer.deadline_at(at(start, 90)).unwrap();
-        wait.finish_at(at(start, 100)).unwrap();
-        let first_byte = at(start, 111);
+        let queued_deadline = writer.deadline_at(at(start, 1800)).unwrap();
+        wait.finish_at(at(start, 1820)).unwrap();
+        let first_byte = at(start, 1831);
         assert!(
             first_byte < queued_deadline,
             "the queued copy alone would incorrectly admit"

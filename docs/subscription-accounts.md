@@ -51,11 +51,16 @@ existing Page dispatcher: page access, navigation and confirmation remain subjec
 to the browser's existing permissions. No local executor is selected. Unsupported
 capabilities do not silently fall back to text, an API key or another source.
 
-Each browser turn shares limits of 40 tool calls, 12 page reads and 8 opened links.
-It has 90 seconds of cumulative active work, up to 5 minutes of actual browser
-confirmation or takeover waiting, and a 390-second absolute ceiling. Only an
-owned browser wait pauses active time; provider waiting does not. These limits
-do not claim to count Codex's internal model requests or generated tokens.
+Each browser turn admits at most 40 tool calls and retains at most 12 successful
+page reads; each `open_tabs` invocation may open at most 8 links. One task clock allows 30 minutes
+of cumulative elapsed runtime, excluding at most 5 minutes of actual owned
+browser confirmation or takeover waiting, with a 35-minute absolute ceiling
+from the original start. Provider silence, context preparation, tools,
+compaction, retries and child activity do not renew or pause runtime. This is
+an explicit finite native task policy, not a claim of parity with the legacy
+model loop or a count of internal model calls, generated tokens or per-child
+CPU time. The API path's existing 90-second per-model-call limit and the prior
+text-only native contract are unchanged.
 
 Stop retires new actions, while already-entered effects and the original process
 remain owned until settled. A known model answer and a failed browser cleanup are

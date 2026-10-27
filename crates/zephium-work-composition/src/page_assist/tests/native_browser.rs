@@ -23,10 +23,21 @@ struct BrowserFixture {
     timing: Mutex<Option<NativeBudgetView>>,
     revoke: Mutex<Option<NativeBrowserRevocation>>,
     hold_native: Mutex<Option<oneshot::Receiver<()>>>,
+    reasoning_waits: Mutex<VecDeque<oneshot::Receiver<()>>>,
+    reasoning_entered: std::sync::atomic::AtomicUsize,
     sealed_outcome: Mutex<Option<NativeConversationOutcome>>,
     early_result: Mutex<
         Option<oneshot::Receiver<Result<NativeConversationOutcome, PageAssistNativeFaultV1>>>,
     >,
+}
+impl BrowserFixture {
+    async fn reasoning(&self) {
+        let wait = self.reasoning_waits.lock().unwrap().pop_front();
+        if let Some(wait) = wait {
+            self.reasoning_entered.fetch_add(1, Ordering::AcqRel);
+            let _ = wait.await;
+        }
+    }
 }
 fn browser_choice() -> NativeConversationChoice {
     NativeConversationChoice {
@@ -110,6 +121,7 @@ impl NativeConversationReservation for BrowserReservation {
                     );
                 }
                 for (index, (name, arguments)) in fixture.calls.iter().enumerate() {
+                    fixture.reasoning().await;
                     if cancel.load(Ordering::Acquire) {
                         break;
                     }
@@ -140,6 +152,7 @@ impl NativeConversationReservation for BrowserReservation {
                         _ => break,
                     }
                 }
+                fixture.reasoning().await;
                 if !cancel.load(Ordering::Acquire) {
                     let _ = events(NativeConversationEvent::TextSnapshot {
                         text: fixture.final_text.clone(),
@@ -313,6 +326,8 @@ fn browser_harness(calls: Vec<(&str, Value)>, final_text: &str) -> (Harness, Arc
         timing: Mutex::new(None),
         revoke: Mutex::new(None),
         hold_native: Mutex::new(None),
+        reasoning_waits: Mutex::new(VecDeque::new()),
+        reasoning_entered: std::sync::atomic::AtomicUsize::new(0),
         sealed_outcome: Mutex::new(None),
         early_result: Mutex::new(None),
     });
@@ -451,7 +466,7 @@ async fn browser_actual_confirmation_pauses_active_budget_but_never_approves_act
     assert_eq!(h.state().await, PageAssistReplyStateV1::Done);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn browser_stop_during_entered_effect_retains_both_owners_until_actual_return() {
     let (h, fixture) = browser_harness(
         vec![(
@@ -471,6 +486,15 @@ async fn browser_stop_during_entered_effect_retains_both_owners_until_actual_ret
     h.page.lock().act_wait = Some(hold);
     let (_, task) = ask_browser(&h, "Expand twice", true).await;
     until(|| h.page.lock().act_entered).await;
+    tokio::time::advance(Duration::from_secs(121)).await;
+    assert!(fixture
+        .timing
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .deadline()
+        .is_ok());
     assert!(h.service.stop(SPACE));
     drop(task);
     for _ in 0..20 {
@@ -1700,6 +1724,171 @@ async fn public_ask_keeps_ordinary_model_browser_path_unchanged() {
     assert!(
         matches!(&h.blocks().await[0], PageAssistBlockV1::Text { text, .. } if text == "Ordinary model answer")
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn browser_silent_reasoning_can_exceed_the_legacy_single_call_timeout() {
+    let (h, fixture) = browser_harness(vec![], "Answer after silent reasoning");
+    let (release, wait) = oneshot::channel();
+    fixture.reasoning_waits.lock().unwrap().push_back(wait);
+    let (_, task) = ask_browser(&h, "Think before answering", false).await;
+    until(|| fixture.reasoning_entered.load(Ordering::Acquire) == 1).await;
+    tokio::time::advance(Duration::from_secs(121)).await;
+    tokio::task::yield_now().await;
+    assert!(fixture.provider_started.load(Ordering::Acquire));
+    assert!(!fixture.local_settled.load(Ordering::Acquire));
+    assert!(fixture.reserved.load(Ordering::Acquire));
+    assert!(fixture
+        .timing
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .deadline()
+        .is_ok());
+    assert!(h
+        .service
+        .state()
+        .running
+        .values()
+        .all(|r| r.cancel.reason().is_none()));
+    release.send(()).unwrap();
+    task.await;
+    assert_eq!(h.state().await, PageAssistReplyStateV1::Done);
+    assert!(fixture.native_settled.load(Ordering::Acquire));
+}
+
+#[tokio::test(start_paused = true)]
+async fn browser_multiple_reasoning_and_tool_legs_share_one_original_task_clock() {
+    let (h, fixture) = browser_harness(
+        vec![("list_tabs", json!({})), ("read_page", json!({"tab":"t1"}))],
+        "Answer after several steps",
+    );
+    let mut releases = Vec::new();
+    for _ in 0..3 {
+        let (release, wait) = oneshot::channel();
+        fixture.reasoning_waits.lock().unwrap().push_back(wait);
+        releases.push(release);
+    }
+    let (_, task) = ask_browser(&h, "Inspect the page", true).await;
+    until(|| fixture.reasoning_entered.load(Ordering::Acquire) == 1).await;
+    let timing = fixture.timing.lock().unwrap().as_ref().unwrap().clone();
+    let original = timing.deadline().unwrap();
+    let hard = timing.hard_deadline().unwrap();
+    for (index, release) in releases.into_iter().enumerate() {
+        until(|| fixture.reasoning_entered.load(Ordering::Acquire) == index + 1).await;
+        tokio::time::advance(Duration::from_secs(70)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            timing.deadline().unwrap(),
+            original,
+            "no renewal per tool/leg"
+        );
+        assert_eq!(timing.hard_deadline().unwrap(), hard);
+        assert_eq!(fixture.outputs.lock().unwrap().len(), index);
+        release.send(()).unwrap();
+    }
+    task.await;
+    assert_eq!(fixture.outputs.lock().unwrap().len(), 2);
+    assert!(fixture.outputs.lock().unwrap().iter().all(|(ok, _)| *ok));
+    assert_eq!(h.state().await, PageAssistReplyStateV1::Done);
+}
+
+#[tokio::test(start_paused = true)]
+async fn browser_runtime_expiry_keeps_entered_effect_and_native_owner_until_both_return() {
+    let (h, fixture, release_action, mut task) = held_browser_effect().await;
+    let (release_native, hold) = oneshot::channel();
+    *fixture.hold_native.lock().unwrap() = Some(hold);
+    tokio::time::advance(Duration::from_secs(1800)).await;
+    until(|| {
+        h.service
+            .state()
+            .running
+            .values()
+            .any(|r| r.cancel.reason().is_some())
+    })
+    .await;
+    assert!(!h.page.lock().act_returned);
+    assert!(!h.page.lock().act_dropped.load(Ordering::Acquire));
+    assert!(!fixture.local_settled.load(Ordering::Acquire));
+    assert!(fixture.reserved.load(Ordering::Acquire));
+    assert!(matches!(futures_poll(&mut task), std::task::Poll::Pending));
+    release_action.send(()).unwrap();
+    until(|| fixture.local_settled.load(Ordering::Acquire)).await;
+    assert_eq!(h.page.lock().acted.len(), 1, "no second step after expiry");
+    assert!(!fixture.native_settled.load(Ordering::Acquire));
+    assert!(fixture.reserved.load(Ordering::Acquire));
+    assert!(matches!(futures_poll(&mut task), std::task::Poll::Pending));
+    release_native.send(()).unwrap();
+    task.await;
+    let PageAssistMessageV1::Reply { fault, .. } = h.reply().await else {
+        panic!()
+    };
+    assert_eq!(
+        fault,
+        Some(PageAssistFaultV1::NativeConversation {
+            fault: PageAssistNativeFaultV1::Timeout
+        })
+    );
+    assert!(fixture.native_settled.load(Ordering::Acquire));
+    assert!(!fixture.reserved.load(Ordering::Acquire));
+}
+
+#[tokio::test(start_paused = true)]
+async fn browser_repeated_confirmations_share_five_minutes_without_approving_next_effect() {
+    let (h, fixture) = browser_harness(
+        vec![(
+            "act",
+            json!({"steps":[{"verb":"click","ref":"a6"},{"verb":"click","ref":"a6"}]}),
+        )],
+        "unused",
+    );
+    h.page.lock().steps.insert(
+        6,
+        ResolvedStep {
+            label: "Commit".into(),
+            effect: StepEffect::Commit(WorkConfirmCategoryV1::Purchase),
+        },
+    );
+    let (reply, task) = ask_browser(&h, "Two confirmed steps", true).await;
+    until(|| {
+        h.service
+            .state()
+            .running
+            .values()
+            .any(|r| r.decision.is_some())
+    })
+    .await;
+    tokio::time::advance(Duration::from_secs(120)).await;
+    assert!(h.service.decide(
+        &h.conversation().await,
+        reply,
+        1,
+        PageAssistDecisionV1::Approve
+    ));
+    until(|| {
+        h.page.lock().acted.len() == 1
+            && h.service
+                .state()
+                .running
+                .values()
+                .any(|r| r.decision.is_some())
+    })
+    .await;
+    tokio::time::advance(Duration::from_secs(180)).await;
+    task.await;
+    assert_eq!(h.page.lock().acted.len(), 1);
+    let PageAssistMessageV1::Reply { fault, .. } = h.reply().await else {
+        panic!()
+    };
+    assert_eq!(
+        fault,
+        Some(PageAssistFaultV1::NativeConversation {
+            fault: PageAssistNativeFaultV1::Timeout
+        })
+    );
+    assert!(fixture.local_settled.load(Ordering::Acquire));
+    assert!(fixture.native_settled.load(Ordering::Acquire));
 }
 
 #[path = "native_preparation.rs"]
