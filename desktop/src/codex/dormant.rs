@@ -22,6 +22,7 @@ pub(super) struct Startup {
     pub(super) deadline: Instant,
 }
 
+#[cfg(test)]
 pub(super) fn retained(service: &Service) -> bool {
     service.dormant.lock().is_ok_and(|value| value.is_some())
         || service.startup.as_ref().is_some_and(|start| {

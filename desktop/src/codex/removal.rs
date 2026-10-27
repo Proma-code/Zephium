@@ -273,7 +273,7 @@ impl Slot {
         )
         .map_err(|_| RemovalFault::Scope)?;
         let old = std::mem::replace(&mut self.custody, Custody::Transition);
-        let result = match old {
+        match old {
             Custody::Prepared(value) => match value.retry(retry) {
                 Ok(value) => {
                     self.custody = Custody::Prepared(Box::new(value));
@@ -339,8 +339,7 @@ impl Slot {
                 self.custody = other;
                 Err(RemovalFault::RecoveryRequired)
             }
-        };
-        result
+        }
     }
     fn current(&mut self) -> Result<(), RemovalFault> {
         match &mut self.custody {
@@ -1208,145 +1207,6 @@ pub(super) fn open_failed(registry: &std::sync::Weak<Registry>, operation: &Arc<
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    fn operation() -> Arc<Operation> {
-        Arc::new(Operation::new(
-            ProfileId::from(1),
-            RemovalAttemptId::fresh_native().unwrap(),
-        ))
-    }
-    #[test]
-    fn verified_local_receipt_is_phase_and_sequence_bound() {
-        let receipt = LocalReceipt {
-            sequence: 4,
-            phase: LocalPhase::Acknowledge,
-            result: Some(app::CleanupProgress::Verified),
-        };
-        assert!(receipt.verified(4, LocalPhase::Acknowledge));
-        assert!(receipt.verified(4, LocalPhase::Acknowledge));
-        assert!(!receipt.verified(3, LocalPhase::Acknowledge));
-        assert!(!receipt.verified(5, LocalPhase::Acknowledge));
-        assert!(!receipt.verified(4, LocalPhase::Cleanup));
-        for phase in [LocalPhase::PrepareAbsent, LocalPhase::Renew] {
-            let receipt = LocalReceipt { phase, ..receipt };
-            assert!(!receipt.verified(4, phase));
-        }
-        for result in [
-            None,
-            Some(app::CleanupProgress::Pending(
-                app::RemovalStage::LocalCleanup,
-            )),
-            Some(app::CleanupProgress::Interrupted(
-                app::RemovalStage::LocalCleanup,
-            )),
-            Some(app::CleanupProgress::Blocked(
-                app::RemovalStage::RecoveryRequired,
-            )),
-        ] {
-            let receipt = LocalReceipt { result, ..receipt };
-            assert!(!receipt.verified(4, LocalPhase::Acknowledge));
-        }
-    }
-    #[test]
-    fn preparation_receipt_never_substitutes_for_a_current_native_capability() {
-        let action = operation();
-        let mut slot = Slot {
-            attempt: None,
-            native_attempt: action.native_attempt,
-            action,
-            custody: Custody::WaitingAbsent,
-            finalization_pending: false,
-            local: Some(LocalReceipt {
-                sequence: 1,
-                phase: LocalPhase::PrepareAbsent,
-                result: None,
-            }),
-            sequence: 1,
-        };
-        assert_eq!(
-            slot.preparation_status(),
-            Some(app::PreparedStatus::Pending(
-                app::RemovalStage::LocalCleanup
-            ))
-        );
-        slot.local.as_mut().unwrap().result = Some(app::CleanupProgress::Verified);
-        assert_eq!(slot.preparation_status(), None);
-        assert_eq!(slot.current(), Err(RemovalFault::RecoveryRequired));
-        slot.local.as_mut().unwrap().result = Some(app::CleanupProgress::Interrupted(
-            app::RemovalStage::LocalCleanup,
-        ));
-        assert_eq!(
-            slot.preparation_status(),
-            Some(app::PreparedStatus::Interrupted(
-                app::RemovalStage::LocalCleanup
-            ))
-        );
-        assert!(!slot
-            .local
-            .as_ref()
-            .unwrap()
-            .verified(1, LocalPhase::PrepareAbsent));
-    }
-    #[test]
-    fn initial_inventory_is_sealed_and_contains_no_authority() {
-        let inventory = Inventory::default();
-        assert!(!inventory.admission_open());
-        assert!(!inventory.contains(ProfileId::from(1)));
-    }
-    #[test]
-    fn observation_never_renews_the_original_absolute_deadline() {
-        let operation = operation();
-        let deadline = operation.deadline;
-        assert!(operation.current());
-        assert!(operation.current());
-        assert_eq!(operation.deadline, deadline);
-        operation.cancel.store(true, Ordering::Release);
-        assert!(!operation.current());
-        assert_eq!(operation.deadline, deadline);
-    }
-    #[test]
-    fn explicit_retry_cannot_rearm_an_unsatisfied_running_obligation() {
-        let action = operation();
-        let mut slot = Slot {
-            attempt: None,
-            native_attempt: action.native_attempt,
-            action: action.clone(),
-            custody: Custody::Running,
-            finalization_pending: false,
-            local: None,
-            sequence: 0,
-        };
-        assert_eq!(slot.new_retry_action(), Err(RemovalFault::RecoveryRequired));
-        assert!(Arc::ptr_eq(&action, &slot.action));
-        assert!(action.current());
-        assert!(matches!(slot.custody, Custody::Running));
-    }
-    #[test]
-    fn shutdown_retires_retained_actions_even_without_a_live_service() {
-        let inventory = Inventory::default();
-        let action = operation();
-        inventory.slots.lock().unwrap().insert(
-            action.profile,
-            Slot {
-                attempt: None,
-                native_attempt: action.native_attempt,
-                action: action.clone(),
-                custody: Custody::Waiting,
-                finalization_pending: false,
-                local: None,
-                sequence: 0,
-            },
-        );
-        inventory.verified.store(true, Ordering::Release);
-        inventory.cancel_all();
-        assert!(!inventory.admission_open());
-        assert!(!action.current());
-        assert!(inventory.contains(action.profile));
-    }
-}
-
-#[cfg(test)]
 pub(super) fn test_operation(profile: ProfileId) -> Arc<Operation> {
     Arc::new(Operation::new(
         profile,
@@ -1665,5 +1525,144 @@ pub(super) fn cancel_turn(
         connection.cancel_turn_for_removal(scope, &admission, operation.deadline)
     } else {
         connection.cancel_turn(scope, &service.stop)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn operation() -> Arc<Operation> {
+        Arc::new(Operation::new(
+            ProfileId::from(1),
+            RemovalAttemptId::fresh_native().unwrap(),
+        ))
+    }
+    #[test]
+    fn verified_local_receipt_is_phase_and_sequence_bound() {
+        let receipt = LocalReceipt {
+            sequence: 4,
+            phase: LocalPhase::Acknowledge,
+            result: Some(app::CleanupProgress::Verified),
+        };
+        assert!(receipt.verified(4, LocalPhase::Acknowledge));
+        assert!(receipt.verified(4, LocalPhase::Acknowledge));
+        assert!(!receipt.verified(3, LocalPhase::Acknowledge));
+        assert!(!receipt.verified(5, LocalPhase::Acknowledge));
+        assert!(!receipt.verified(4, LocalPhase::Cleanup));
+        for phase in [LocalPhase::PrepareAbsent, LocalPhase::Renew] {
+            let receipt = LocalReceipt { phase, ..receipt };
+            assert!(!receipt.verified(4, phase));
+        }
+        for result in [
+            None,
+            Some(app::CleanupProgress::Pending(
+                app::RemovalStage::LocalCleanup,
+            )),
+            Some(app::CleanupProgress::Interrupted(
+                app::RemovalStage::LocalCleanup,
+            )),
+            Some(app::CleanupProgress::Blocked(
+                app::RemovalStage::RecoveryRequired,
+            )),
+        ] {
+            let receipt = LocalReceipt { result, ..receipt };
+            assert!(!receipt.verified(4, LocalPhase::Acknowledge));
+        }
+    }
+    #[test]
+    fn preparation_receipt_never_substitutes_for_a_current_native_capability() {
+        let action = operation();
+        let mut slot = Slot {
+            attempt: None,
+            native_attempt: action.native_attempt,
+            action,
+            custody: Custody::WaitingAbsent,
+            finalization_pending: false,
+            local: Some(LocalReceipt {
+                sequence: 1,
+                phase: LocalPhase::PrepareAbsent,
+                result: None,
+            }),
+            sequence: 1,
+        };
+        assert_eq!(
+            slot.preparation_status(),
+            Some(app::PreparedStatus::Pending(
+                app::RemovalStage::LocalCleanup
+            ))
+        );
+        slot.local.as_mut().unwrap().result = Some(app::CleanupProgress::Verified);
+        assert_eq!(slot.preparation_status(), None);
+        assert_eq!(slot.current(), Err(RemovalFault::RecoveryRequired));
+        slot.local.as_mut().unwrap().result = Some(app::CleanupProgress::Interrupted(
+            app::RemovalStage::LocalCleanup,
+        ));
+        assert_eq!(
+            slot.preparation_status(),
+            Some(app::PreparedStatus::Interrupted(
+                app::RemovalStage::LocalCleanup
+            ))
+        );
+        assert!(!slot
+            .local
+            .as_ref()
+            .unwrap()
+            .verified(1, LocalPhase::PrepareAbsent));
+    }
+    #[test]
+    fn initial_inventory_is_sealed_and_contains_no_authority() {
+        let inventory = Inventory::default();
+        assert!(!inventory.admission_open());
+        assert!(!inventory.contains(ProfileId::from(1)));
+    }
+    #[test]
+    fn observation_never_renews_the_original_absolute_deadline() {
+        let operation = operation();
+        let deadline = operation.deadline;
+        assert!(operation.current());
+        assert!(operation.current());
+        assert_eq!(operation.deadline, deadline);
+        operation.cancel.store(true, Ordering::Release);
+        assert!(!operation.current());
+        assert_eq!(operation.deadline, deadline);
+    }
+    #[test]
+    fn explicit_retry_cannot_rearm_an_unsatisfied_running_obligation() {
+        let action = operation();
+        let mut slot = Slot {
+            attempt: None,
+            native_attempt: action.native_attempt,
+            action: action.clone(),
+            custody: Custody::Running,
+            finalization_pending: false,
+            local: None,
+            sequence: 0,
+        };
+        assert_eq!(slot.new_retry_action(), Err(RemovalFault::RecoveryRequired));
+        assert!(Arc::ptr_eq(&action, &slot.action));
+        assert!(action.current());
+        assert!(matches!(slot.custody, Custody::Running));
+    }
+    #[test]
+    fn shutdown_retires_retained_actions_even_without_a_live_service() {
+        let inventory = Inventory::default();
+        let action = operation();
+        inventory.slots.lock().unwrap().insert(
+            action.profile,
+            Slot {
+                attempt: None,
+                native_attempt: action.native_attempt,
+                action: action.clone(),
+                custody: Custody::Waiting,
+                finalization_pending: false,
+                local: None,
+                sequence: 0,
+            },
+        );
+        inventory.verified.store(true, Ordering::Release);
+        inventory.cancel_all();
+        assert!(!inventory.admission_open());
+        assert!(!action.current());
+        assert!(inventory.contains(action.profile));
     }
 }

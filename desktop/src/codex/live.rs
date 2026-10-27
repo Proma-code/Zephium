@@ -793,10 +793,9 @@ fn worker(
         }) && matches!(
             connection.state(),
             AccountState::StartingLogin | AccountState::AwaitingBrowser
-        ) {
-            if removal::cancel_login(service, &mut connection, &scope).is_err() {
-                break;
-            }
+        ) && removal::cancel_login(service, &mut connection, &scope).is_err()
+        {
+            break;
         }
         if let Some(current) = active.as_mut() {
             if current.delivery.is_none()
@@ -1973,7 +1972,7 @@ pub(super) async fn dispatch(
             rollback_view,
             wake_demand.take(),
         ) {
-            return view;
+            return *view;
         }
     } else {
         drop(admission_view);
@@ -1992,7 +1991,7 @@ fn enqueue_admitted(
     operation: Command,
     view: Option<MutexGuard<'_, CodexViewV1>>,
     previous: Option<CodexViewV1>,
-) -> Result<(), CodexViewV1> {
+) -> Result<(), Box<CodexViewV1>> {
     enqueue_demand_admitted(service, operation, view, previous, None)
 }
 fn enqueue_demand_admitted(
@@ -2001,7 +2000,7 @@ fn enqueue_demand_admitted(
     mut view: Option<MutexGuard<'_, CodexViewV1>>,
     previous: Option<CodexViewV1>,
     demand: Option<dormant::Demand>,
-) -> Result<(), CodexViewV1> {
+) -> Result<(), Box<CodexViewV1>> {
     let unsent_login = if let Command::Login(login) = &operation {
         Some(login.id.clone())
     } else {
@@ -2026,11 +2025,11 @@ fn enqueue_demand_admitted(
                 }
             }
             view.error = Some(error);
-            return Err((*view).clone());
+            return Err(Box::new((*view).clone()));
         }
         let mut view = service.snapshot();
         view.error = Some(error);
-        return Err(view);
+        return Err(Box::new(view));
     }
     Ok(())
 }

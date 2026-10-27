@@ -322,11 +322,11 @@ pub(super) fn drain(
         }
         if let Some(local) = rejected.as_mut() {
             if let Ok(Some(receipt)) = local.owner.poll_settlement() {
-                if receipt.scope() == scope {
-                    if release(service, receipt.conversation().as_str(), receipt.reply()) {
-                        if let Some(local) = rejected.take() {
-                            let _ = local.call.result.send(ReplyDelivery::Failed(local.fault));
-                        }
+                if receipt.scope() == scope
+                    && release(service, receipt.conversation().as_str(), receipt.reply())
+                {
+                    if let Some(local) = rejected.take() {
+                        let _ = local.call.result.send(ReplyDelivery::Failed(local.fault));
                     }
                 }
             }
