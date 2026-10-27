@@ -132,7 +132,7 @@ describe("retired direct-account catalog", () => {
       const view = models({ keys });
       const old = retained();
       view.entries.push(old);
-      view.efforts.push({ id: old.id, levels: ["high"] });
+      view.efforts.push({ id: old.id, levels: ["high"], effort: "high" });
       view.chosen.page = old.id;
       const before = structuredClone(view);
       for (const role of ["lead", "page", "decision"] as const) {
