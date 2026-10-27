@@ -93,6 +93,48 @@ pub(crate) async fn profiles_get(
     )
 }
 
+/// Reconcile only an already-confirmed removal. This never begins a new delete.
+#[tauri::command]
+#[specta::specta]
+pub(crate) async fn profiles_retry_removal(
+    caller: WebviewWindow,
+    shell: State<'_, Handle>,
+    profile: String,
+) -> Result<zephium_ipc::ProfileRemovalRetryV1, ()> {
+    if !admitted(&caller, "profiles_retry_removal") || profile.len() > 64 {
+        return Err(());
+    }
+    let profile = profile_of(&profile).ok_or(())?;
+    let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+    if !shell.dispatch(Command::RetryProfileRemoval { profile, reply }) {
+        return Err(());
+    }
+    tokio::task::spawn_blocking(move || receiver.recv_timeout(Duration::from_secs(4)))
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
+}
+
+/// Recheck the protected removal inventory without beginning or driving deletion.
+#[tauri::command]
+#[specta::specta]
+pub(crate) async fn profiles_recheck_removal_inventory(
+    caller: WebviewWindow,
+    shell: State<'_, Handle>,
+) -> Result<zephium_ipc::ProfileRemovalRetryV1, ()> {
+    if !admitted(&caller, "profiles_recheck_removal_inventory") {
+        return Err(());
+    }
+    let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+    if !shell.dispatch(Command::RecheckProfileRemovalInventory { reply }) {
+        return Err(());
+    }
+    tokio::task::spawn_blocking(move || receiver.recv_timeout(Duration::from_secs(4)))
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
+}
+
 #[tauri::command]
 #[specta::specta]
 pub(crate) fn profiles_create(

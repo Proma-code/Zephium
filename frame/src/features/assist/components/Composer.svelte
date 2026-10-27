@@ -35,6 +35,7 @@
   let voice = $state<{ toggle(): void }>();
 
   const status = $derived(session.status);
+  const textOnly = $derived(status?.model?.capabilities === "text_only");
   const page = $derived(session.pageAttached ? (status?.page ?? null) : null);
   const live = $derived(new Map(tabs.tabs().map((tab) => [tab.id, tab])));
   const markOf = (id: string) => {
@@ -229,16 +230,19 @@
       }}
       {onkeydown}></textarea>
   {/if}
-  {#if session.notice?.reason === "chat_gpt"}
+  {#if session.notice?.reason === "chat_gpt" || session.notice?.reason === "native_conversation"}
     <FaultNote fault={session.notice} />
   {:else if notice}<p class="notice" role="alert">{notice}</p>{/if}
   <div class="bar">
-    <AddMenu {session} onpick={pick} />
+    {#if !textOnly}<AddMenu {session} onpick={pick} />{:else}<span class="notice"
+        >{m.assist_codex_text_only()}</span
+      >{/if}
     <span class="grow"></span>
     <span class="model">
       {#await loadModelPicker() then picker}<picker.default
           profile={session.profile}
           role="page"
+          nativeModel={status?.model?.source === "codex" ? status.model : null}
         />{/await}
     </span>
     <div class="action" data-action={action}>

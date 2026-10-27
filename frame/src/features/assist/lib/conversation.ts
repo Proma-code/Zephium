@@ -76,6 +76,15 @@ function applyReply(reply: Reply, kind: PageAssistEventV1): Reply | null {
       blocks[kind.block] = { ...block, text: block.text + kind.delta };
       return { ...reply, blocks };
     }
+    case "text_snapshot": {
+      if (!open(reply) || new TextEncoder().encode(kind.text).length > 24 * 1024) return null;
+      const blocks = [...reply.blocks];
+      if (kind.block === blocks.length && kind.block < MAX_BLOCKS)
+        blocks.push({ kind: "text", text: "", cites: [] });
+      if (blocks[kind.block]?.kind !== "text") return null;
+      blocks[kind.block] = { kind: "text", text: kind.text, cites: [] };
+      return { ...reply, blocks };
+    }
     case "cites": {
       const block = reply.blocks[kind.block];
       if (block?.kind !== "text") return null;

@@ -408,9 +408,13 @@ fn provider_window_changes_override_plan_examples_and_unknown_plan_text_is_disca
 }
 
 #[test]
-fn extra_credentials_account_details_and_labels_are_not_projected() {
-    let reading = parse_codex_rate_limits(br#"{"access_token":"synthetic-secret","account":{"email":"synthetic-secret"},"rateLimits":{"limitName":"synthetic-secret","primary":{"usedPercent":50,"token":"synthetic-secret"}}}"#, provenance(QuotaSource::CodexAppServer), CAPTURED).unwrap();
+fn extra_credentials_account_details_are_not_projected_but_bounded_bucket_label_is() {
+    let reading = parse_codex_rate_limits(br#"{"access_token":"synthetic-secret","account":{"email":"synthetic-secret"},"rateLimits":{"limitName":"Codex synthetic label","primary":{"usedPercent":50,"token":"synthetic-secret"}}}"#, provenance(QuotaSource::CodexAppServer), CAPTURED).unwrap();
     assert!(!format!("{reading:?}").contains("synthetic-secret"));
+    assert_eq!(
+        reading.buckets[0].name.as_deref(),
+        Some("Codex synthetic label")
+    );
     let claude = parse_claude_statusline(br#"{"apiKey":"synthetic-secret","session_id":"synthetic-secret","rate_limits":{"five_hour":{"used_percentage":50}}}"#, provenance(QuotaSource::ClaudeCodeStatusLine), CAPTURED).unwrap();
     assert!(!format!("{claude:?}").contains("synthetic-secret"));
 }
@@ -587,4 +591,41 @@ fn an_already_expired_observation_is_stale_at_capture_without_a_timer() {
     assert!(
         matches!(projection.state(), QuotaState::Stale { reading, fault: None } if reading.buckets[0].windows[0].remaining_percent == Some(0.0))
     );
+}
+
+#[test]
+fn codex_bucket_name_is_optional_exact_bounded_text() {
+    let scope = provenance(QuotaSource::CodexAppServer);
+    for name in [
+        serde_json::Value::Null,
+        serde_json::json!(""),
+        serde_json::json!("Codex window"),
+        serde_json::json!("حصة النموذج"),
+    ] {
+        let input=serde_json::to_vec(&serde_json::json!({"rateLimits":{"limitId":"codex","limitName":name,"primary":{"usedPercent":0}}})).unwrap();
+        let reading = parse_codex_rate_limits(&input, scope, CAPTURED).unwrap();
+        assert_eq!(reading.buckets[0].name.as_deref(), name.as_str());
+    }
+    let input =
+        serde_json::to_vec(&serde_json::json!({"rateLimits":{"limitName":"x".repeat(256)}}))
+            .unwrap();
+    assert!(parse_codex_rate_limits(&input, scope, CAPTURED).is_ok());
+}
+
+#[test]
+fn malformed_overlong_or_control_bucket_name_is_observation_failure() {
+    let scope = provenance(QuotaSource::CodexAppServer);
+    for name in [
+        serde_json::json!("x".repeat(257)),
+        serde_json::json!("line\nbreak"),
+        serde_json::json!(7),
+        serde_json::json!({"html":"not-a-label"}),
+    ] {
+        let input =
+            serde_json::to_vec(&serde_json::json!({"rateLimits":{"limitName":name}})).unwrap();
+        assert_eq!(
+            parse_codex_rate_limits(&input, scope, CAPTURED),
+            Err(QuotaFault::InvalidShape)
+        );
+    }
 }

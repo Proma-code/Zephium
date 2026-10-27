@@ -1,13 +1,13 @@
 # Build plan
 
-- [ ] 1. Windows subscription-account integration
-  - [ ] 1a. Direct official ChatGPT account lifecycle and native ownership
-  - [ ] 1b. Account-aware model/inference path without changing API-key behavior
-  - [ ] 1c. Truthful Claude/OpenCode/Antigravity setup and gate states
-  - [ ] 1d. Safe, accessible Settings UI and stale-operation handling
-  - [ ] 1e. Final portable checks, Windows qualification and independent review
+- [ ] 1. Windows Codex subscription integration
+  - [ ] Original runtime/account ownership and protected storage
+  - [ ] Canonical model, effort, quota and durable conversation continuity
+  - [ ] Existing Page/browser tools and genuine Ultra child lifecycle
+  - [ ] Explicit removal/recovery and retained direct-account retirement
+  - [ ] Existing-design UI, API/Work preservation and compatible updates
+  - [ ] Exact-source Windows qualification and independent review
 
-All rows belong to the same active feature and branch, not parallel work items.
-Implementation existed before Blueprint adoption; unchecked rows mean their
-complete acceptance/evidence has not been established by this packet. They do
-not imply no code exists. The lead may update them only against observed results.
+These are acceptance boundaries of one feature, not parallel provider projects.
+Unchecked means the complete final evidence is not yet established; module tests
+alone do not complete a product boundary. Detailed receipts remain private.

@@ -18,6 +18,7 @@ mod favicons;
 mod filesystem;
 mod history;
 pub mod media;
+mod page_choice;
 mod page_permissions;
 pub mod profile_avatars;
 mod resources;

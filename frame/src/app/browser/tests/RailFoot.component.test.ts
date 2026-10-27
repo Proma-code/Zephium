@@ -23,6 +23,8 @@ vi.mock("$shared/ipc/bindings", async () => {
       data: {
         current: id,
         private: false,
+        removal_recovery: null,
+        removals: [],
         profiles: [
           {
             id,

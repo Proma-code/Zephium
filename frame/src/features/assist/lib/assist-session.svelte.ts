@@ -63,6 +63,8 @@ export class AssistSession {
   private sendGeneration = 0;
   private queue: PageAssistChangedV1[] | null = null;
   private stopListening: (() => void) | null = null;
+  private stopModelsListening: (() => void) | null = null;
+  private listenerGeneration = 0;
   private active = false;
 
   constructor(readonly profile: string) {}
@@ -101,12 +103,34 @@ export class AssistSession {
   async start() {
     if (this.active) return;
     this.active = true;
-    const stop = await events.pageAssistChanged.listen(({ payload }) => this.receive(payload));
-    if (!this.active) {
+    const generation = ++this.listenerGeneration;
+    const current = () => this.active && generation === this.listenerGeneration;
+    const stop = await events.pageAssistChanged.listen(({ payload }) => {
+      if (current()) this.receive(payload);
+    });
+    if (!current()) {
       stop();
       return;
     }
     this.stopListening = stop;
+    try {
+      // Native owner/catalog readiness is advisory: reread the authoritative Page status.
+      const stopModels = await events.workModelsChanged.listen(() => {
+        if (current()) this.refresh();
+      });
+      if (!current()) {
+        stopModels();
+        return;
+      }
+      this.stopModelsListening = stopModels;
+    } catch (error) {
+      stop();
+      if (current()) {
+        this.active = false;
+        this.stopListening = null;
+      }
+      throw error;
+    }
   }
 
   /** The Space and the tab in front. A new Space starts from its own snapshot. */
@@ -249,12 +273,23 @@ export class AssistSession {
 
   /** True when Rust admitted the message; what it says arrives as events. */
   async ask(text: string, suggestion: PageAssistSuggestionV1 | null = null): Promise<boolean> {
-    const words = text.trim().slice(0, MESSAGE_LIMIT);
+    const native = this.status?.model?.source === "codex";
+    const words = native ? text : text.trim().slice(0, MESSAGE_LIMIT);
+    if (
+      native &&
+      (text.length > MESSAGE_LIMIT || suggestion !== null || this.attachments().length > 0)
+    ) {
+      this.notice = {
+        reason: "native_conversation",
+        fault: text.length > MESSAGE_LIMIT ? "limit" : "unsupported_input",
+      };
+      return false;
+    }
     const space = this.space;
     if (
       !this.active ||
       !space ||
-      (!words && !suggestion) ||
+      (!words.trim() && !suggestion) ||
       this.busy ||
       !this.talks ||
       this.sending
@@ -473,9 +508,12 @@ export class AssistSession {
     this.cancelPick();
     if (this.space) void quietly(commands.pageAssistClose(this.space), false);
     this.active = false;
+    this.listenerGeneration++;
     this.generation++;
     this.stopListening?.();
     this.stopListening = null;
+    this.stopModelsListening?.();
+    this.stopModelsListening = null;
     this.queue = null;
     this.space = null;
     this.tab = null;

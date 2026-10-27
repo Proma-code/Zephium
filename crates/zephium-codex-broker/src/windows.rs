@@ -205,6 +205,7 @@ fn no_inherit(handle: &OwnedHandle) -> Result<(), Fault> {
         .map_err(|_| Fault::Custody)
 }
 
+mod environment_block;
 fn environment(runtime: &RuntimePaths) -> Result<Vec<u16>, Fault> {
     let mut system = [0; 32768];
     let length = unsafe { GetSystemDirectoryW(Some(&mut system)) } as usize;
@@ -228,16 +229,28 @@ fn environment(runtime: &RuntimePaths) -> Result<Vec<u16>, Fault> {
         ("TEMP", runtime.temp().as_os_str().to_owned()),
         ("TMP", runtime.temp().as_os_str().to_owned()),
     ];
+    // Windows var_os uses the platform's case-insensitive name lookup. Only
+    // these seven source-proven transport names are queried; never enumerate or
+    // inherit provider/auth/config/environment overrides. Values stay unlogged.
+    let transport = crate::transport_environment::InheritedTransport::capture(|name| {
+        std::env::var_os(name).map(|value| value.encode_wide().collect())
+    })
+    .map_err(|_| Fault::InvalidRuntime)?;
+    entries.extend(
+        transport
+            .entries()
+            .map(|(name, value)| (name, OsString::from_wide(value))),
+    );
     entries.sort_by_cached_key(|(key, _)| key.to_ascii_uppercase());
-    let mut output = Vec::new();
-    for (key, value) in entries {
+    // 65,536 UTF-16 units is our total resource bound, not a Windows OS limit.
+    // A malformed/oversized entry refuses the whole spawn, never partial env.
+    environment_block::encode(entries.into_iter().map(|(key, value)| {
         let mut entry = OsString::from(key);
         entry.push("=");
         entry.push(value);
-        output.extend(wide(&entry)?);
-    }
-    output.push(0);
-    Ok(output)
+        wide(&entry).map_err(|_| ())
+    }))
+    .map_err(|_| Fault::InvalidRuntime)
 }
 
 pub(crate) struct TurnSendFailure {

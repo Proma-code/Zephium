@@ -1,5 +1,8 @@
 <script lang="ts">
   import { Popover } from "bits-ui";
+  import { codexEffort } from "$domain/codex";
+  import type { PageAssistModelV1 } from "$shared/ipc/bindings";
+  import type { CodexEffortV1 } from "$shared/ipc/codex-bindings";
   import { onDestroy, onMount, tick, untrack } from "svelte";
   import { accountSession, planName } from "$domain/account";
   import type { WorkModelEntry, WorkModelProvider, WorkModelReasoning } from "$shared/ipc/bindings";
@@ -13,7 +16,6 @@
     favourites,
     keyState,
     keyedProviders,
-    hasChatGptModels,
     hasGatewayModels,
     hasGoModels,
     connectionName,
@@ -51,11 +53,14 @@
   let {
     profile,
     role = "lead",
+    nativeModel = null,
     onsettings = () => void commands.runCommand("settings.ai"),
   }: {
     profile: string;
     /** Which of the person's models it chooses: Work's lead, or the sidebar assistant's page model. */
     role?: "lead" | "page";
+    /** Already observed Page metadata; never starts Codex merely to draw a trigger. */
+    nativeModel?: PageAssistModelV1 | null;
     /** Opens Settings → Models, where keys and accounts are managed. */
     onsettings?: () => void;
   } = $props();
@@ -63,6 +68,19 @@
   const uid = $props.id();
 
   let session = $state.raw<ModelsSession | null>(null);
+  let codexConnected = $state(false);
+  let codexRows = $state(0);
+  let nativePanel = $state<{ collapse: () => boolean; navigate: (event: KeyboardEvent) => void }>();
+  let nativeFavourites = $state(false);
+  let nativeActive = $state<string | undefined>();
+  $effect(() => {
+    void profile;
+    codexConnected = false;
+    codexRows = 0;
+    nativeFavourites = false;
+    nativeActive = undefined;
+  });
+  const nativeSelected = $derived(role === "page" && nativeModel?.source === "codex");
   let effortGeneration = 0;
   let wanted: WorkModelReasoning | null = null;
   let sending = false;
@@ -100,7 +118,20 @@
   const savedAccountChoice = $derived(models?.chosen[role]?.startsWith("chatgpt/") ?? false);
   const savedGoChoice = $derived(models?.chosen[role]?.startsWith("opencode-go/") ?? false);
   const savedGatewayChoice = $derived(models?.chosen[role]?.startsWith("gateway/") ?? false);
-  const groups = $derived(pickerGroups(models, role, session?.endpoint ?? []));
+  const groups = $derived.by(() => {
+    const offered = pickerGroups(models, role, session?.endpoint ?? []);
+    // Retained direct-sign-in choices remain readable, never offered as a new
+    // subscription method or silently converted to the managed Codex account.
+    return {
+      ...offered,
+      ready: offered.ready
+        .map((group) => ({
+          ...group,
+          entries: group.entries.filter((entry) => !entry.id.startsWith("chatgpt/")),
+        }))
+        .filter((group) => group.entries.length > 0),
+    };
+  });
   const tierOf = $derived(tiers(groups.ready));
 
   type Item = { id: string; entry: WorkModelEntry };
@@ -126,7 +157,7 @@
           own.push({ provider, standing: "sign_in" });
       } else if (
         usable(models, provider) ||
-        (provider === "open_ai" && hasChatGptModels(models)) ||
+        (provider === "open_ai" && (nativeSelected || codexConnected)) ||
         (provider === "compatible" && hasGatewayModels(models)) ||
         (provider === "open_code_go" && hasGoModels(models))
       )
@@ -153,7 +184,7 @@
 
   /** The sheet is as tall as its longest list needs, so it holds still as providers are chosen and searched. */
   const sheetHeight = $derived.by(() => {
-    const rows = Math.max(0, ...groups.ready.map((group) => group.entries.length));
+    const rows = Math.max(0, codexRows, ...groups.ready.map((group) => group.entries.length));
     // The rail's own height: its padding, a seat and a gap for each, and the hairline after the leading seats.
     const rail = 26 + seats.length * 34 + (seats[0]?.provider === "cloud" ? 8 : 0);
     return Math.min(520, Math.max(rail, 148 + 34 * rows));
@@ -167,14 +198,16 @@
       seats.find(
         (row) =>
           row.provider ===
-          (current?.model.provider ??
-            (savedAccountChoice
-              ? "open_ai"
-              : savedGatewayChoice
-                ? "compatible"
-                : savedGoChoice
-                  ? "open_code_go"
-                  : null)),
+          (nativeSelected
+            ? "open_ai"
+            : (current?.model.provider ??
+              (savedAccountChoice
+                ? "open_ai"
+                : savedGatewayChoice
+                  ? "compatible"
+                  : savedGoChoice
+                    ? "open_code_go"
+                    : null))),
       )?.provider ??
       seats[0]?.provider ??
       null
@@ -182,15 +215,10 @@
   });
   const seat = $derived(seats.find((row) => row.provider === shown) ?? null);
   /** A connection filter, never a new provider or a model/billing selection. */
-  let sourcePick = $state<"api" | "chatgpt" | null>(null);
-  const source = $derived(
-    sourcePick ??
-      (current?.id.startsWith("chatgpt/") ||
-      savedAccountChoice ||
-      (!usable(models, "open_ai") && hasChatGptModels(models))
-        ? "chatgpt"
-        : "api"),
-  );
+  let sourcePick = $state<"api" | "codex" | null>(null);
+  const source = $derived(sourcePick ?? (nativeSelected ? "codex" : "api"));
+
+  const nativePane = $derived(role === "page" && shown === "open_ai" && source === "codex");
 
   let gatewaySourcePick = $state<"endpoint" | "gateway" | null>(null);
   const gatewaySource = $derived(
@@ -219,7 +247,7 @@
       .flatMap((group) => {
         const sources =
           spanning && group.provider === "open_ai"
-            ? (["api", "chatgpt"] as const)
+            ? (["api"] as const)
             : spanning && group.provider === "compatible"
               ? (["endpoint", "gateway"] as const)
               : [null];
@@ -245,7 +273,9 @@
       })
       .filter((section) => section.items.length);
   });
-  const hits = $derived(searching ? new Set(sections.map((section) => section.provider)) : null);
+  const hits = $derived(
+    searching && !nativePane ? new Set(sections.map((section) => section.provider)) : null,
+  );
   const items = $derived(sections.flatMap((section) => section.items));
   const slot = (id: string) => `${uid}-${items.findIndex((item) => item.id === id)}`;
 
@@ -256,14 +286,14 @@
 
   /** The effort the person last set while the menu is open, ahead of Rust's answer. */
   let intent = $state<WorkModelReasoning | null>(null);
-  const levels = $derived(effortLevels(models, chosen));
+  const levels = $derived(chosen?.startsWith("chatgpt/") ? [] : effortLevels(models, chosen));
   const resolvedEffort = $derived(modelEffort(models, chosen));
   const effort = $derived<WorkModelReasoning | null>(
     levels.length ? (intent ? nearestEffort(levels, intent) : resolvedEffort) : null,
   );
 
   const card = $derived.by<CardSubject | null>(() => {
-    if (!current) return null;
+    if (!current || nativeSelected || source === "codex") return null;
     return { entry: current, tier: tierOf[current.id] ?? null, levels, effort };
   });
 
@@ -420,7 +450,7 @@
   async function choose(entry: WorkModelEntry) {
     if (locked(models, entry.id)) return upgrade();
     if (session?.busy) return;
-    if (entry.id !== chosen && !(await session?.choose(role, entry.id))) return;
+    if ((entry.id !== chosen || nativeSelected) && !(await session?.choose(role, entry.id))) return;
     close();
   }
 
@@ -491,6 +521,10 @@
   /** The favourites view and back to the provider that was open. */
   let before: View | null = null;
   async function toggleFavourites() {
+    if (nativePane) {
+      nativeFavourites = !nativeFavourites;
+      return;
+    }
     if (shown === "favourites") {
       await pick(before);
       return;
@@ -537,6 +571,24 @@
 
   function keys(event: KeyboardEvent) {
     if (event.defaultPrevented || event.isComposing) return;
+    if (nativePane) {
+      const target = event.target as HTMLElement;
+      if (
+        target !== field &&
+        event.key.length === 1 &&
+        event.key !== " " &&
+        !event.ctrlKey &&
+        !event.metaKey &&
+        !event.altKey &&
+        !target.closest('button, [role="slider"]')
+      ) {
+        event.preventDefault();
+        void openSearch(event.key);
+      } else if (target === field && ["ArrowDown", "ArrowUp", "Enter"].includes(event.key)) {
+        nativePanel?.navigate(event);
+      }
+      return;
+    }
     const target = event.target as HTMLElement;
     const inField = target === field;
     const onButton = target instanceof HTMLButtonElement;
@@ -582,7 +634,6 @@
           !searching &&
           seat &&
           seat.standing !== "ready" &&
-          shownSource !== "chatgpt" &&
           shownSource !== "gateway" &&
           shown !== "open_code_go"
         )
@@ -593,6 +644,10 @@
   }
 
   function escape(event: KeyboardEvent) {
+    if (nativePane && nativePanel?.collapse()) {
+      event.preventDefault();
+      return;
+    }
     if (effortOpen) {
       event.preventDefault();
       putAway();
@@ -647,11 +702,13 @@
   });
 
   const triggerLabel = $derived(
-    current
-      ? effort
-        ? m.model_trigger_effort({ model: modelName(current), effort: effortName(effort) })
-        : m.work_model_trigger({ model: modelName(current) })
-      : m.work_model_label(),
+    nativeSelected && nativeModel
+      ? `${nativeModel.name} · ${m.codex_source()} · ${nativeModel.effort ? codexEffort(nativeModel.effort as CodexEffortV1) : m.codex_effort_default()}`
+      : current
+        ? effort
+          ? m.model_trigger_effort({ model: modelName(current), effort: effortName(effort) })
+          : m.work_model_trigger({ model: modelName(current) })
+        : m.work_model_label(),
   );
   const title = $derived(
     shown === "favourites" ? m.model_favourites() : shown ? nameOf(shown) : m.work_model_label(),
@@ -662,12 +719,26 @@
   <Popover.Trigger
     bind:ref={trigger}
     class="model-trigger ui-shine ui-shine-press"
-    aria-label={keyless ? m.model_connect() : triggerLabel}
+    aria-label={keyless
+      ? m.model_connect()
+      : role === "lead" && current
+        ? m.work_model_scoped_trigger({ label: triggerLabel })
+        : triggerLabel}
     disabled={!models}
   >
     {#if keyless}
       <span class="trigger-mark" aria-hidden="true"><Icon icon={Key01Icon} size={14} /></span>
       <span class="trigger-name empty">{m.model_connect()}</span>
+    {:else if nativeSelected && nativeModel}
+      <span class="trigger-mark" aria-hidden="true"
+        ><ProviderMark provider="open_ai" size={15} /></span
+      >
+      <span class="trigger-name">{nativeModel.name}</span>
+      <span class="trigger-level"
+        ><span class="trigger-dot" aria-hidden="true">·</span>{nativeModel.effort
+          ? codexEffort(nativeModel.effort as CodexEffortV1)
+          : m.codex_effort_default()}</span
+      >
     {:else if current}
       <span class="trigger-mark" aria-hidden="true"
         ><ProviderMark provider={current.model.provider} size={15} /></span
@@ -722,7 +793,7 @@
               class="tool fade"
               aria-label={m.model_favourites()}
               title={m.model_favourites()}
-              aria-pressed={shown === "favourites"}
+              aria-pressed={nativePane ? nativeFavourites : shown === "favourites"}
               onpointerdown={(event) => event.preventDefault()}
               onclick={() => void toggleFavourites()}
               ><Icon icon={StarIcon} size={15} strokeWidth={1.8} /></button
@@ -760,11 +831,13 @@
               placeholder={m.model_search()}
               aria-label={m.model_search()}
               aria-expanded="true"
-              aria-controls="{uid}-list"
+              aria-controls={nativePane ? `${uid}-native-list` : `${uid}-list`}
               aria-autocomplete="list"
-              aria-activedescendant={active && items.some((item) => item.id === active)
-                ? slot(active)
-                : undefined}
+              aria-activedescendant={nativePane
+                ? nativeActive
+                : active && items.some((item) => item.id === active)
+                  ? slot(active)
+                  : undefined}
               oninput={retyped}
             />
             {#if searching}<button
@@ -809,18 +882,33 @@
                 active = null;
               }}>{shown === "open_ai" ? m.model_source_api() : m.model_source_endpoint()}</button
             >
-            <button
-              type="button"
-              aria-pressed={shownSource === "chatgpt" || shownSource === "gateway"}
-              onclick={() => {
-                if (shown === "open_ai") sourcePick = "chatgpt";
-                else gatewaySourcePick = "gateway";
-                active = null;
-              }}>{shown === "open_ai" ? m.model_source_chatgpt() : m.model_source_gateway()}</button
-            >
+            {#if role === "page" && shown === "open_ai"}
+              <button
+                type="button"
+                aria-label={m.codex_source()}
+                aria-pressed={shownSource === "codex"}
+                onclick={() => {
+                  sourcePick = "codex";
+                  active = null;
+                  query = "";
+                  searchOpen = false;
+                }}>{m.codex_source()}</button
+              >
+            {/if}
+            {#if shown === "compatible"}
+              <button
+                type="button"
+                aria-label={m.model_source_gateway()}
+                aria-pressed={shownSource === "gateway"}
+                onclick={() => {
+                  gatewaySourcePick = "gateway";
+                  active = null;
+                }}>{m.model_source_gateway()}</button
+              >
+            {/if}
           </div>
           <span class="sr-only" id={`${uid}-sources-note`}>{m.model_sources_note()}</span>
-          {#if shown === "open_ai" && savedAccountChoice && !hasChatGptModels(models)}
+          {#if shown === "open_ai" && (savedAccountChoice || current?.id.startsWith("chatgpt/"))}
             <p class="note" role="status">{m.ai_chatgpt_choice_unavailable()}</p>
           {/if}
           {#if shown === "compatible" && savedGatewayChoice && !hasGatewayModels(models)}
@@ -839,15 +927,6 @@
               <p class="note failure" role="alert">{m.gateway_load_failed()}</p>
             {/await}
           {/if}
-          {#if shownSource === "chatgpt" && open}
-            {#await import("./ModelChatGpt.svelte")}
-              <p class="note" role="status">{m.model_chatgpt_loading()}</p>
-            {:then connection}
-              <connection.default {profile} hasModels={hasChatGptModels(models)} />
-            {:catch}
-              <p class="note failure" role="alert">{m.model_chatgpt_load_failed()}</p>
-            {/await}
-          {/if}
         {/if}
         {#if shown === "open_code_go" && !spanning && open}
           {#if savedGoChoice && !hasGoModels(models)}<p class="note" role="status">
@@ -859,7 +938,23 @@
             <connection.default {profile} hasModels={hasGoModels(models)} onsettings={settings} />
           {:catch}<p class="note failure" role="alert">{m.go_load_failed()}</p>{/await}
         {/if}
-        {#if !spanning && ((shownSource === "chatgpt" && !hasChatGptModels(models)) || (shownSource === "gateway" && !hasGatewayModels(models)) || (shown === "open_code_go" && !hasGoModels(models)))}
+        {#if nativePane && open}
+          {#await import("./ModelCodex.svelte")}<p class="note" role="status">
+              {m.codex_loading()}
+            </p>
+          {:then pane}<pane.default
+              {profile}
+              {query}
+              favouritesOnly={nativeFavourites}
+              listId={`${uid}-native-list`}
+              onactive={(id) => (nativeActive = id)}
+              bind:this={nativePanel}
+              onchosen={close}
+              onstate={(ready) => (codexConnected = ready)}
+              oncount={(count) => (codexRows = count)}
+            />
+          {:catch}<p class="note failure" role="alert">{m.codex_load_failed()}</p>{/await}
+        {:else if !spanning && ((shownSource === "gateway" && !hasGatewayModels(models)) || (shown === "open_code_go" && !hasGoModels(models)))}
           <!-- The native connection view above explains the missing catalog. -->
         {:else if shown === "open_ai" && !spanning && source === "api" && !usable(models, "open_ai")}
           <ModelAsk
@@ -887,7 +982,7 @@
           <div
             class="list"
             class:account-list={!spanning &&
-              (shownSource === "chatgpt" || shownSource === "gateway" || shown === "open_code_go")}
+              (shownSource === "gateway" || shown === "open_code_go")}
             id="{uid}-list"
             role="listbox"
             aria-label={searching ? m.model_search() : title}
@@ -930,7 +1025,7 @@
                     data-id={item.id}
                     data-active={item.id === active ? "" : undefined}
                     data-walk={item.id === active && walked ? "" : undefined}
-                    aria-selected={item.id === chosen}
+                    aria-selected={!nativeSelected && item.id === chosen}
                     aria-label={closed
                       ? needed
                         ? m.work_model_upgrade_plan_label({
@@ -948,7 +1043,7 @@
                       >{/if}
                     <span class="slot">
                       <span class="check" aria-hidden="true"
-                        >{#if item.id === chosen}<Icon
+                        >{#if !nativeSelected && item.id === chosen}<Icon
                             icon={Tick02Icon}
                             size={14}
                             strokeWidth={2.2}
@@ -977,6 +1072,7 @@
               </p>{/if}
           </div>
         {/if}
+        {#if role === "lead"}<p class="note">{m.work_model_scope()}</p>{/if}
         {#if searchOff}<p class="note">{m.work_model_no_search()}</p>{/if}
         {#if session?.fault?.action === `choose:${role}`}<p class="note failure" role="alert">
             {m.work_model_failed()}
@@ -1108,6 +1204,7 @@
 
   .sources button {
     flex: 1;
+    min-inline-size: 0;
     min-block-size: 28px;
     padding: 4px 8px;
     border: 0;

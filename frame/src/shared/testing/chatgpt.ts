@@ -8,10 +8,9 @@ export function chatgptView(profile: string, changes: Partial<ChatGptViewV1> = {
     profile,
     state: "signed_out",
     email: null,
-    models: 0,
     error: null,
     revocation_unconfirmed: false,
-    login_attempt: null,
+    presence: "missing",
     ...changes,
   };
 }

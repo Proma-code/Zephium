@@ -210,6 +210,30 @@ impl ManagedAccount {
         self.queue(request, RequestKind::Logout)
     }
 
+    /// Connection wire-idleness alone does not drain a browser login ceremony.
+    /// This exact reducer preflight must precede protected reservation writes.
+    pub(crate) fn removal_ready(&self, scope: &Scope) -> Result<(), Fault> {
+        self.check_scope(scope)?;
+        if self.queued.is_some() || self.pending.is_some() {
+            return Err(Fault::Account(AccountFault::Busy));
+        }
+        self.reducer.logout_ready().map_err(Fault::Account)
+    }
+
+    /// The held native removal transaction uses the same original logout wire
+    /// request, but creates its fresh read only after the logout notification.
+    pub(crate) fn logout_for_removal(
+        &mut self,
+        action: LogoutAction,
+    ) -> Result<AccountEvent, Fault> {
+        self.check_scope(&action.0)?;
+        let request = self
+            .reducer
+            .logout_deferred_read(true)
+            .map_err(Fault::Account)?;
+        self.queue(request, RequestKind::Logout)
+    }
+
     pub(crate) fn cancel_login(&mut self, scope: &Scope) -> Result<AccountEvent, Fault> {
         self.check_scope(scope)?;
         if self
@@ -820,5 +844,37 @@ mod tests {
             session.take_request(&scope(), u64::MAX),
             Err(Fault::WireId)
         ));
+    }
+    #[test]
+    fn removal_preflight_refuses_browser_login_without_disabling_its_cancel() {
+        let mut session = ready();
+        queued(
+            session
+                .login(LoginAction::from_native_action(scope()))
+                .unwrap(),
+        );
+        request(&mut session, 11, "account/login/start");
+        let event = session
+            .reply(
+                &scope(),
+                11,
+                Ok(json!({
+                    "type":"chatgpt", "loginId":"synthetic-login",
+                    "authUrl":"https://auth.openai.com/authorize?synthetic=1"
+                })),
+            )
+            .unwrap();
+        assert!(matches!(event.into_effect(), Effect::OpenBrowser(_)));
+        assert_eq!(session.state(&scope()), Ok(AccountState::AwaitingBrowser));
+        assert_eq!(
+            session.removal_ready(&scope()),
+            Err(Fault::Account(AccountFault::Busy))
+        );
+        assert_eq!(session.state(&scope()), Ok(AccountState::AwaitingBrowser));
+        queued(session.cancel_login(&scope()).unwrap());
+        assert_eq!(
+            request(&mut session, 12, "account/login/cancel"),
+            json!({"id":12,"method":"account/login/cancel","params":{"loginId":"synthetic-login"}})
+        );
     }
 }

@@ -74,6 +74,8 @@ impl Shell {
         Some(ProfilesView {
             current: current.map(|profile| profile.to_string()),
             private,
+            removals: self.profile_removals_view(),
+            removal_recovery: self.profile_removal_recovery_view(),
             profiles: self
                 .profiles
                 .iter()

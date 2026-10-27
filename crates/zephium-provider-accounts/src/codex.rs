@@ -72,6 +72,7 @@ enum Method {
     Login,
     Cancel(String),
     Logout,
+    LogoutDeferredRead,
 }
 
 /// A narrowly typed request for an already-qualified native transport.
@@ -118,7 +119,9 @@ impl Request {
             Method::Cancel(login_id) => {
                 json!({"id": self.id, "method": "account/login/cancel", "params": {"loginId": login_id}})
             }
-            Method::Logout => json!({"id": self.id, "method": "account/logout"}),
+            Method::Logout | Method::LogoutDeferredRead => {
+                json!({"id": self.id, "method": "account/logout"})
+            }
         }
     }
 }
@@ -272,6 +275,12 @@ impl CodexAccountSession {
         Err(Fault::Busy)
     }
 
+    /// Nonmutating readiness only, not user consent or logout authority. The
+    /// native removal owner checks this before publishing protected intent.
+    pub fn logout_ready(&self) -> Result<(), Fault> {
+        self.idle()
+    }
+
     /// Request logout only after a separate explicit user decision.
     ///
     /// Logout affects the official CLI's account, not Zephium's API-key vault.
@@ -282,6 +291,19 @@ impl CodexAccountSession {
         self.idle()?;
         self.state = AccountState::Checking;
         self.request(Method::Logout)
+    }
+
+    /// Explicit logout with confirmation read creation deferred to its native
+    /// owner. Used only when that owner must first observe the original logout
+    /// notification. The ACK is not signed-out evidence; no freshness flag is
+    /// cleared and every later read uses the ordinary invalidation rules.
+    pub fn logout_deferred_read(&mut self, user_confirmed: bool) -> Result<Request, Fault> {
+        if !user_confirmed {
+            return Err(Fault::ConsentRequired);
+        }
+        self.idle()?;
+        self.state = AccountState::Checking;
+        self.request(Method::LogoutDeferredRead)
     }
 
     /// End this observer without claiming cancellation, logout, or success.
@@ -416,6 +438,13 @@ impl CodexAccountSession {
                 // Confirm through account/read; an acknowledgement is not account state.
                 self.state = AccountState::Checking;
                 self.request(Method::Read).map(Event::Send)
+            }
+            Method::LogoutDeferredRead => {
+                // The native owner creates the one new confirmation read after
+                // its separately validated notification barrier, never via a
+                // fake result or by resetting an in-flight read's freshness.
+                self.state = AccountState::Checking;
+                Ok(Event::Changed)
             }
         }
     }

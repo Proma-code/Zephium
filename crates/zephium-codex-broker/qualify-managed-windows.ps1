@@ -53,6 +53,27 @@ Assert-Receipts $output @(
     'codex-owner-unsent-skip-ack-unknown',
     'codex-owner-preparation-ack-unknown'
 )
+$output=@(& $fixture quota); $code=$LASTEXITCODE; $output | Write-Output
+if ($code -ne 0) { throw 'Synthetic observational quota qualification failed.' }
+Assert-Receipts $output @(
+    'codex-quota-account-replacement-late-reply-ignored',
+    'codex-quota-same-pump-account-replacement-coalesced',
+    'codex-quota-provider-refusal-turn-settled',
+    'codex-quota-expired-read-late-reply-turn-settled',
+    'codex-quota-malformed-reading-turn-settled'
+)
+$output=@(& $fixture removal); $code=$LASTEXITCODE; $output | Write-Output
+if ($code -ne 0) { throw 'Synthetic explicit removal settlement qualification failed.' }
+Assert-Receipts $output @(
+    'codex-removal-signedout-still-logout-same-lease',
+    'codex-removal-pending-catalog-drained-no-pagination',
+    'codex-removal-pending-quota-drained-before-settlement',
+    'codex-removal-ack-without-notification-refused',
+    'codex-removal-inflight-invalidation-refused',
+    'codex-removal-late-invalidation-refused',
+    'codex-removal-nonzero-exit-refused',
+    'codex-removal-cancel-during-finish-refused'
+)
 $output=@(& $fixture vault); $code=$LASTEXITCODE; $output | Write-Output
 if ($code -ne 0) { throw 'Nonsecret OS credential-store availability check failed.' }
 Assert-Receipts $output @('codex-vault-nonsecret-roundtrip')

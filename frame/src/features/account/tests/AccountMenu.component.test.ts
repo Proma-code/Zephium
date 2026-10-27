@@ -50,7 +50,13 @@ async function shoot(name: string) {
 
 async function open(account: AccountV1, profiles: ProfileEntryView[], name = "Account") {
   native.account = account;
-  native.profiles = { current: ID(1), private: false, profiles };
+  native.profiles = {
+    current: ID(1),
+    private: false,
+    profiles,
+    removals: [],
+    removal_recovery: null,
+  };
   const screen = await render(AccountMenuStage);
   await settle(200);
   await screen.getByRole("button", { name, exact: true }).click();

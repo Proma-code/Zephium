@@ -14,11 +14,11 @@ instructions, especially `frame/AGENTS.md`, and current user scope govern.
   are useful but not Windows runtime qualification. No macOS/Linux feature work.
 - Preserve the native CLI execution gate, caller/profile scope, CSP, generated
   IPC ownership and credential isolation. Do not read/import another app's tokens.
-- ChatGPT uses direct official Sign in with ChatGPT and Zephium-owned registration.
-  OpenCode Go uses an explicitly configured Console access key, separate from CLI
-  login, with coding-use and provider billing disclosures. Claude's original-client
-  route remains in qualification. An existing local gateway is a separate custom
-  connection, not official Antigravity consumer sign-in or proof of entitlement.
+- Codex is the only subscription connection being developed. Use a verified
+  compatible official runtime with a separate app-owned home; never import an
+  existing Codex/ChatGPT grant. Direct SIWC is retired except minimal retained-data
+  observation, disconnect and profile cleanup. Other providers are deferred;
+  existing API/Work configurations must remain functional and separate.
 - Tests use synthetic credentials/messages and isolated fixtures. No real login,
   logout, OAuth consent, paid inference, account changes or user browser profile.
 - No upstream installer, hook, background monitor, package upgrade, external

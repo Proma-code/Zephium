@@ -198,11 +198,15 @@ const person = (n: number, name: string, color: number, revision = 1): ProfileEn
   avatar: { style: n === 3 ? "symbol" : "initials", color, symbol: 4, revision },
 });
 const ONE: ProfilesView = {
+  removal_recovery: null,
+  removals: [],
   current: ID(1),
   private: false,
   profiles: [person(1, "Personal", 0, 0)],
 };
 const THREE: ProfilesView = {
+  removal_recovery: null,
+  removals: [],
   current: ID(1),
   private: false,
   profiles: [person(1, "Personal", 0, 0), person(2, "Work", 1), person(3, "Side Project", 8)],

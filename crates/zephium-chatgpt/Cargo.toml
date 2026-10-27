@@ -12,15 +12,12 @@ test-fixtures = []
 windows-subscription-trial = []
 
 [dependencies]
-base64.workspace = true
 getrandom = "=0.3.4"
-jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["aws_lc_rs"] }
-reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "json", "form", "stream"] }
+reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "form", "stream"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "=0.10.9"
-tokio = { workspace = true, features = ["time", "net", "io-util", "sync"] }
-url.workspace = true
+tokio = { workspace = true, features = ["time", "sync"] }
 zeroize = { version = "=1.9.0", features = ["serde"] }
 zephium-core.workspace = true
 zephium-credentials.workspace = true

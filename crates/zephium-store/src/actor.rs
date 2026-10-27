@@ -402,6 +402,11 @@ enum Cmd {
         Sender<zephium_core::bookmarks::BookmarkReply>,
     ),
     ClearHistory(ProfileId, Option<i64>, Sender<Option<u32>>),
+    PageChoice(
+        ProfileId,
+        zephium_core::page_choice::Call,
+        Sender<zephium_core::page_choice::Reply>,
+    ),
     Codex(
         ProfileId,
         zephium_core::codex_store::Call,
@@ -1184,6 +1189,9 @@ impl Store for SqliteStore {
     }
 
     fn set_app_setting(&self, key: String, value: String) -> bool {
+        if zephium_core::page_choice::reserved_key(&key) {
+            return false;
+        }
         if key.is_empty()
             || key.len() > MAX_SETTING_KEY_BYTES
             || value.len() > MAX_SETTING_VALUE_BYTES
@@ -1448,6 +1456,62 @@ impl Store for SqliteStore {
             return None;
         }
         rx.recv_timeout(STORE_RPC_TIMEOUT).ok().flatten()
+    }
+
+    fn page_choice_call(
+        &self,
+        profile: ProfileId,
+        call: zephium_core::page_choice::Call,
+    ) -> zephium_core::page_choice::Reply {
+        use zephium_core::page_choice::{Call, Fault, Reply, Selection};
+        if !call.valid(profile) {
+            return Reply::Failed(Fault::Invalid);
+        }
+        let lifecycle = self.lifecycle.read().unwrap_or_else(|p| p.into_inner());
+        if lifecycle.terminal_admitted || self.shutdown_clean.load(Ordering::Acquire) {
+            return Reply::Failed(Fault::Unavailable);
+        }
+        let mutates = call.mutates();
+        let (tx, rx) = mpsc::channel();
+        let mut settings = self
+            .pending_settings
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut inserted = Vec::new();
+        if let Call::CompareAndSwap { selection, .. } = &call {
+            let keys = zephium_core::page_choice::keys(profile);
+            let selected = match selection {
+                Selection::Model(_) => 0,
+                Selection::Codex(_) => 2,
+            };
+            for index in [selected, 1, 3] {
+                if !settings.known_keys.contains(&keys[index]) {
+                    inserted.push(keys[index].clone());
+                }
+            }
+            if settings.unique_keys() + inserted.len() > MAX_PENDING_SETTINGS {
+                return Reply::Failed(Fault::Limit);
+            }
+            settings.known_keys.extend(inserted.iter().cloned());
+        }
+        if self
+            .tx
+            .try_send(Cmd::PageChoice(profile, call, tx))
+            .is_err()
+        {
+            for key in inserted {
+                settings.known_keys.remove(&key);
+            }
+            return Reply::Failed(Fault::Unavailable);
+        }
+        drop(settings);
+        drop(lifecycle);
+        rx.recv_timeout(STORE_RPC_TIMEOUT)
+            .unwrap_or(Reply::Failed(if mutates {
+                Fault::OutcomeUnknown
+            } else {
+                Fault::Unavailable
+            }))
     }
 
     fn codex_call(
@@ -2010,6 +2074,21 @@ fn actor(
                     hub.clear_history_checked(profile, since)
                 } else {
                     None
+                };
+                let _ = reply.send(result);
+            }
+            Some(Cmd::PageChoice(profile, call, reply)) => {
+                // Drain any grandfathered asynchronous values before the complete
+                // cohort becomes selection authority. New generic Page writes
+                // are refused at admission, so none can overtake this transaction.
+                let settings_settled =
+                    flush_settings(&mut hub, &pending_settings, &mut setting_retry, true);
+                let result = if settings_settled && flush(&mut hub, &mut pending) {
+                    hub.page_choice_call(profile, call)
+                } else {
+                    zephium_core::page_choice::Reply::Failed(
+                        zephium_core::page_choice::Fault::Unavailable,
+                    )
                 };
                 let _ = reply.send(result);
             }

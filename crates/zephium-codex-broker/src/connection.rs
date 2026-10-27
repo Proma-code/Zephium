@@ -8,6 +8,7 @@ use crate::{
     managed_account::{
         self, Effect, InitializedAccountReceipt, LoginAction, LogoutAction, ManagedAccount,
     },
+    preparation_budget::PreparationBudget,
     profile::{
         native::{random_id, ProfileLease},
         ProfileId,
@@ -134,6 +135,7 @@ pub enum Event {
     Account(AccountState),
     OpenBrowser(LoginUrl),
     Catalog(Catalog),
+    Quota(QuotaView),
     Conversation(conversation::Event),
     /// Original terminal is known, but durable continuation acknowledgement is not.
     HistoryUncertain(conversation::TurnResult),
@@ -160,6 +162,7 @@ impl ScopedEvent {
 }
 enum PendingKind {
     Account,
+    Quota(quota::QuotaPending),
     Catalog(Option<String>),
     Conversation(Command),
 }
@@ -194,8 +197,11 @@ pub struct Connection {
     association_scope: durable::Scope,
     records: BTreeMap<ConversationKey, durable::Association>,
     session: Option<Session>,
-    runtime: Arc<RuntimePaths>,
+    runtime: Option<Arc<RuntimePaths>>,
+    removal: Option<removal::RemovalState>,
+    removal_setup: Option<removal::AccountPreparation>,
     account: ManagedAccount,
+    quota_owner: crate::quota_owner::QuotaOwner,
     catalog: Option<Catalog>,
     catalog_builder: Option<CatalogBuilder>,
     conversations: BTreeMap<ConversationKey, Conversation>,
@@ -213,6 +219,36 @@ pub struct Connection {
     advisory_join: crate::notification_scope::AdvisoryJoin,
     settled_turns: BTreeMap<ConversationKey, (String, String)>,
     notification_frames: usize,
+}
+/// Startup timing plus an optional native removal action, never caller RPC rights.
+pub(crate) struct NativePreparation {
+    budget: PreparationBudget,
+    removal: Option<removal::AccountPreparation>,
+    existing_owner: Option<durable::Scope>,
+}
+impl From<PreparationBudget> for NativePreparation {
+    fn from(budget: PreparationBudget) -> Self {
+        Self {
+            budget,
+            removal: None,
+            existing_owner: None,
+        }
+    }
+}
+impl NativePreparation {
+    fn check(&self, cancel: &AtomicBool) -> Result<(), Fault> {
+        check(self.budget.deadline(), cancel)?;
+        if let Some(setup) = &self.removal {
+            setup.current()?;
+        }
+        Ok(())
+    }
+    fn next_rpc(self) -> Self {
+        Self {
+            budget: self.budget.next_rpc(Instant::now()),
+            ..self
+        }
+    }
 }
 /// A native-held authenticated image that passed the exact production semantic
 /// startup policy in a fresh signed-out disposable home. No account home was open.
@@ -257,22 +293,93 @@ impl Connection {
         cached_release: Option<&str>,
         cancel: &AtomicBool,
     ) -> Result<Self, Fault> {
-        let preparation = Instant::now() + PREPARE;
-        check(preparation, cancel)?;
+        Self::open_with_budget(
+            profile,
+            epoch,
+            associations,
+            cached_release,
+            cancel,
+            PreparationBudget::ordinary(Instant::now() + PREPARE).into(),
+        )
+    }
+    /// Native explicit-removal setup only. Queue/preparation time consumes the
+    /// same immutable obligation; this cannot extend it or select new rights.
+    pub fn open_for_removal(
+        profile: ProfileId,
+        epoch: u64,
+        associations: Box<dyn Associations>,
+        cached_release: Option<&str>,
+        admission: &RemovalAdmission,
+        absolute_deadline: Instant,
+    ) -> Result<Self, Fault> {
+        let setup = removal::AccountPreparation::new(admission, absolute_deadline)?;
+        let cancel = setup.cancel.clone();
+        Self::open_with_budget(
+            profile,
+            epoch,
+            associations,
+            cached_release,
+            &cancel,
+            NativePreparation {
+                budget: PreparationBudget::removal(Instant::now(), absolute_deadline),
+                removal: Some(setup),
+                existing_owner: None,
+            },
+        )
+    }
+    fn open_with_budget(
+        profile: ProfileId,
+        epoch: u64,
+        mut associations: Box<dyn Associations>,
+        cached_release: Option<&str>,
+        cancel: &AtomicBool,
+        mut preparation: NativePreparation,
+    ) -> Result<Self, Fault> {
+        preparation.check(cancel)?;
+        let deadline = preparation.budget.deadline();
+        // Removal must never provision a replacement for missing managed data.
+        // Canonical ownership and existing held identity are joined before even
+        // the disposable compatibility process or credential prerequisite.
+        let existing = if preparation.removal.is_some() {
+            let canonical = match associations.call(durable::Call::InspectOwner) {
+                durable::Reply::Owner(Some(value)) if value.valid() => value,
+                durable::Reply::Owner(_) => return Err(Fault::RecoveryRequired),
+                _ => return Err(Fault::PersistenceUnavailable),
+            };
+            preparation.check(cancel)?;
+            let lease = ProfileLease::open_existing_for_removal(profile, canonical.incarnation)
+                .map_err(|_| Fault::RecoveryRequired)?;
+            Some((canonical, lease))
+        } else {
+            None
+        };
+        preparation.check(cancel)?;
         let detected =
-            discovery::discover(preparation, cached_release, cancel).map_err(discovery_fault)?;
+            discovery::discover(deadline, cached_release, cancel).map_err(discovery_fault)?;
         let _origin = detected.origin();
-        let prepared = CompatibleImage::prepare(detected.into_image(), preparation, cancel)?;
-        check(preparation, cancel)?;
+        preparation.check(cancel)?;
+        let prepared = CompatibleImage::prepare(detected.into_image(), deadline, cancel)?;
+        preparation.check(cancel)?;
         // No authenticated profile or OS credential target is touched until the
         // exact retained image passed the disposable production-policy probe.
         crate::vault_probe::verify().map_err(|_| Fault::Vault)?;
-        let lease = ProfileLease::open(profile).map_err(|e| match e {
-            crate::profile::native::Error::RecoveryRequired => Fault::RecoveryRequired,
-            crate::profile::native::Error::Busy => Fault::Busy,
-            _ => Fault::Profile,
-        })?;
-        check(preparation, cancel)?;
+        preparation.check(cancel)?;
+        let lease = if let Some((canonical, lease)) = existing {
+            if associations.call(durable::Call::InspectOwner)
+                != durable::Reply::Owner(Some(canonical))
+            {
+                return Err(Fault::PersistenceUnavailable);
+            }
+            preparation.existing_owner = Some(canonical);
+            lease
+        } else {
+            ProfileLease::open(profile).map_err(|e| match e {
+                crate::profile::native::Error::RecoveryRequired => Fault::RecoveryRequired,
+                crate::profile::native::Error::Busy => Fault::Busy,
+                _ => Fault::Profile,
+            })?
+        };
+        preparation.check(cancel)?;
         Self::bootstrap(
             profile,
             epoch,
@@ -291,9 +398,10 @@ impl Connection {
         lease: ProfileLease,
         prepared: CompatibleImage,
         mut associations: Box<dyn Associations>,
-        admission_deadline: Instant,
+        preparation: NativePreparation,
         cancel: &AtomicBool,
     ) -> Result<Self, Fault> {
+        preparation.check(cancel)?;
         if lease.record.profile != profile || prepared.0.kind() != crate::pin::ImageKind::Cli {
             return Err(Fault::Policy);
         }
@@ -304,23 +412,36 @@ impl Connection {
             epoch,
         )
         .map_err(|_| Fault::ScopeChanged)?;
-        let association_scope = match associations.call(durable::Call::Open {
-            incarnation: lease.record.incarnation,
-        }) {
-            durable::Reply::Scope(value)
-                if value.valid() && value.incarnation == lease.record.incarnation =>
+        let association_scope = if let Some(expected) = preparation.existing_owner {
+            if expected.incarnation != lease.record.incarnation
+                || associations.call(durable::Call::InspectOwner)
+                    != durable::Reply::Owner(Some(expected))
             {
-                value
+                return Err(Fault::PersistenceUnavailable);
             }
-            _ => return Err(Fault::PersistenceUnavailable),
+            expected
+        } else {
+            if preparation.removal.is_some() {
+                return Err(Fault::PersistenceUnavailable);
+            }
+            match associations.call(durable::Call::Open {
+                incarnation: lease.record.incarnation,
+            }) {
+                durable::Reply::Scope(value)
+                    if value.valid() && value.incarnation == lease.record.incarnation =>
+                {
+                    value
+                }
+                _ => return Err(Fault::PersistenceUnavailable),
+            }
         };
         let runtime = Arc::new(RuntimePaths::persistent(lease).map_err(|_| Fault::Profile)?);
-        check(admission_deadline, cancel)?;
-        let deadline = Instant::now() + RPC;
+        preparation.check(cancel)?;
+        let preparation = preparation.next_rpc();
         let release_version = prepared.0.version().to_owned();
         let projection = prepared.0.projection();
         let session = Session::spawn(prepared.0, Arc::clone(&runtime)).map_err(transport)?;
-        check(deadline, cancel)?;
+        preparation.check(cancel)?;
         let mut connection = Self::bootstrap_session(
             scope,
             session,
@@ -330,7 +451,7 @@ impl Connection {
                 scope: association_scope,
             },
             projection,
-            deadline,
+            preparation,
             cancel,
         )?;
         connection.release_version = Some(release_version);
@@ -342,9 +463,11 @@ impl Connection {
         runtime: Arc<RuntimePaths>,
         storage: StoreBinding,
         projection: ConfigProjection,
-        deadline: Instant,
+        preparation: NativePreparation,
         cancel: &AtomicBool,
     ) -> Result<Self, Fault> {
+        let deadline = preparation.budget.deadline();
+        preparation.check(cancel)?;
         let account =
             policy_handshake(&mut session, &runtime, &scope, projection, deadline, cancel)?;
         let mut connection = Self {
@@ -355,8 +478,11 @@ impl Connection {
             association_scope: storage.scope,
             records: BTreeMap::new(),
             session: Some(session),
-            runtime,
+            runtime: Some(runtime),
+            removal: None,
+            removal_setup: preparation.removal,
             account,
+            quota_owner: Self::new_quota_owner(&scope),
             catalog: None,
             catalog_builder: None,
             conversations: BTreeMap::new(),
@@ -375,7 +501,11 @@ impl Connection {
             settled_turns: BTreeMap::new(),
             notification_frames: 0,
         };
-        connection.read_account(&scope, cancel)?;
+        connection.read_account_until(
+            &scope,
+            cancel,
+            preparation.budget.next_rpc(Instant::now()).deadline(),
+        )?;
         Ok(connection)
     }
     pub fn scope(&self) -> &Scope {
@@ -395,7 +525,7 @@ impl Connection {
     /// Observational readiness only. The native Page reservation and final
     /// writer admission still bind the exact scope/account/turn independently.
     pub fn can_admit_text(&self, scope: &Scope) -> bool {
-        self.current(scope).is_ok()
+        self.ordinary_current(scope).is_ok()
             && self.state() == AccountState::ChatGpt
             && self.catalog.is_some()
             && self.idle().is_ok()
@@ -410,7 +540,13 @@ impl Connection {
         }
     }
     fn idle(&self) -> Result<(), Fault> {
-        if self.active.is_some() || !self.pending.is_empty() || self.prompt.is_some() {
+        if self.active.is_some()
+            || self
+                .pending
+                .values()
+                .any(|pending| !matches!(pending.kind, PendingKind::Quota(_)))
+            || self.prompt.is_some()
+        {
             Err(Fault::Busy)
         } else {
             Ok(())
@@ -435,6 +571,28 @@ impl Connection {
         cancel: &AtomicBool,
         fence: Option<windows::WriteFence>,
     ) -> Result<(), Fault> {
+        let (deadline, fence) = if let Some(setup) = &self.removal_setup {
+            setup.current()?;
+            if !matches!(
+                message.get("method").and_then(Value::as_str),
+                Some(
+                    "account/read"
+                        | "account/login/cancel"
+                        | "turn/interrupt"
+                        | "thread/unsubscribe"
+                )
+            ) {
+                return self.fail(Fault::ScopeChanged);
+            }
+            let fence = match fence {
+                Some(value) if value.same_action(&setup.fence) => value,
+                Some(value) => value.and_action(&setup.fence).ok_or(Fault::ScopeChanged)?,
+                None => setup.fence.clone(),
+            };
+            (deadline.min(setup.deadline), Some(fence))
+        } else {
+            (deadline, fence)
+        };
         check(deadline, cancel).or_else(|f| self.fail(f))?;
         let mut bytes = serde_json::to_vec(&message).map_err(|_| Fault::Protocol)?;
         let result = self
@@ -447,14 +605,27 @@ impl Connection {
         result.or_else(|f| self.fail(f))
     }
     pub fn read_account(&mut self, scope: &Scope, cancel: &AtomicBool) -> Result<(), Fault> {
+        self.ordinary_current(scope)?;
+        self.read_account_until(scope, cancel, Instant::now() + RPC)
+    }
+    fn read_account_until(
+        &mut self,
+        scope: &Scope,
+        cancel: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<(), Fault> {
         self.current(scope)?;
+        if self.removal.is_some() {
+            return Err(Fault::Busy);
+        }
         self.idle()?;
-        self.account_deadline = Some(Instant::now() + RPC);
+        check(deadline, cancel).or_else(|fault| self.fail(fault))?;
+        self.account_deadline = Some(deadline);
         let event = self.account.read(scope).map_err(managed_fault)?;
         self.account_effect(event, cancel, &mut Vec::new())
     }
     pub fn login(&mut self, scope: &Scope, cancel: &Arc<AtomicBool>) -> Result<(), Fault> {
-        self.current(scope)?;
+        self.ordinary_current(scope)?;
         self.idle()?;
         self.login_fence = Some(windows::WriteFence::login(Arc::clone(cancel)));
         let event = self
@@ -466,12 +637,12 @@ impl Connection {
         self.account_effect(event, cancel, &mut Vec::new())
     }
     pub fn cancel_login(&mut self, scope: &Scope, cancel: &AtomicBool) -> Result<(), Fault> {
-        self.current(scope)?;
+        self.ordinary_current(scope)?;
         let event = self.account.cancel_login(scope).map_err(managed_fault)?;
         self.account_effect(event, cancel, &mut Vec::new())
     }
     pub fn logout(&mut self, scope: &Scope, cancel: &AtomicBool) -> Result<(), Fault> {
-        self.current(scope)?;
+        self.ordinary_current(scope)?;
         self.idle()?;
         let event = self
             .account
@@ -489,6 +660,7 @@ impl Connection {
             return self.fail(Fault::ScopeChanged);
         }
         if event.invalidates_admission() {
+            self.quota_owner.invalidate(false);
             self.catalog = None;
             self.catalog_builder = None;
             if self.active.is_some() || self.prompt.is_some() {
@@ -498,6 +670,12 @@ impl Connection {
         match event.into_effect() {
             Effect::Ignored => {}
             Effect::Changed(state) => {
+                if state == AccountState::ChatGpt {
+                    self.quota_owner.ready();
+                }
+                if state == AccountState::SignedOut {
+                    self.quota_owner.signed_out();
+                }
                 self.account_deadline = None;
                 if !matches!(
                     state,
@@ -514,70 +692,110 @@ impl Connection {
                 out.push(self.event(None, Event::OpenBrowser(url)));
             }
             Effect::CloseRequired => return self.fail(Fault::Cancelled),
-            Effect::RequestQueued => {
-                let id = self.id()?;
-                let request = self
-                    .account
-                    .take_request(&self.scope, id)
-                    .map_err(|_| Fault::Protocol)?;
-                if request.scope() != &self.scope || request.wire_id() != id {
-                    return self.fail(Fault::ScopeChanged);
-                }
-                let deadline = *self
-                    .account_deadline
-                    .get_or_insert_with(|| Instant::now() + RPC);
-                self.pending.insert(
-                    id,
-                    Pending {
-                        kind: PendingKind::Account,
-                        deadline,
-                    },
-                );
-                // AtomicBool is checked by send_frame before any bytes. If cancelled
-                // after logical handoff, settle; never send login to obtain cancel ID.
-                let message = request.into_json();
-                if matches!(
-                    message.get("method").and_then(Value::as_str),
-                    Some("account/login/start" | "account/logout")
-                ) {
-                    check(deadline, cancel).or_else(|f| self.fail(f))?;
-                    let expected = self.association_scope;
-                    let updated = match self
-                        .associations
-                        .call(durable::Call::AdvanceGrant { expected })
-                    {
-                        durable::Reply::Scope(value)
-                            if value.incarnation == expected.incarnation
-                                && value.grant_epoch
-                                    == expected
-                                        .grant_epoch
-                                        .checked_add(1)
-                                        .ok_or(Fault::Limit)? =>
-                        {
-                            value
-                        }
-                        _ => return self.fail(Fault::PersistenceUnavailable),
-                    };
-                    self.association_scope = updated;
-                    self.conversations.clear();
-                    self.records.clear();
-                    self.settled_turns.clear();
-                    self.advisory_join = crate::notification_scope::AdvisoryJoin::default();
-                }
-                let fence = if message.get("method").and_then(Value::as_str)
-                    == Some("account/login/start")
-                {
-                    Some(self.login_fence.clone().ok_or(Fault::Protocol)?)
-                } else {
-                    None
-                };
-                self.send_fenced(message, deadline, cancel, fence)?;
-            }
+            Effect::RequestQueued => self.account_request(cancel)?,
         }
+        self.schedule_quota(cancel)?;
+        self.publish_quota();
+        Ok(())
+    }
+    fn account_request(&mut self, cancel: &AtomicBool) -> Result<(), Fault> {
+        let id = self.id()?;
+        let request = self
+            .account
+            .take_request(&self.scope, id)
+            .map_err(|_| Fault::Protocol)?;
+        if request.scope() != &self.scope || request.wire_id() != id {
+            return self.fail(Fault::ScopeChanged);
+        }
+        let deadline = if let Some(removal) = &self.removal {
+            removal.intent.current().map_err(removal::removal_fault)?;
+            removal.deadline
+        } else if let Some(setup) = &self.removal_setup {
+            setup.current()?;
+            self.account_deadline
+                .unwrap_or_else(|| Instant::now() + RPC)
+                .min(setup.deadline)
+        } else {
+            *self
+                .account_deadline
+                .get_or_insert_with(|| Instant::now() + RPC)
+        };
+        self.pending.insert(
+            id,
+            Pending {
+                kind: PendingKind::Account,
+                deadline,
+            },
+        );
+        // AtomicBool is checked by send_frame before any bytes. If cancelled
+        // after logical handoff, settle; never send login to obtain cancel ID.
+        let message = request.into_json();
+        if self.removal.is_none()
+            && self.removal_setup.is_some()
+            && !matches!(
+                message.get("method").and_then(Value::as_str),
+                Some("account/read" | "account/login/cancel")
+            )
+        {
+            return self.fail(Fault::ScopeChanged);
+        }
+        if matches!(
+            message.get("method").and_then(Value::as_str),
+            Some("account/login/start" | "account/logout")
+        ) {
+            check(deadline, cancel).or_else(|f| self.fail(f))?;
+            let expected = self.association_scope;
+            let updated = match self
+                .associations
+                .call(durable::Call::AdvanceGrant { expected })
+            {
+                durable::Reply::Scope(value)
+                    if value.incarnation == expected.incarnation
+                        && value.grant_epoch
+                            == expected.grant_epoch.checked_add(1).ok_or(Fault::Limit)? =>
+                {
+                    value
+                }
+                _ => return self.fail(Fault::PersistenceUnavailable),
+            };
+            if let Some(removal) = &mut self.removal {
+                if message.get("method").and_then(Value::as_str) != Some("account/logout") {
+                    return Err(Fault::Protocol);
+                }
+                removal
+                    .intent
+                    .retired(&self.scope, updated.incarnation, updated.grant_epoch)
+                    .map_err(removal::removal_fault)?;
+            }
+            self.association_scope = updated;
+            self.conversations.clear();
+            self.records.clear();
+            self.settled_turns.clear();
+            self.advisory_join = crate::notification_scope::AdvisoryJoin::default();
+        }
+        let fence = if let Some(removal) = &mut self.removal {
+            let request = match message.get("method").and_then(Value::as_str) {
+                Some("account/logout") => crate::removal::Request::Logout,
+                Some("account/read") => crate::removal::Request::Read,
+                _ => return Err(Fault::Protocol),
+            };
+            removal
+                .intent
+                .outgoing(&self.scope, id, request, self.association_scope.grant_epoch)
+                .map_err(removal::removal_fault)?;
+            Some(removal.intent.writer_fence())
+        } else if let Some(setup) = &self.removal_setup {
+            Some(setup.fence.clone())
+        } else if message.get("method").and_then(Value::as_str) == Some("account/login/start") {
+            Some(self.login_fence.clone().ok_or(Fault::Protocol)?)
+        } else {
+            None
+        };
+        self.send_fenced(message, deadline, cancel, fence)?;
         Ok(())
     }
     pub fn refresh_catalog(&mut self, scope: &Scope, cancel: &AtomicBool) -> Result<(), Fault> {
-        self.current(scope)?;
+        self.ordinary_current(scope)?;
         self.idle()?;
         if self.state() != AccountState::ChatGpt {
             return Err(Fault::NotConnected);
@@ -626,7 +844,7 @@ impl Connection {
         // It never bypasses scope, account, catalog or continuity admission.
         admission.check_scope()?;
         check(Instant::now() + RPC, cancel)?;
-        self.current(scope)?;
+        self.ordinary_current(scope)?;
         self.idle()?;
         if self.state() != AccountState::ChatGpt {
             return Err(Fault::NotConnected);
@@ -863,10 +1081,13 @@ impl Connection {
                 self.closing_deadline = Some(Instant::now() + RPC);
                 return self.maybe_unsubscribe(cancel);
             }
+            if self.removal_setup.is_some() {
+                return self.fail(Fault::ScopeChanged);
+            }
             let prompt = self.prompt.as_mut().ok_or(Fault::Protocol)?;
             let message = wire::command(
                 &command,
-                path(self.runtime.cwd())?,
+                path(self.runtime.as_ref().ok_or(Fault::Closed)?.cwd())?,
                 &mut prompt.text,
                 self.projection,
             )
@@ -946,7 +1167,7 @@ impl Connection {
                 .unwrap_or(&mut empty);
             let message = wire::command(
                 &command,
-                path(self.runtime.cwd())?,
+                path(self.runtime.as_ref().ok_or(Fault::Closed)?.cwd())?,
                 prepared,
                 self.projection,
             )
@@ -973,6 +1194,10 @@ impl Connection {
         }
     }
     pub fn cancel_turn(&mut self, scope: &Scope, cancel: &AtomicBool) -> Result<(), Fault> {
+        self.ordinary_current(scope)?;
+        self.cancel_existing_turn(scope, cancel)
+    }
+    fn cancel_existing_turn(&mut self, scope: &Scope, cancel: &AtomicBool) -> Result<(), Fault> {
         self.current(scope)?;
         let key = self.active.clone().ok_or(Fault::Busy)?;
         let Some(prompt) = self.prompt.as_mut() else {
@@ -1201,7 +1426,14 @@ impl Connection {
         self.current(scope)?;
         let mut observed = std::mem::take(&mut self.ready_events);
         match self.poll_inner(cancel, &mut observed) {
-            Ok(()) => Ok(observed),
+            Ok(()) => {
+                self.quota_owner.coalesce_events(
+                    &mut observed,
+                    |event| matches!(event.event, Event::Quota(_)),
+                    |view| self.event(None, Event::Quota(view)),
+                );
+                Ok(observed)
+            }
             Err(fault) => {
                 // A failed connection must not deliver an undispatched browser
                 // URL or re-authorize account/catalog readiness from this batch.
@@ -1219,9 +1451,20 @@ impl Connection {
         }
     }
     fn poll_inner(&mut self, cancel: &AtomicBool, out: &mut Vec<ScopedEvent>) -> Result<(), Fault> {
+        self.quota_tick();
         let mut deadline = self.deadline;
+        if let Some(setup) = &self.removal_setup {
+            setup.current()?;
+            deadline = deadline.min(setup.deadline);
+        }
+        if let Some(removal) = &self.removal {
+            removal.intent.current().map_err(removal::removal_fault)?;
+            deadline = deadline.min(removal.deadline);
+        }
         for pending in self.pending.values() {
-            deadline = deadline.min(pending.deadline);
+            if !matches!(pending.kind, PendingKind::Quota(_)) {
+                deadline = deadline.min(pending.deadline);
+            }
         }
         if let Some(login) = self.login_deadline {
             deadline = deadline.min(login);
@@ -1270,6 +1513,8 @@ impl Connection {
                 }
             }
         }
+        self.schedule_quota(cancel)?;
+        self.publish_quota();
         out.append(&mut self.ready_events);
         Ok(())
     }
@@ -1282,14 +1527,32 @@ impl Connection {
     ) -> Result<(), Fault> {
         let pending = self.pending.remove(&id).ok_or(Fault::Protocol)?;
         match pending.kind {
+            PendingKind::Quota(quota) => self.quota_reply(quota, pending.deadline, result),
             PendingKind::Account => {
                 let event = self
                     .account
                     .reply(&self.scope, id, result.map_err(|_| ()))
                     .map_err(|_| Fault::Protocol)?;
+                if let Some(removal) = &mut self.removal {
+                    removal
+                        .intent
+                        .replied(
+                            &self.scope,
+                            id,
+                            self.account.state(&self.scope).map_err(managed_fault)?,
+                        )
+                        .map_err(removal::removal_fault)?;
+                }
                 self.account_effect(event, cancel, out)?;
             }
             PendingKind::Catalog(cursor) => {
+                if self.removal_setup.is_some() || self.removal.is_some() {
+                    // The exact owned ID/envelope has drained. Its result is
+                    // no longer admission data; no continuation page is sent.
+                    self.catalog = None;
+                    self.catalog_builder = None;
+                    return Ok(());
+                }
                 if self.state() != AccountState::ChatGpt {
                     return Err(Fault::NotConnected);
                 }
@@ -1347,7 +1610,7 @@ impl Connection {
                 {
                     compatibility::validate_opened_thread(
                         &result,
-                        path(self.runtime.cwd())?,
+                        path(self.runtime.as_ref().ok_or(Fault::Closed)?.cwd())?,
                         choice,
                     )
                     .map_err(|_| Fault::Policy)?;
@@ -1400,6 +1663,10 @@ impl Connection {
         if self.notification_frames > MAX_NOTIFICATION_FRAMES {
             return Err(Fault::Limit);
         }
+        if method == "account/rateLimits/updated" {
+            self.quota_notification(&params);
+            return Ok(());
+        }
         let classified =
             wire::classify_notification(method, &params).map_err(|fault| match fault {
                 wire::Fault::Unsupported => Fault::UnsupportedAction,
@@ -1408,7 +1675,8 @@ impl Connection {
             })?;
         match classified {
             NotificationClass::AccountInvalidation | NotificationClass::AccountLoginCompleted => {
-                let notification = if classified == NotificationClass::AccountInvalidation {
+                let account_invalidation = classified == NotificationClass::AccountInvalidation;
+                let notification = if account_invalidation {
                     managed_account::Notification::AccountUpdated
                 } else {
                     managed_account::Notification::LoginCompleted
@@ -1417,7 +1685,25 @@ impl Connection {
                     .account
                     .notification(&self.scope, notification, params)
                     .map_err(|_| Fault::Protocol)?;
-                return self.account_effect(event, cancel, out);
+                let release_read = if let Some(removal) = &mut self.removal {
+                    if !account_invalidation {
+                        return Err(Fault::Protocol);
+                    }
+                    removal
+                        .intent
+                        .account_invalidated()
+                        .map_err(removal::removal_fault)?
+                } else {
+                    false
+                };
+                self.account_effect(event, cancel, out)?;
+                if release_read {
+                    // Deferred logout created no logical Read. This is the one
+                    // new ordinary confirmation request after the notification.
+                    let event = self.account.read(&self.scope).map_err(managed_fault)?;
+                    self.account_effect(event, cancel, out)?;
+                }
+                return Ok(());
             }
             NotificationClass::RemoteAuthority => return Err(Fault::Policy),
             NotificationClass::Informational(advisory) => {
@@ -1651,6 +1937,7 @@ impl Connection {
                 }
             }
         }
+        self.quota_owner.invalidate(false);
         self.catalog = None;
         self.catalog_builder = None;
         self.prompt = None;
@@ -1943,3 +2230,96 @@ fn managed_fault(fault: managed_account::Fault) -> Fault {
 pub(crate) mod fixture_peer;
 #[cfg(all(debug_assertions, feature = "native-fixtures"))]
 pub(crate) mod fixtures;
+#[cfg(all(debug_assertions, feature = "native-fixtures"))]
+pub(crate) mod removal_fixtures;
+
+pub(crate) mod removal;
+pub use crate::profile::removal::RemovalAttemptId;
+pub use crate::removal::{
+    CredentialObservation, RemovalAdmission, RemovalRetryAdmission, RemovalRetryFault,
+};
+pub use removal::{RemovalFailure, SettledRemoval};
+
+mod quota;
+pub use quota::QuotaView;
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+    struct NoStore;
+    impl Associations for NoStore {
+        fn call(&mut self, _: durable::Call) -> durable::Reply {
+            panic!("expired removal preparation must not observe or mutate Store")
+        }
+    }
+    struct InspectionOnly {
+        generation: Option<Arc<AtomicU64>>,
+    }
+    impl Associations for InspectionOnly {
+        fn call(&mut self, call: durable::Call) -> durable::Reply {
+            assert!(matches!(call, durable::Call::InspectOwner));
+            if let Some(generation) = &self.generation {
+                generation.store(2, Ordering::Release);
+                durable::Reply::Owner(Some(durable::Scope {
+                    incarnation: [3; 16],
+                    grant_epoch: 1,
+                }))
+            } else {
+                durable::Reply::Owner(None)
+            }
+        }
+    }
+    #[test]
+    fn absent_owner_never_reaches_filesystem_discovery_or_provider_startup() {
+        let action = RemovalAdmission::from_native(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(1)),
+            1,
+        )
+        .unwrap();
+        let result = Connection::open_for_removal(
+            ProfileId::from_native([1; 16]).unwrap(),
+            1,
+            Box::new(InspectionOnly { generation: None }),
+            None,
+            &action,
+            Instant::now() + PREPARE,
+        );
+        assert!(matches!(result, Err(Fault::RecoveryRequired)));
+    }
+    #[test]
+    fn retirement_during_owner_inspection_stops_before_existing_lease_or_spawn() {
+        let generation = Arc::new(AtomicU64::new(1));
+        let action =
+            RemovalAdmission::from_native(Arc::new(AtomicBool::new(false)), generation.clone(), 1)
+                .unwrap();
+        let result = Connection::open_for_removal(
+            ProfileId::from_native([1; 16]).unwrap(),
+            1,
+            Box::new(InspectionOnly {
+                generation: Some(generation),
+            }),
+            None,
+            &action,
+            Instant::now() + PREPARE,
+        );
+        assert!(matches!(result, Err(Fault::ScopeChanged)));
+    }
+    #[test]
+    fn already_expired_removal_open_refuses_before_runtime_or_store_admission() {
+        let result = Connection::open_for_removal(
+            ProfileId::from_native([1; 16]).unwrap(),
+            1,
+            Box::new(NoStore),
+            None,
+            &RemovalAdmission::from_native(
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU64::new(1)),
+                1,
+            )
+            .unwrap(),
+            Instant::now() - Duration::from_secs(1),
+        );
+        assert!(matches!(result, Err(Fault::Timeout)));
+    }
+}

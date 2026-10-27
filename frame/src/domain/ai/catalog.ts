@@ -112,13 +112,6 @@ export function keyState(models: WorkModelsV1 | null, provider: WorkModelProvide
   return models?.providers.find((row) => row.provider === provider)?.key ?? "missing";
 }
 
-/** Native-only account entries use their own IDs and never imply an API key. */
-export function hasChatGptModels(models: WorkModelsV1 | null): boolean {
-  return !!models?.entries.some(
-    (entry) => entry.model.provider === "open_ai" && entry.id.startsWith("chatgpt/"),
-  );
-}
-
 /** A provider can run calls now: its key is set and not refused. */
 export function usable(models: WorkModelsV1 | null, provider: WorkModelProvider): boolean {
   if (!models || provider === "open_code_go") return false;
@@ -157,12 +150,7 @@ export function pickerGroups(
   const entries = [...(models?.entries ?? []), ...endpoint];
   const accountEntries = new Set(
     models?.entries
-      .filter(
-        (entry) =>
-          (entry.model.provider === "open_ai" && entry.id.startsWith("chatgpt/")) ||
-          gatewayEntry(entry) ||
-          goEntry(entry),
-      )
+      .filter((entry) => gatewayEntry(entry) || goEntry(entry))
       .map((entry) => entry.id) ?? [],
   );
   const order: readonly WorkModelProvider[] = ["cloud", ...keyedProviders, "open_code_go"];
@@ -173,6 +161,7 @@ export function pickerGroups(
     const offered = entries
       .filter((entry) => {
         if (
+          entry.id.startsWith("chatgpt/") ||
           entry.model.provider !== provider ||
           !(entry.roles.includes(role) || (role !== "decision" && entry.roles.includes("lead")))
         )
@@ -186,9 +175,7 @@ export function pickerGroups(
     const available = offered.filter((entry) => {
       if (entry.model.provider === "open_code_go" || entry.id.startsWith("opencode-go/"))
         return goEntry(entry) && accountEntries.has(entry.id);
-      return entry.id.startsWith("chatgpt/") || entry.id.startsWith("gateway/")
-        ? accountEntries.has(entry.id)
-        : providerUsable;
+      return entry.id.startsWith("gateway/") ? accountEntries.has(entry.id) : providerUsable;
     });
     if (available.length) ready.push({ provider, entries: available });
     if (!providerUsable && !available.length && suggested.includes(provider))
@@ -214,7 +201,7 @@ export function entryOf(models: WorkModelsV1 | null, id: string | null | undefin
 
 /** The efforts `id` takes as the lead, weakest first; empty when it takes none. */
 export function effortLevels(models: WorkModelsV1 | null, id: string | null | undefined) {
-  if (!models || !id) return [];
+  if (!models || !id || id.startsWith("chatgpt/")) return [];
   return models.efforts.find((row) => row.id === id)?.levels ?? [];
 }
 

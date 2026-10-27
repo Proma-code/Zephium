@@ -66,6 +66,45 @@ pub enum PageAssistAvailabilityV1 {
     Unavailable,
 }
 
+/// Provider protocol identity, separate from its original model name.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum PageAssistModelSourceV1 {
+    #[default]
+    Model,
+    Codex,
+}
+
+/// Native conversation mode cannot read pages, attach content or execute tools.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum PageAssistCapabilitiesV1 {
+    #[default]
+    Page,
+    TextOnly,
+}
+
+/// Closed original-client faults; never upstream messages or request content.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum PageAssistNativeFaultV1 {
+    Unavailable,
+    UnsupportedInput,
+    ScopeChanged,
+    Protocol,
+    Limit,
+    OutcomeUnknown,
+    /// Original terminal received, but the local history settlement was not confirmed.
+    HistoryUncertain,
+    /// Visible Page history differs from this original-client conversation.
+    HistoryDiverged,
+    /// Native non-dispatch proof and exact durable skipped-attempt acknowledgement.
+    NotSent,
+    Upstream,
+    Timeout,
+    Cancelled,
+}
+
 /// The model the conversation uses, as the composer names it.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Type)]
 #[serde(deny_unknown_fields)]
@@ -76,6 +115,10 @@ pub struct PageAssistModelV1 {
     pub name: String,
     /// Zephium AI (credits) rather than the person's own key.
     pub hosted: bool,
+    /// Actual backend, not inferred from the display name.
+    pub source: PageAssistModelSourceV1,
+    /// Capabilities are known before reading any page context.
+    pub capabilities: PageAssistCapabilitiesV1,
     /// The effort it runs at, such as "high"; null when it has none.
     pub effort: Option<String>,
 }
@@ -116,6 +159,9 @@ pub enum PageAssistFaultV1 {
     /// The selected ChatGPT connection failed; only closed native diagnostics cross.
     ChatGpt {
         fault: zephium_core::work::model::ChatGptModelFault,
+    },
+    NativeConversation {
+        fault: PageAssistNativeFaultV1,
     },
     Unavailable,
 }
@@ -615,6 +661,11 @@ pub enum PageAssistEventV1 {
     Text {
         block: u16,
         delta: String,
+    },
+    /// Replaces native conversation text, including a corrected or empty final.
+    TextSnapshot {
+        block: u16,
+        text: String,
     },
     /// The text block's cites so far.
     Cites {

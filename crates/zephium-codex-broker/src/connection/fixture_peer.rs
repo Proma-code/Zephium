@@ -8,6 +8,11 @@ const LIMIT: u64 = 1024 * 1024;
 #[derive(Clone, Copy)]
 pub(crate) enum Scenario {
     TwoTurns,
+    QuotaExpired,
+    QuotaMalformed,
+    QuotaRefused,
+    QuotaReplacement,
+    QuotaCoalesced,
     ColdRestore,
     Cancel,
     Invalidate,
@@ -24,9 +29,20 @@ pub(crate) enum Scenario {
     LostPreparationAck,
 }
 impl Scenario {
+    pub(crate) fn three_turns(self) -> bool {
+        matches!(
+            self,
+            Self::TwoTurns | Self::QuotaExpired | Self::QuotaMalformed | Self::QuotaRefused
+        )
+    }
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "owner-two-turns" => Some(Self::TwoTurns),
+            "quota-expired" => Some(Self::QuotaExpired),
+            "quota-malformed" => Some(Self::QuotaMalformed),
+            "quota-refused" => Some(Self::QuotaRefused),
+            "quota-replacement" => Some(Self::QuotaReplacement),
+            "quota-coalesced" => Some(Self::QuotaCoalesced),
             "owner-cold-restore" => Some(Self::ColdRestore),
             "owner-cancel" => Some(Self::Cancel),
             "owner-invalidate" => Some(Self::Invalidate),
@@ -52,6 +68,9 @@ struct Peer<R, W> {
     had_first_turn: bool,
     withhold_open: bool,
     default_choices: bool,
+    pending_quota: Option<u64>,
+    malformed_quota: bool,
+    refused_quota: bool,
     home: String,
     cwd: String,
 }
@@ -110,6 +129,12 @@ impl<R: BufRead, W: Write> Peer<R, W> {
         self.send(json!({"method":method,"params":params,"emittedAtMs":1}))
     }
     fn bootstrap(&mut self) -> Result<(), &'static str> {
+        self.bootstrap_with_catalog(true)
+    }
+    fn bootstrap_with_catalog(&mut self, catalog: bool) -> Result<(), &'static str> {
+        self.bootstrap_account(catalog, true)
+    }
+    fn bootstrap_account(&mut self, catalog: bool, chatgpt: bool) -> Result<(), &'static str> {
         let expected: Value =
             serde_json::from_slice(&crate::wire::initialize()).map_err(|_| "transcript-init")?;
         let id = self.expect(expected)?;
@@ -141,10 +166,27 @@ impl<R: BufRead, W: Write> Peer<R, W> {
         let id = self.expect(json!({"method":"account/read","params":{"refreshToken":false}}))?;
         self.reply(
             id,
-            json!({"account":{"type":"chatgpt"},"requiresOpenaiAuth":true}),
+            json!({"account":if chatgpt { json!({"type":"chatgpt"}) } else { Value::Null },"requiresOpenaiAuth":true}),
         )?;
+        if !chatgpt {
+            return Ok(());
+        }
+        let quota_id = self.expect(json!({"method":"account/rateLimits/read","params":{"supportsLunaReserve":false,"excludeResetCreditDetails":true}}))?;
+        if self.default_choices || !catalog {
+            // The actual turn must remain admissible while this unrelated
+            // observational read still awaits its reply.
+            self.pending_quota = Some(quota_id);
+        } else {
+            self.reply(quota_id, Self::quota_reading())?;
+        }
+        if !catalog {
+            return Ok(());
+        }
         let id = self.expect(crate::wire::model_list(0, None))?;
         self.reply(id,json!({"data":[{"id":"synthetic-picker","model":MODEL,"displayName":"Synthetic","description":"owned fixture","hidden":false,"supportedReasoningEfforts":[{"reasoningEffort":"high","description":"fixture"},{"reasoningEffort":"none","description":"explicit none"}],"defaultReasoningEffort":"high","isDefault":true,"inputModalities":["text"]}],"nextCursor":null}))
+    }
+    fn quota_reading() -> Value {
+        json!({"rateLimits":{"limitId":"codex","primary":{"usedPercent":10,"windowDurationMins":300,"resetsAt":2000000000},"secondary":null,"planType":"plus"}})
     }
     fn opened(&mut self, resume: bool, text: &str, defer: bool) -> Result<(), &'static str> {
         let method = if resume {
@@ -206,6 +248,17 @@ impl<R: BufRead, W: Write> Peer<R, W> {
         }
         if turn == "turn-one" {
             self.had_first_turn = true;
+        }
+        if let Some(quota_id) = self.pending_quota.take() {
+            let mut reading = Self::quota_reading();
+            if self.malformed_quota {
+                reading["rateLimits"]["primary"]["usedPercent"] = json!(101);
+            }
+            if self.refused_quota {
+                self.send(json!({"id":quota_id,"error":{"code":-32000,"message":"synthetic quota refusal"}}))?;
+            } else {
+                self.reply(quota_id, reading)?;
+            }
         }
         // Informational producer can race ahead of the RPC response. It must
         // be correlated later without creating/finishing a turn by itself.
@@ -290,10 +343,69 @@ pub(crate) fn child(scenario: Scenario) -> Result<(), &'static str> {
         last: 0,
         had_first_turn: matches!(scenario, Scenario::ColdRestore),
         withhold_open: matches!(scenario, Scenario::LostPreparationAck),
-        default_choices: matches!(scenario, Scenario::TwoTurns),
+        default_choices: scenario.three_turns(),
+        pending_quota: None,
+        malformed_quota: matches!(scenario, Scenario::QuotaMalformed),
+        refused_quota: matches!(scenario, Scenario::QuotaRefused),
         home,
         cwd,
     };
+    if matches!(
+        scenario,
+        Scenario::QuotaReplacement | Scenario::QuotaCoalesced
+    ) {
+        peer.bootstrap_with_catalog(false)?;
+        let old = peer.pending_quota.take().ok_or("quota-old-request")?;
+        if matches!(scenario, Scenario::QuotaCoalesced) {
+            let temp =
+                std::path::PathBuf::from(std::env::var_os("TEMP").ok_or("quota-helper-temp")?);
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !temp.join("quota-batch-go").exists() {
+                if std::time::Instant::now() >= until {
+                    return Err("quota-helper-batch-go");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let mut batch = serde_json::to_vec(&json!({"id":old,"result":Peer::<std::io::BufReader<std::io::Stdin>,std::io::Stdout>::quota_reading()})).map_err(|_| "quota-helper-batch")?;
+            batch.push(b'\n');
+            serde_json::to_writer(&mut batch, &json!({"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":null}}})).map_err(|_| "quota-helper-batch")?;
+            batch.push(b'\n');
+            serde_json::to_writer(
+                &mut batch,
+                &json!({"method":"account/updated","params":{"authMode":"chatgpt"}}),
+            )
+            .map_err(|_| "quota-helper-batch")?;
+            batch.push(b'\n');
+            peer.output
+                .write_all(&batch)
+                .map_err(|_| "quota-helper-batch-write")?;
+            peer.output
+                .flush()
+                .map_err(|_| "quota-helper-batch-write")?;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(temp.join("quota-batch-ready"))
+                .map_err(|_| "quota-helper-batch-ready")?;
+        } else {
+            peer.note("account/updated", json!({"authMode":"chatgpt"}))?;
+        }
+        let read = peer.expect(json!({"method":"account/read","params":{"refreshToken":false}}))?;
+        peer.reply(
+            read,
+            json!({"account":{"type":"chatgpt"},"requiresOpenaiAuth":true}),
+        )?;
+        let mut reading =
+            Peer::<std::io::BufReader<std::io::Stdin>, std::io::Stdout>::quota_reading();
+        reading["rateLimits"]["primary"]["usedPercent"] = json!(99);
+        if !matches!(scenario, Scenario::QuotaCoalesced) {
+            peer.reply(old, reading)?;
+        }
+        if peer.read()?.is_some() {
+            return Err("quota-replacement-unexpected-request");
+        }
+        return Ok(());
+    }
     peer.bootstrap()?;
     if matches!(scenario, Scenario::ColdRestore) {
         peer.opened(true, "synthetic second $skill_two", false)?;
@@ -358,7 +470,10 @@ pub(crate) fn child(scenario: Scenario) -> Result<(), &'static str> {
     }
     peer.start("synthetic first $skill_one", "turn-one")?;
     match scenario {
-        Scenario::TwoTurns => {
+        Scenario::TwoTurns
+        | Scenario::QuotaExpired
+        | Scenario::QuotaMalformed
+        | Scenario::QuotaRefused => {
             peer.note("error",json!({"threadId":THREAD,"turnId":"turn-one","error":{"message":"synthetic ignored text"},"willRetry":true}))?;
             peer.complete("turn-one", "synthetic first answer", "completed")?;
             peer.opened(true, "synthetic second $skill_two", true)?;
@@ -382,7 +497,9 @@ pub(crate) fn child(scenario: Scenario) -> Result<(), &'static str> {
         Scenario::LostSettleAck => {
             peer.terminal("turn-one", "synthetic preserved answer", "completed")?;
         }
-        Scenario::LostStartAck
+        Scenario::QuotaReplacement
+        | Scenario::QuotaCoalesced
+        | Scenario::LostStartAck
         | Scenario::ColdRestore
         | Scenario::CancelBeforeTurn
         | Scenario::RevisionBeforeWrite
@@ -400,4 +517,105 @@ pub(crate) fn child(scenario: Scenario) -> Result<(), &'static str> {
         return Err("transcript-unexpected-replay");
     }
     Ok(())
+}
+
+/// Fixed local-only removal peer; uses no original login or credential store.
+pub(crate) fn removal_child(
+    scenario: super::removal_fixtures::Scenario,
+) -> Result<(), &'static str> {
+    use super::removal_fixtures::Scenario;
+    let mut peer = Peer {
+        input: std::io::BufReader::new(std::io::stdin()),
+        output: std::io::stdout(),
+        last: 0,
+        had_first_turn: false,
+        withhold_open: false,
+        default_choices: false,
+        pending_quota: None,
+        malformed_quota: false,
+        refused_quota: false,
+        home: std::env::var("CODEX_HOME").map_err(|_| "removal-helper-home")?,
+        cwd: std::env::current_dir()
+            .map_err(|_| "removal-helper-cwd")?
+            .to_str()
+            .ok_or("removal-helper-cwd")?
+            .to_owned(),
+    };
+    peer.bootstrap_account(
+        false,
+        matches!(scenario, Scenario::PendingQuota | Scenario::PendingCatalog),
+    )?;
+    if matches!(scenario, Scenario::PendingCatalog) {
+        let catalog = peer.expect(crate::wire::model_list(0, None))?;
+        let quota = peer
+            .pending_quota
+            .take()
+            .ok_or("removal-helper-catalog-quota")?;
+        peer.reply(
+            quota,
+            Peer::<std::io::BufReader<std::io::Stdin>, std::io::Stdout>::quota_reading(),
+        )?;
+        peer.reply(
+            catalog,
+            json!({"data":[],"nextCursor":"must-not-be-requested"}),
+        )?;
+    }
+    let logout = peer.expect(json!({"method":"account/logout"}))?;
+    peer.reply(logout, json!({}))?;
+    if matches!(scenario, Scenario::MissingNotification) {
+        // An ACK alone must not cause a fresh read or any follow-up mutation.
+        if peer.read()?.is_some() {
+            return Err("removal-helper-ack-only-read");
+        }
+        return Ok(());
+    }
+    peer.note("account/updated", json!({"authMode":null}))?;
+    let read = peer.expect(json!({"method":"account/read","params":{"refreshToken":false}}))?;
+    if matches!(scenario, Scenario::InvalidatedRead) {
+        peer.note("account/updated", json!({"authMode":"chatgpt"}))?;
+    }
+    peer.reply(read, json!({"account":null,"requiresOpenaiAuth":true}))?;
+    if matches!(scenario, Scenario::PendingQuota) {
+        let temp = std::path::PathBuf::from(std::env::var_os("TEMP").ok_or("removal-helper-temp")?);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !temp.join("removal-quota-drain-observed").exists() {
+            if std::time::Instant::now() >= until {
+                return Err("removal-helper-quota-barrier");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let quota = peer
+            .pending_quota
+            .take()
+            .ok_or("removal-helper-owned-quota")?;
+        peer.reply(
+            quota,
+            Peer::<std::io::BufReader<std::io::Stdin>, std::io::Stdout>::quota_reading(),
+        )?;
+    }
+    if peer.read()?.is_some() {
+        return Err("removal-helper-unexpected-request");
+    }
+    match scenario {
+        Scenario::LateInvalidation => peer.note("account/updated", json!({"authMode":"chatgpt"})),
+        Scenario::NonzeroExit => std::process::exit(7),
+        Scenario::CancelDuringFinish => {
+            let temp =
+                std::path::PathBuf::from(std::env::var_os("TEMP").ok_or("removal-helper-temp")?);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(temp.join("removal-finish-started"))
+                .map_err(|_| "removal-helper-finish-barrier")?;
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !temp.join("removal-finish-cancelled").exists() {
+                if std::time::Instant::now() >= until {
+                    return Err("removal-helper-cancel-barrier");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }

@@ -8,6 +8,10 @@
       "js": 37558,
       "css": 364
     },
+    "lazy:domain/codex/session.svelte.ts": {
+      "js": 6512,
+      "css": 0
+    },
     "lazy:domain/notes/index.ts": {
       "js": 14703,
       "css": 0
@@ -39,6 +43,10 @@
     "lazy:features/bookmarks/components/BookmarksPanel.svelte": {
       "js": 20250,
       "css": 6190
+    },
+    "lazy:features/codex/components/CodexConnection.svelte": {
+      "js": 5614,
+      "css": 566
     },
     "lazy:features/downloads/components/DownloadsList.svelte": {
       "js": 12792,
@@ -91,10 +99,6 @@
     "lazy:features/settings/components/AiSubscriptions.svelte": {
       "js": 6638,
       "css": 1280
-    },
-    "lazy:features/settings/components/ChatGptAccount.svelte": {
-      "js": 13186,
-      "css": 521
     },
     "lazy:features/settings/components/LocalGateway.svelte": {
       "js": 15479,
@@ -324,9 +328,9 @@
       "js": 13868,
       "css": 4388
     },
-    "lazy:features/work/components/bar/ModelChatGpt.svelte": {
-      "js": 12826,
-      "css": 818
+    "lazy:features/work/components/bar/ModelCodex.svelte": {
+      "js": 6063,
+      "css": 1801
     },
     "lazy:features/work/components/bar/ModelGateway.svelte": {
       "js": 12090,

@@ -19,12 +19,24 @@ const CONTROL_BUDGET: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy)]
 pub(super) enum Mode {
+    #[cfg(feature = "native-fixtures")]
+    Removal(crate::connection::removal_fixtures::Scenario),
     Nonzero,
     Truncated,
     Blocked,
     Tree,
     #[cfg(feature = "native-fixtures")]
     OwnerTwoTurns,
+    #[cfg(feature = "native-fixtures")]
+    QuotaExpired,
+    #[cfg(feature = "native-fixtures")]
+    QuotaMalformed,
+    #[cfg(feature = "native-fixtures")]
+    QuotaRefused,
+    #[cfg(feature = "native-fixtures")]
+    QuotaReplacement,
+    #[cfg(feature = "native-fixtures")]
+    QuotaCoalesced,
     #[cfg(feature = "native-fixtures")]
     OwnerColdRestore,
     #[cfg(feature = "native-fixtures")]
@@ -57,12 +69,24 @@ pub(super) enum Mode {
 impl Mode {
     pub(super) fn args(self) -> &'static [&'static str] {
         match self {
+            #[cfg(feature = "native-fixtures")]
+            Self::Removal(scenario) => scenario.args(),
             Self::Nonzero => &["transport-child", "nonzero"],
             Self::Truncated => &["transport-child", "truncated"],
             Self::Blocked => &["transport-child", "blocked"],
             Self::Tree => &["transport-child", "tree"],
             #[cfg(feature = "native-fixtures")]
             Self::OwnerTwoTurns => &["transport-child", "owner-two-turns"],
+            #[cfg(feature = "native-fixtures")]
+            Self::QuotaExpired => &["transport-child", "quota-expired"],
+            #[cfg(feature = "native-fixtures")]
+            Self::QuotaMalformed => &["transport-child", "quota-malformed"],
+            #[cfg(feature = "native-fixtures")]
+            Self::QuotaRefused => &["transport-child", "quota-refused"],
+            #[cfg(feature = "native-fixtures")]
+            Self::QuotaReplacement => &["transport-child", "quota-replacement"],
+            #[cfg(feature = "native-fixtures")]
+            Self::QuotaCoalesced => &["transport-child", "quota-coalesced"],
             #[cfg(feature = "native-fixtures")]
             Self::OwnerColdRestore => &["transport-child", "owner-cold-restore"],
             #[cfg(feature = "native-fixtures")]
@@ -356,7 +380,12 @@ pub(crate) fn child(mode: &str) -> Result<(), &'static str> {
         }
         "leaf" => std::thread::sleep(Duration::from_secs(60)),
         #[cfg(feature = "native-fixtures")]
-        mode @ ("owner-cold-restore"
+        mode @ ("quota-expired"
+        | "quota-malformed"
+        | "quota-refused"
+        | "quota-replacement"
+        | "quota-coalesced"
+        | "owner-cold-restore"
         | "owner-two-turns"
         | "owner-cancel"
         | "owner-invalidate"
@@ -375,6 +404,18 @@ pub(crate) fn child(mode: &str) -> Result<(), &'static str> {
                 crate::connection::fixture_peer::Scenario::parse(mode).ok_or("helper-mode")?;
             crate::connection::fixture_peer::child(scenario)?;
         }
+        #[cfg(feature = "native-fixtures")]
+        mode @ ("removal-pending-quota"
+        | "removal-signed-out"
+        | "removal-no-notification"
+        | "removal-invalidated-read"
+        | "removal-late-invalidation"
+        | "removal-nonzero"
+        | "removal-cancel-finish") => {
+            let scenario = crate::connection::removal_fixtures::Scenario::parse(mode)
+                .ok_or("removal-helper-mode")?;
+            crate::connection::fixture_peer::removal_child(scenario)?;
+        }
         _ => return Err("helper-mode"),
     }
     Ok(())
@@ -388,6 +429,11 @@ pub(crate) fn owner_session(
     fresh_runtime(
         match scenario {
             Scenario::TwoTurns => Mode::OwnerTwoTurns,
+            Scenario::QuotaExpired => Mode::QuotaExpired,
+            Scenario::QuotaMalformed => Mode::QuotaMalformed,
+            Scenario::QuotaRefused => Mode::QuotaRefused,
+            Scenario::QuotaReplacement => Mode::QuotaReplacement,
+            Scenario::QuotaCoalesced => Mode::QuotaCoalesced,
             Scenario::ColdRestore => Mode::OwnerColdRestore,
             Scenario::Cancel => Mode::OwnerCancel,
             Scenario::Invalidate => Mode::OwnerInvalidate,
@@ -405,6 +451,14 @@ pub(crate) fn owner_session(
         },
         RuntimePaths::fresh_managed()?,
     )
+}
+
+#[cfg(feature = "native-fixtures")]
+pub(crate) fn removal_session(
+    scenario: crate::connection::removal_fixtures::Scenario,
+    lease: crate::profile::native::ProfileLease,
+) -> Result<(Session, Arc<RuntimePaths>), &'static str> {
+    fresh_runtime(Mode::Removal(scenario), RuntimePaths::persistent(lease)?)
 }
 
 #[cfg(test)]

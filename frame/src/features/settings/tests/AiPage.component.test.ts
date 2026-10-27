@@ -249,8 +249,8 @@ test("a custom server is asked for its models once per address, even when it has
   screen.unmount();
 });
 
-test("ChatGPT models can be chosen without enabling OpenAI API-key rows", async () => {
-  const view = models({});
+test("legacy direct account models are not offered as a new Settings choice", async () => {
+  const view = models({ keys: { open_ai: "valid" } });
   view.entries.push(
     entry("open_ai", "gpt-account", "GPT Account", false, ["lead"], {
       id: "chatgpt/gpt-account",
@@ -260,10 +260,7 @@ test("ChatGPT models can be chosen without enabling OpenAI API-key rows", async 
   native.read.mockResolvedValue(view);
   const screen = await render(AiPage);
   await screen.getByRole("button", { name: "Work", exact: true }).click();
-  await expect
-    .element(page.getByRole("option", { name: /GPT Account/u }))
-    .toHaveAccessibleDescription("ChatGPT");
-  await expect.element(page.getByRole("option", { name: /GPT-6 Sol/u })).not.toBeInTheDocument();
+  expect(page.getByRole("option", { name: /GPT Account/u }).query()).toBeNull();
 });
 
 test("a disconnected ChatGPT choice stays visible instead of silently resetting", async () => {
@@ -276,7 +273,11 @@ test("a disconnected ChatGPT choice stays visible instead of silently resetting"
   );
   const screen = await render(AiPage);
   await expect
-    .element(screen.getByText("Saved ChatGPT model unavailable — connect your account"))
+    .element(
+      screen.getByText(
+        "This saved direct connection is retired. Select Codex for sidebar chat or choose another configured source. Your saved account and history are unchanged.",
+      ),
+    )
     .toBeVisible();
 });
 

@@ -90,7 +90,13 @@ async function shoot(target: HTMLElement, name: string) {
 test("the sidebar foot wears the profile's photo, and its stack lists the other profiles", async () => {
   photo.url = paintPhoto();
   await page.viewport(520, 720);
-  native.profiles = { current: ID(1), private: false, profiles };
+  native.profiles = {
+    current: ID(1),
+    private: false,
+    profiles,
+    removals: [],
+    removal_recovery: null,
+  };
   const screen = await render(ProfileFootLook);
   await settle();
   await shoot(screen.container, "foot-photo");
@@ -102,7 +108,13 @@ test("the sidebar foot wears the profile's photo, and its stack lists the other 
   await shoot(screen.container, "foot-photo-open");
   await screen.unmount();
 
-  native.profiles = { current: ID(2), private: false, profiles };
+  native.profiles = {
+    current: ID(2),
+    private: false,
+    profiles,
+    removals: [],
+    removal_recovery: null,
+  };
   const symbol = await render(ProfileFootLook);
   await settle();
   await shoot(symbol.container, "foot-symbol");
@@ -111,6 +123,8 @@ test("the sidebar foot wears the profile's photo, and its stack lists the other 
   native.profiles = {
     current: ID(1),
     private: false,
+    removal_recovery: null,
+    removals: [],
     profiles: [entry(1, "Personal", { revision: 0 }), ...profiles.slice(1)],
   };
   const unchosen = await render(ProfileFootLook);

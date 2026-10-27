@@ -14,6 +14,7 @@ use zephium_agentic::lead::{
     LeadSecretFuture, LeadStaticCredential, LeadTarget,
 };
 use zephium_core::ids::ProfileId;
+use zephium_core::page_choice;
 use zephium_core::work::model::*;
 
 use WorkModelProvider as P;
@@ -63,6 +64,11 @@ pub trait WorkModelSettings: Send + Sync {
     fn get(&self, key: &str) -> Option<String>;
     /// Stores a value; an empty value clears it.
     fn set(&self, key: String, value: String) -> bool;
+    /// Atomic source/model cohort. An absent implementation is unavailable,
+    /// never permission to fall back to independent Page setting writes.
+    fn page_choice(&self, _profile: ProfileId, _call: page_choice::Call) -> page_choice::Reply {
+        page_choice::Reply::Failed(page_choice::Fault::Unavailable)
+    }
 }
 
 /// What a hosted call is made for, kept on this computer so the usage history
@@ -98,24 +104,13 @@ pub trait WorkCloudSession: Send + Sync {
     fn sourced(&self, _request_id: &str, _source: &WorkCallSource) {}
 }
 
-/// The local, profile-scoped ChatGPT grant, distinct from BYOK and hosted AI.
-/// Implementations expose cached observations only; these methods run while the
-/// model state is locked and must not do I/O or call back into this module.
+/// Cleanup for retained direct-sign-in records. This port cannot create a grant,
+/// publish a model catalogue or dispatch inference for the retired source.
 pub trait WorkChatGptSession: Send + Sync {
     /// Delete this profile's local protected account before the crash-resumable
     /// profile-deletion journal can finalize. Called outside the model lock,
     /// bounded by the actor's existing deletion deadline; failure is retryable.
     fn erase_profile(&self, profile: ProfileId, deadline: Instant) -> bool;
-
-    /// Current catalog for this exact profile. Empty when disconnected.
-    fn entries(&self, profile: ProfileId) -> Vec<WorkModelEntry>;
-    /// A revocable client for an explicitly selected catalog model.
-    /// It must recheck the profile/grant and refresh credentials before dispatch.
-    fn client(
-        &self,
-        profile: ProfileId,
-        model: &str,
-    ) -> Result<Arc<dyn WorkModelClient>, WorkModelError>;
 }
 
 /// A separately configured existing local gateway. Cached reads only; no endpoint
@@ -344,20 +339,6 @@ pub fn model_fallback_allowed(selected: &WorkModelEntry, fallback: &WorkModelEnt
 /// Local browser search remains available independently of this decision.
 pub fn paid_search_fallback_allowed(selected: &[&WorkModelEntry]) -> bool {
     !selected.iter().any(|entry| is_explicit_connection(entry))
-}
-
-fn chatgpt_entries(profile: ProfileId) -> Vec<WorkModelEntry> {
-    chatgpt()
-        .map(|session| session.entries(profile))
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|entry| {
-            entry.model.provider == P::OpenAi
-                && entry.model.wire == WorkModelWire::OpenAiResponses
-                && !entry.model.model.is_empty()
-                && entry.id == format!("chatgpt/{}", entry.model.model)
-        })
-        .collect()
 }
 
 /// Called after any change a picker or Settings shows (keys, choices, catalog).
@@ -776,9 +757,13 @@ fn entries(state: &State) -> Vec<WorkModelEntry> {
 
 fn stored_choice(state: &State, profile: ProfileId, role: WorkModelRole) -> Option<WorkModelEntry> {
     let key = choice_key(profile, role);
-    let stored: WorkModelEntry = match setting(&key) {
-        Some(text) => serde_json::from_str(&text).ok()?,
-        None => state.choices.get(&key).cloned()?,
+    let stored: WorkModelEntry = if role == WorkModelRole::Page && settings_installed() {
+        page_selection(profile).ok()?.model?
+    } else {
+        match setting(&key) {
+            Some(text) => serde_json::from_str(&text).ok()?,
+            None => state.choices.get(&key).cloned()?,
+        }
     };
     // Keep an explicit choice even if it disappeared; never silently replace it.
     let local = compatible_base().is_some_and(|base| is_local(&base));
@@ -885,9 +870,8 @@ fn effective(state: &State, profile: ProfileId, role: WorkModelRole) -> Option<W
         if is_explicit_connection(&choice) {
             // An explicit source choice is never replaced by a separately billed
             // API key. Likewise, an API-key default never starts using a grant.
-            return chatgpt_entries(profile)
+            return gateway_entries(profile)
                 .into_iter()
-                .chain(gateway_entries(profile))
                 .chain(go_entries(profile))
                 .find(|entry| entry.id == choice.id);
         }
@@ -1218,17 +1202,9 @@ fn client_for(
     profile: Option<ProfileId>,
 ) -> Result<Arc<dyn WorkModelClient>, WorkModelError> {
     if is_chatgpt(entry) {
-        let signed_out = WorkModelError::ChatGpt {
-            fault: ChatGptModelFault::SignedOut,
-        };
-        let profile = profile.ok_or(signed_out)?;
-        let current = chatgpt_entries(profile)
-            .into_iter()
-            .find(|current| current.id == entry.id)
-            .ok_or(signed_out)?;
-        return chatgpt()
-            .ok_or(signed_out)?
-            .client(profile, &current.model.model);
+        return Err(WorkModelError::ChatGpt {
+            fault: ChatGptModelFault::Retired,
+        });
     }
     if is_gateway(entry) {
         let unavailable = WorkModelError::Gateway {
@@ -1347,6 +1323,9 @@ pub async fn resolve_entry_for(
     source: Option<WorkCallSource>,
 ) -> Result<(WorkModelEntry, Arc<dyn WorkModelClient>), WorkModelError> {
     ensure_presence().await;
+    if role == WorkModelRole::Page && settings_installed() {
+        let _ = page_selection(profile)?;
+    }
     let state = state();
     let entry = effective(&state, profile, role).ok_or_else(|| {
         let source = stored_choice(&state, profile, role).or_else(|| {
@@ -1356,19 +1335,14 @@ pub async fn resolve_entry_for(
                 .filter(is_explicit_connection)
         });
         let unsupported_role = source.as_ref().is_some_and(|source| {
-            chatgpt_entries(profile)
+            gateway_entries(profile)
                 .into_iter()
-                .chain(gateway_entries(profile))
                 .chain(go_entries(profile))
                 .any(|entry| entry.id == source.id && !entry.roles.contains(&role))
         });
         if source.as_ref().is_some_and(is_chatgpt) {
             WorkModelError::ChatGpt {
-                fault: if unsupported_role {
-                    ChatGptModelFault::Unsupported
-                } else {
-                    ChatGptModelFault::SignedOut
-                },
+                fault: ChatGptModelFault::Retired,
             }
         } else if source.as_ref().is_some_and(is_gateway) {
             WorkModelError::Gateway {
@@ -1436,7 +1410,6 @@ pub async fn view(profile: ProfileId) -> WorkModelsView {
         .and_then(|lead| effort_for(&state, profile, &lead));
     let effective = ROLES.map(|role| effective(&state, profile, role).map(|entry| entry.id));
     let mut entries = entries(&state);
-    entries.extend(chatgpt_entries(profile));
     entries.extend(gateway_entries(profile));
     entries.extend(go_entries(profile));
     for role in ROLES {
@@ -1492,40 +1465,149 @@ pub async fn view(profile: ProfileId) -> WorkModelsView {
     }
 }
 
+/// Catalog-validated Page choice, not yet stored or made active. Non-Clone so
+/// one caller owns its publication; it is not provider/account authority.
+pub struct PreparedPageChoice {
+    profile: ProfileId,
+    choice: Option<WorkModelEntry>,
+}
+impl PreparedPageChoice {
+    pub fn profile(&self) -> ProfileId {
+        self.profile
+    }
+    pub fn selection(&self) -> page_choice::Selection {
+        page_choice::Selection::Model(self.choice.clone())
+    }
+}
+fn settings_installed() -> bool {
+    SETTINGS.read().ok().is_some_and(|slot| slot.is_some())
+}
+/// One confirmed canonical observation; malformed/missing Store replies do not
+/// become a model-default decision or a cached source switch.
+pub fn page_selection(profile: ProfileId) -> Result<page_choice::Snapshot, WorkModelError> {
+    let settings = SETTINGS
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .ok_or(WorkModelError::Protocol)?;
+    match settings.page_choice(profile, page_choice::Call::Read) {
+        page_choice::Reply::Loaded(snapshot) if snapshot.profile == profile && snapshot.valid() => {
+            Ok(snapshot)
+        }
+        _ => Err(WorkModelError::Protocol),
+    }
+}
+fn validated_choice(
+    profile: ProfileId,
+    role: WorkModelRole,
+    id: Option<&str>,
+) -> Result<Option<WorkModelEntry>, WorkModelError> {
+    if role == WorkModelRole::Decision {
+        return Err(WorkModelError::BadRequest);
+    }
+    let Some(id) = id else {
+        return Ok(None);
+    };
+    if id.starts_with("chatgpt/") {
+        return Err(WorkModelError::ChatGpt {
+            fault: ChatGptModelFault::Retired,
+        });
+    }
+    let state = state();
+    let entry = entries(&state)
+        .into_iter()
+        .chain(gateway_entries(profile))
+        .chain(go_entries(profile))
+        .chain(state.listed.values().flatten().cloned())
+        .find(|entry| entry.id == id)
+        .ok_or(WorkModelError::BadRequest)?;
+    if state
+        .cloud
+        .iter()
+        .any(|model| model.entry.id == id && !model.available)
+        || (!entry.roles.contains(&role) && !entry.roles.contains(&WorkModelRole::Lead))
+    {
+        return Err(WorkModelError::BadRequest);
+    }
+    Ok(Some(entry))
+}
+pub fn prepare_page_choice(
+    profile: ProfileId,
+    id: Option<&str>,
+) -> Result<PreparedPageChoice, WorkModelError> {
+    let choice = validated_choice(profile, WorkModelRole::Page, id)?;
+    if !page_choice::Selection::Model(choice.clone()).valid() {
+        return Err(WorkModelError::BadRequest);
+    }
+    Ok(PreparedPageChoice { profile, choice })
+}
+/// Publishes only the exact confirmed Store transition. A queued acknowledgement,
+/// conflict, observation, or uncertain outcome never publishes the requested value.
+pub fn publish_page_choice(
+    prepared: PreparedPageChoice,
+    expected: &page_choice::Snapshot,
+    receipt: page_choice::Reply,
+) -> Result<(), WorkModelError> {
+    if prepared.profile != expected.profile {
+        return Err(WorkModelError::BadRequest);
+    }
+    let wanted = expected
+        .updated(prepared.selection())
+        .ok_or(WorkModelError::BadRequest)?;
+    let page_choice::Reply::Committed(committed) = receipt else {
+        return Err(WorkModelError::Protocol);
+    };
+    if committed != wanted {
+        return Err(WorkModelError::Protocol);
+    }
+    let key = choice_key(prepared.profile, WorkModelRole::Page);
+    {
+        let mut state = state();
+        match prepared.choice {
+            Some(entry) => {
+                state.choices.insert(key, entry);
+            }
+            None => {
+                state.choices.remove(&key);
+            }
+        }
+    }
+    notify();
+    Ok(())
+}
+
 /// Stores the person's choice for `role`; `None` returns it to the default.
 pub fn choose(
     profile: ProfileId,
     role: WorkModelRole,
     id: Option<&str>,
 ) -> Result<(), WorkModelError> {
-    if role == WorkModelRole::Decision {
-        return Err(WorkModelError::BadRequest);
+    if role == WorkModelRole::Page && settings_installed() {
+        let prepared = prepare_page_choice(profile, id)?;
+        let expected = page_selection(profile)?;
+        // This generic/default-filling path cannot activate a different Page
+        // source. Explicit product switches use the prepared native transaction.
+        if expected.backend != page_choice::Backend::Model {
+            return Err(WorkModelError::BadRequest);
+        }
+        let settings = SETTINGS
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .ok_or(WorkModelError::Protocol)?;
+        let receipt = settings.page_choice(
+            profile,
+            page_choice::Call::CompareAndSwap {
+                expected: Box::new(expected.clone()),
+                selection: prepared.selection(),
+            },
+        );
+        return publish_page_choice(prepared, &expected, receipt);
     }
     let key = choice_key(profile, role);
-    let value = match id {
+    let value = match validated_choice(profile, role, id)? {
+        Some(entry) => serde_json::to_string(&entry).map_err(|_| WorkModelError::BadRequest)?,
         None => String::new(),
-        Some(id) => {
-            let state = state();
-            let entry = entries(&state)
-                .into_iter()
-                .chain(chatgpt_entries(profile))
-                .chain(gateway_entries(profile))
-                .chain(go_entries(profile))
-                .chain(state.listed.values().flatten().cloned())
-                .find(|entry| entry.id == id)
-                .ok_or(WorkModelError::BadRequest)?;
-            let locked = state
-                .cloud
-                .iter()
-                .any(|model| model.entry.id == id && !model.available);
-            if locked {
-                return Err(WorkModelError::BadRequest);
-            }
-            if !entry.roles.contains(&role) && !entry.roles.contains(&WorkModelRole::Lead) {
-                return Err(WorkModelError::BadRequest);
-            }
-            serde_json::to_string(&entry).map_err(|_| WorkModelError::BadRequest)?
-        }
     };
     if SETTINGS.read().ok().is_some_and(|slot| slot.is_some())
         && !store_setting(key.clone(), value.clone())
@@ -1634,6 +1716,13 @@ pub fn fill_defaults(profile: ProfileId, provider: P) {
         return;
     }
     for role in ROLES {
+        if role == WorkModelRole::Page
+            && settings_installed()
+            && !page_selection(profile)
+                .is_ok_and(|snapshot| snapshot.backend == page_choice::Backend::Model)
+        {
+            continue;
+        }
         let entry = {
             let state = state();
             if stored_choice(&state, profile, role).is_some() {
@@ -1849,8 +1938,72 @@ mod tests {
             self.0.lock().unwrap().get(key).cloned()
         }
         fn set(&self, key: String, value: String) -> bool {
+            if page_choice::reserved_key(&key) {
+                return false;
+            }
             self.0.lock().unwrap().insert(key, value);
             true
+        }
+        fn page_choice(&self, profile: ProfileId, call: page_choice::Call) -> page_choice::Reply {
+            let mut values = self.0.lock().unwrap();
+            let [model_key, backend_key, codex_key, revision_key] = page_choice::keys(profile);
+            let current = page_choice::Snapshot {
+                profile,
+                revision: values
+                    .get(&revision_key)
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0),
+                backend: if values
+                    .get(&backend_key)
+                    .is_some_and(|value| value == "codex")
+                {
+                    page_choice::Backend::Codex
+                } else {
+                    page_choice::Backend::Model
+                },
+                model: values
+                    .get(&model_key)
+                    .filter(|value| !value.is_empty())
+                    .and_then(|value| serde_json::from_str(value).ok()),
+                codex: values
+                    .get(&codex_key)
+                    .and_then(|value| serde_json::from_str(value).ok()),
+            };
+            match call {
+                page_choice::Call::Read => page_choice::Reply::Loaded(current),
+                page_choice::Call::CompareAndSwap {
+                    expected,
+                    selection,
+                } => {
+                    if *expected != current {
+                        return page_choice::Reply::Conflict(current);
+                    }
+                    let Some(next) = current.updated(selection) else {
+                        return page_choice::Reply::Failed(page_choice::Fault::Invalid);
+                    };
+                    values.insert(
+                        model_key,
+                        next.model
+                            .as_ref()
+                            .map(|value| serde_json::to_string(value).unwrap())
+                            .unwrap_or_default(),
+                    );
+                    values.insert(
+                        backend_key,
+                        if next.backend == page_choice::Backend::Codex {
+                            "codex"
+                        } else {
+                            "model"
+                        }
+                        .into(),
+                    );
+                    if let Some(choice) = &next.codex {
+                        values.insert(codex_key, serde_json::to_string(choice).unwrap());
+                    }
+                    values.insert(revision_key, next.revision.to_string());
+                    page_choice::Reply::Committed(next)
+                }
+            }
         }
     }
 
@@ -2145,253 +2298,80 @@ mod tests {
             Some(WorkModelReasoning::Medium)
         );
 
-        // The local subscription remains a separate, explicitly chosen lane.
-        // Merely signing in never changes API-key or Automatic behavior.
-        struct Subscription {
-            profile: ProfileId,
-            entry: WorkModelEntry,
-        }
-        struct SubscriptionClient;
-        impl WorkModelClient for SubscriptionClient {
-            fn call<'a>(
-                &'a self,
-                request: WorkModelRequest,
-                events: &'a (dyn Fn(WorkModelEvent) + Send + Sync),
-            ) -> WorkModelFuture<'a> {
-                Box::pin(async move {
-                    assert_eq!(request.model.provider, P::OpenAi);
-                    assert_eq!(request.model.wire, WorkModelWire::OpenAiResponses);
-                    assert_eq!(request.model.model, "gpt-6.1-sol");
-                    assert_eq!(request.reasoning, Some(WorkModelReasoning::High));
-                    assert!(
-                        matches!(request.messages.as_slice(), [WorkModelMessage::User(parts)]
-                        if matches!(parts.as_slice(), [WorkModelPart::Text(text)] if text == "مرحبا"))
-                    );
-                    events(WorkModelEvent::Text("Hello from the fixture".into()));
-                    Ok(WorkModelOutcome {
-                        stop: WorkModelStop::EndTurn,
-                        usage: WorkModelUsage::default(),
-                        assistant: vec![WorkModelPart::Text("Hello from the fixture".into())],
-                    })
-                })
-            }
-        }
-        impl WorkChatGptSession for Subscription {
-            fn erase_profile(&self, _: ProfileId, _: Instant) -> bool {
-                true
-            }
-            fn entries(&self, profile: ProfileId) -> Vec<WorkModelEntry> {
-                if profile == self.profile {
-                    vec![self.entry.clone()]
-                } else {
-                    vec![]
-                }
-            }
-            fn client(
-                &self,
-                profile: ProfileId,
-                model: &str,
-            ) -> Result<Arc<dyn WorkModelClient>, WorkModelError> {
-                if profile == self.profile && model == self.entry.model.model {
-                    Ok(Arc::new(SubscriptionClient))
-                } else {
-                    Err(WorkModelError::MissingKey)
-                }
-            }
-        }
+        // A retained direct-sign-in choice remains serialized but cannot mint a
+        // replacement source, catalogue or model request after retirement.
         let subscriber = profile_id(45);
-        let mut subscribed = models::builtin()
+        let mut retired = models::builtin()
             .into_iter()
             .find(|entry| entry.model.provider == P::OpenAi)
             .unwrap();
-        let byok = subscribed.clone();
-        subscribed.id = "chatgpt/gpt-6.1-sol".into();
-        subscribed.model.model = "gpt-6.1-sol".into();
-        subscribed.supports.reasoning = true;
-        subscribed.model.wire = WorkModelWire::OpenAiResponses;
-        subscribed.display_name = "Fixture".into();
-        subscribed.roles = vec![
+        let byok = retired.clone();
+        retired.id = "chatgpt/gpt-6.1-sol".into();
+        retired.model.model = "gpt-6.1-sol".into();
+        retired.model.wire = WorkModelWire::OpenAiResponses;
+        retired.roles = vec![
             WorkModelRole::Lead,
             WorkModelRole::Page,
             WorkModelRole::Light,
         ];
+        let raw = serde_json::to_string(&retired).unwrap();
+        assert!(SETTINGS
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .set(choice_key(subscriber, WorkModelRole::Lead), raw.clone()));
         with_keys(&[P::OpenAi]);
-        choose(subscriber, WorkModelRole::Lead, Some(&byok.id)).unwrap();
-        install_chatgpt_session(Arc::new(Subscription {
-            profile: subscriber,
-            entry: subscribed.clone(),
-        }));
-        assert_eq!(
-            effective(&state(), subscriber, WorkModelRole::Lead)
-                .unwrap()
-                .id,
-            byok.id,
-            "linking a subscription must preserve an explicit API-key choice"
-        );
-        choose(subscriber, WorkModelRole::Lead, None).unwrap();
-        with_keys(&[]);
-        assert!(effective(&state(), subscriber, WorkModelRole::Lead).is_none());
-        assert!(super::view(subscriber)
-            .await
-            .entries
-            .iter()
-            .any(|entry| entry.id == subscribed.id));
-        assert!(!super::view(profile_id(46))
-            .await
-            .entries
-            .iter()
-            .any(is_chatgpt));
-        assert_eq!(
-            choose(profile_id(46), WorkModelRole::Lead, Some(&subscribed.id)),
-            Err(WorkModelError::BadRequest)
-        );
-        // Page effort is independent of a Lead or Zephium Cloud session.
-        // Both the picker row and the actual Page request resolve the same value.
-        choose(subscriber, WorkModelRole::Page, Some(&subscribed.id)).unwrap();
-        assert!(cloud().is_none());
-        let page_only = super::view(subscriber).await;
-        assert_eq!(page_only.effective[0], None);
-        assert_eq!(
-            page_only.effective[1].as_deref(),
-            Some(subscribed.id.as_str())
-        );
-        assert_eq!(page_only.effort, None);
-        assert!(page_only.efforts.iter().any(|(id, levels, current)| {
-            id == &subscribed.id
-                && !levels.is_empty()
-                && *current == Some(WorkModelReasoning::Medium)
-        }));
-        set_effort(subscriber, Some(WorkModelReasoning::High)).unwrap();
-        let (page_entry, page_client) = resolve_entry(subscriber, WorkModelRole::Page)
-            .await
-            .unwrap();
-        assert_eq!(
-            lead_effort(subscriber, &page_entry),
-            Some(WorkModelReasoning::High)
-        );
-        assert!(super::view(subscriber)
-            .await
-            .efforts
-            .iter()
-            .any(|(id, _, current)| {
-                id == &subscribed.id && *current == Some(WorkModelReasoning::High)
-            }));
-        let observed = Mutex::new(Vec::new());
-        let reply = page_client
-            .call(
-                WorkModelRequest {
-                    image_fence: None,
-                    cache_key: None,
-                    model: page_entry.model.clone(),
-                    system: vec![],
-                    tools: vec![],
-                    messages: vec![WorkModelMessage::User(vec![WorkModelPart::Text(
-                        "مرحبا".into(),
-                    )])],
-                    max_output_tokens: 8192,
-                    reasoning: lead_effort(subscriber, &page_entry),
-                    native_search: false,
-                    parallel_tools: false,
-                    tool_choice: WorkModelToolChoice::Auto,
-                    volatile_tail: 0,
-                },
-                &|event| observed.lock().unwrap().push(event),
-            )
-            .await
-            .unwrap();
-        assert_eq!(reply.stop, WorkModelStop::EndTurn);
-        assert!(
-            matches!(reply.assistant.as_slice(), [WorkModelPart::Text(text)]
-            if text == "Hello from the fixture")
-        );
-        assert!(
-            matches!(observed.lock().unwrap().as_slice(), [WorkModelEvent::Text(text)]
-            if text == "Hello from the fixture")
-        );
-        assert!(!super::view(subscriber).await.cloud_signed_in);
-        choose(subscriber, WorkModelRole::Page, None).unwrap();
-        choose(subscriber, WorkModelRole::Lead, Some(&subscribed.id)).unwrap();
-        assert_eq!(
-            effective(&state(), subscriber, WorkModelRole::Lead)
-                .unwrap()
-                .id,
-            subscribed.id
-        );
-        assert_eq!(
-            effective(&state(), subscriber, WorkModelRole::Page)
-                .unwrap()
-                .id,
-            subscribed.id
-        );
-        assert_eq!(
-            effective(&state(), subscriber, WorkModelRole::Light)
-                .unwrap()
-                .id,
-            subscribed.id
-        );
-        assert!(!helper_fallback_allowed(
-            subscriber,
-            WorkModelRole::Page,
-            &subscribed
-        ));
-        assert!(!helper_fallback_allowed(
-            subscriber,
-            WorkModelRole::Page,
-            &byok
-        ));
-        choose(subscriber, WorkModelRole::Page, Some(&subscribed.id)).unwrap();
-        assert!(!helper_fallback_allowed(
-            subscriber,
-            WorkModelRole::Page,
-            &byok
-        ));
-        choose(subscriber, WorkModelRole::Page, None).unwrap();
-        assert_eq!(key_status(&state(), P::OpenAi), WorkKeyStatus::Missing);
-        assert!(resolve_entry(subscriber, WorkModelRole::Lead).await.is_ok());
-        state().presence.insert(P::OpenAi, true);
-        assert_eq!(
-            effective(&state(), subscriber, WorkModelRole::Lead)
-                .unwrap()
-                .id,
-            subscribed.id
-        );
-        assert_eq!(
-            effective(&state(), subscriber, WorkModelRole::Page)
-                .unwrap()
-                .id,
-            subscribed.id
-        );
-        assert_eq!(
-            effective(&state(), subscriber, WorkModelRole::Light)
-                .unwrap()
-                .id,
-            subscribed.id
-        );
-        assert_eq!(
-            search_readiness(subscriber).await,
-            WorkSearchReadiness::Unavailable
-        );
-        *CHATGPT.write().unwrap() = None;
-        chatgpt_session_changed();
-        assert!(effective(&state(), subscriber, WorkModelRole::Lead).is_none());
-        assert_eq!(
-            stored_choice(&state(), subscriber, WorkModelRole::Lead)
-                .unwrap()
-                .id,
-            subscribed.id
-        );
-        assert!(effective(&state(), subscriber, WorkModelRole::Page).is_none());
-        assert!(effective(&state(), subscriber, WorkModelRole::Light).is_none());
-        for role in [WorkModelRole::Page, WorkModelRole::Light] {
+        for role in ROLES {
+            assert!(effective(&state(), subscriber, role).is_none());
             assert!(matches!(
                 resolve_entry(subscriber, role).await,
                 Err(WorkModelError::ChatGpt {
-                    fault: ChatGptModelFault::SignedOut
+                    fault: ChatGptModelFault::Retired
                 })
             ));
         }
+        assert_eq!(
+            setting(&choice_key(subscriber, WorkModelRole::Lead)),
+            Some(raw.clone())
+        );
         assert!(!super::view(subscriber).await.entries.iter().any(is_chatgpt));
-        assert_eq!(key_status(&state(), P::OpenAi), WorkKeyStatus::Set);
+        assert_eq!(
+            choose(subscriber, WorkModelRole::Lead, Some(&retired.id)),
+            Err(WorkModelError::ChatGpt {
+                fault: ChatGptModelFault::Retired
+            })
+        );
+        assert!(!model_fallback_allowed(&retired, &byok));
+        assert!(!helper_fallback_allowed(
+            subscriber,
+            WorkModelRole::Page,
+            &byok
+        ));
+        assert!(!paid_search_fallback_allowed(&[&retired]));
+        assert!(matches!(
+            client_for(&state(), &retired, None, Some(subscriber)),
+            Err(WorkModelError::ChatGpt {
+                fault: ChatGptModelFault::Retired
+            })
+        ));
+        // Process-state reconstruction does not discard the stored choice or
+        // interpret a separately available API key as replacement permission.
+        with_keys(&[P::OpenAi]);
+        assert!(effective(&state(), subscriber, WorkModelRole::Lead).is_none());
+        assert_eq!(
+            setting(&choice_key(subscriber, WorkModelRole::Lead)),
+            Some(raw)
+        );
+        // Only an explicit supported selection restores the ordinary API path.
+        choose(subscriber, WorkModelRole::Lead, Some(&byok.id)).unwrap();
+        assert_eq!(
+            effective(&state(), subscriber, WorkModelRole::Lead)
+                .unwrap()
+                .id,
+            byok.id
+        );
+        assert!(resolve_entry(subscriber, WorkModelRole::Lead).await.is_ok());
     }
 
     #[tokio::test]
@@ -2834,5 +2814,261 @@ mod tests {
 
     fn profile_id(id: u128) -> ProfileId {
         ProfileId::from(id)
+    }
+    #[tokio::test]
+    async fn page_choice_prepare_and_receipt_publication_are_separate_and_exact() {
+        let _guard = CHATGPT_TEST_SERIAL.lock().await;
+        let memory = Arc::new(Memory(Mutex::new(HashMap::new())));
+        install_settings(memory.clone());
+        with_keys(&[P::OpenAi]);
+        let profile = profile_id(71);
+        let expected = page_selection(profile).unwrap();
+        let prepared = prepare_page_choice(profile, Some("openai/gpt-6-luna")).unwrap();
+        assert!(!state()
+            .choices
+            .contains_key(&choice_key(profile, WorkModelRole::Page)));
+        assert!(memory.0.lock().unwrap().is_empty());
+        let desired = expected.updated(prepared.selection()).unwrap();
+        // A matching read/queued state is not a commit receipt.
+        assert!(publish_page_choice(
+            prepared,
+            &expected,
+            page_choice::Reply::Loaded(desired.clone())
+        )
+        .is_err());
+        assert!(!state()
+            .choices
+            .contains_key(&choice_key(profile, WorkModelRole::Page)));
+        let prepared = prepare_page_choice(profile, Some("openai/gpt-6-luna")).unwrap();
+        let receipt = memory.page_choice(
+            profile,
+            page_choice::Call::CompareAndSwap {
+                expected: Box::new(expected.clone()),
+                selection: prepared.selection(),
+            },
+        );
+        publish_page_choice(prepared, &expected, receipt).unwrap();
+        assert_eq!(page_selection(profile).unwrap(), desired);
+        assert_eq!(
+            state().choices[&choice_key(profile, WorkModelRole::Page)].id,
+            "openai/gpt-6-luna"
+        );
+        assert!(!memory.set(choice_key(profile, WorkModelRole::Page), String::new()));
+        // Confirmed default removes the old cache rather than resurrecting it.
+        choose(profile, WorkModelRole::Page, None).unwrap();
+        assert!(page_selection(profile).unwrap().model.is_none());
+        assert!(stored_choice(&state(), profile, WorkModelRole::Page).is_none());
+    }
+    #[tokio::test]
+    async fn page_default_fill_and_conflicts_never_deactivate_native_selection() {
+        let _guard = CHATGPT_TEST_SERIAL.lock().await;
+        let memory = Arc::new(Memory(Mutex::new(HashMap::new())));
+        install_settings(memory.clone());
+        with_keys(&[P::OpenAi]);
+        apply_check(
+            P::OpenAi,
+            LeadKeyCheck::Valid(
+                models::builtin()
+                    .into_iter()
+                    .filter(|e| e.model.provider == P::OpenAi)
+                    .collect(),
+            ),
+        );
+        let profile = profile_id(72);
+        let original = page_selection(profile).unwrap();
+        let prepared = prepare_page_choice(profile, Some("openai/gpt-6-luna")).unwrap();
+        let codex = page_choice::Selection::Codex(page_choice::CodexChoice {
+            model: "original-picker-id".into(),
+            effort: page_choice::CodexEffortChoice::Default,
+        });
+        let page_choice::Reply::Committed(native) = memory.page_choice(
+            profile,
+            page_choice::Call::CompareAndSwap {
+                expected: Box::new(original.clone()),
+                selection: codex,
+            },
+        ) else {
+            panic!("fixture commit")
+        };
+        let conflict = memory.page_choice(
+            profile,
+            page_choice::Call::CompareAndSwap {
+                expected: Box::new(original.clone()),
+                selection: prepared.selection(),
+            },
+        );
+        assert!(matches!(conflict, page_choice::Reply::Conflict(_)));
+        assert!(publish_page_choice(prepared, &original, conflict).is_err());
+        fill_defaults(profile, P::OpenAi);
+        assert_eq!(page_selection(profile).unwrap(), native);
+        assert!(choose(profile, WorkModelRole::Page, None).is_err());
+        assert_eq!(page_selection(profile).unwrap(), native);
+        assert!(choose(profile, WorkModelRole::Lead, Some("openai/gpt-6-luna")).is_ok());
+    }
+    #[tokio::test]
+    async fn native_sidebar_selection_preserves_separately_configured_work_roles() {
+        let _guard = CHATGPT_TEST_SERIAL.lock().await;
+        let memory = Arc::new(Memory(Mutex::new(HashMap::new())));
+        install_settings(memory.clone());
+        with_keys(&[P::OpenAi]);
+        apply_check(
+            P::OpenAi,
+            LeadKeyCheck::Valid(
+                models::builtin()
+                    .into_iter()
+                    .filter(|entry| entry.model.provider == P::OpenAi)
+                    .collect(),
+            ),
+        );
+        let profile = profile_id(74);
+        let roles = [
+            WorkModelRole::Lead,
+            WorkModelRole::Page,
+            WorkModelRole::Light,
+        ];
+        for role in roles {
+            choose(profile, role, Some("openai/gpt-6-luna")).unwrap();
+        }
+        let work_before = roles.map(|role| effective(&state(), profile, role).unwrap());
+        let prior = page_selection(profile).unwrap();
+        let page_choice::Reply::Committed(native) = memory.page_choice(
+            profile,
+            page_choice::Call::CompareAndSwap {
+                expected: Box::new(prior.clone()),
+                selection: page_choice::Selection::Codex(page_choice::CodexChoice {
+                    model: "original-picker-id".into(),
+                    effort: page_choice::CodexEffortChoice::Default,
+                }),
+            },
+        ) else {
+            panic!("fixture commit")
+        };
+        assert_eq!(native.backend, page_choice::Backend::Codex);
+        assert_eq!(native.model, prior.model);
+        // This module projects separately configured Work models. It must not
+        // relabel the retained API route as Codex, nor disable unrelated Work.
+        // The sidebar's native backend selection is enforced by its own port.
+        assert_eq!(
+            roles.map(|role| effective(&state(), profile, role).unwrap()),
+            work_before
+        );
+        for role in roles {
+            let entry = stored_choice(&state(), profile, role).unwrap();
+            assert_eq!(entry.id, "openai/gpt-6-luna");
+            assert_eq!(entry.model.provider, P::OpenAi);
+        }
+        fill_defaults(profile, P::OpenAi);
+        assert_eq!(page_selection(profile).unwrap(), native);
+    }
+    #[tokio::test]
+    async fn retired_page_choice_preserves_the_full_canonical_cohort_until_explicit_selection() {
+        let _guard = CHATGPT_TEST_SERIAL.lock().await;
+        let profile = profile_id(74);
+        let mut retired = models::builtin()
+            .into_iter()
+            .find(|entry| entry.id == "openai/gpt-6-luna")
+            .unwrap();
+        retired.id = "chatgpt/retained-page".into();
+        retired.model.model = "retained-page".into();
+        retired.model.wire = WorkModelWire::OpenAiResponses;
+        let inactive = page_choice::CodexChoice {
+            model: "original-inactive-model".into(),
+            effort: page_choice::CodexEffortChoice::Explicit(page_choice::CodexEffort::High),
+        };
+        let [model, backend, codex, revision] = page_choice::keys(profile);
+        let memory = Arc::new(Memory(Mutex::new(HashMap::from([
+            (model, serde_json::to_string(&retired).unwrap()),
+            (backend, "model".into()),
+            (codex, serde_json::to_string(&inactive).unwrap()),
+            (revision, "7".into()),
+        ]))));
+        install_settings(memory.clone());
+        with_keys(&[P::OpenAi]);
+        choose(profile, WorkModelRole::Lead, Some("openai/gpt-6-luna")).unwrap();
+        let bytes = memory.0.lock().unwrap().clone();
+        let original = page_selection(profile).unwrap();
+        assert_eq!(original.model.as_ref(), Some(&retired));
+        assert_eq!(original.backend, page_choice::Backend::Model);
+        assert_eq!(original.codex.as_ref(), Some(&inactive));
+        assert_eq!(original.revision, 7);
+        assert!(matches!(
+            resolve_entry(profile, WorkModelRole::Page).await,
+            Err(WorkModelError::ChatGpt {
+                fault: ChatGptModelFault::Retired
+            })
+        ));
+        assert_eq!(page_selection(profile).unwrap(), original);
+        assert_eq!(*memory.0.lock().unwrap(), bytes);
+        assert!(prepare_page_choice(profile, Some(&retired.id)).is_err());
+        assert_eq!(*memory.0.lock().unwrap(), bytes);
+        // A real supported CAS changes only the requested Page model cohort;
+        // inactive Codex preference bytes and the independent Work role remain.
+        choose(profile, WorkModelRole::Page, Some("openai/gpt-6-sol")).unwrap();
+        let next = page_selection(profile).unwrap();
+        assert_eq!(next.revision, 8);
+        assert_eq!(next.backend, page_choice::Backend::Model);
+        assert_eq!(
+            next.model.as_ref().map(|entry| entry.id.as_str()),
+            Some("openai/gpt-6-sol")
+        );
+        assert_eq!(next.codex, original.codex);
+        let codex_key = page_choice::keys(profile)[2].clone();
+        assert_eq!(memory.get(&codex_key), bytes.get(&codex_key).cloned());
+        let lead_key = choice_key(profile, WorkModelRole::Lead);
+        assert_eq!(memory.get(&lead_key), bytes.get(&lead_key).cloned());
+        assert!(resolve_entry(profile, WorkModelRole::Page).await.is_ok());
+    }
+
+    struct UncertainPageSettings {
+        inner: Memory,
+        mutations: std::sync::atomic::AtomicUsize,
+    }
+    impl WorkModelSettings for UncertainPageSettings {
+        fn get(&self, key: &str) -> Option<String> {
+            self.inner.get(key)
+        }
+        fn set(&self, key: String, value: String) -> bool {
+            self.inner.set(key, value)
+        }
+        fn page_choice(&self, profile: ProfileId, call: page_choice::Call) -> page_choice::Reply {
+            let mutates = call.mutates();
+            let reply = self.inner.page_choice(profile, call);
+            if mutates {
+                self.mutations
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                page_choice::Reply::Failed(page_choice::Fault::OutcomeUnknown)
+            } else {
+                reply
+            }
+        }
+    }
+    #[tokio::test]
+    async fn unconfirmed_page_commit_is_not_published_retried_or_rolled_back() {
+        let _guard = CHATGPT_TEST_SERIAL.lock().await;
+        let memory = Arc::new(UncertainPageSettings {
+            inner: Memory(Mutex::new(HashMap::new())),
+            mutations: std::sync::atomic::AtomicUsize::new(0),
+        });
+        install_settings(memory.clone());
+        with_keys(&[P::OpenAi]);
+        let profile = profile_id(73);
+        assert!(choose(profile, WorkModelRole::Page, Some("openai/gpt-6-luna")).is_err());
+        assert!(!state()
+            .choices
+            .contains_key(&choice_key(profile, WorkModelRole::Page)));
+        assert_eq!(
+            memory.mutations.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        // A later confirmed observation may reveal the committed value; that
+        // does not retroactively invent a successful acknowledgement or resend.
+        assert_eq!(
+            page_selection(profile).unwrap().model.unwrap().id,
+            "openai/gpt-6-luna"
+        );
+        assert_eq!(
+            memory.mutations.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 }

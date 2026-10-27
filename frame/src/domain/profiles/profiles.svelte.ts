@@ -8,6 +8,7 @@ import {
   type ProfileAvatarInputV1,
   type ProfileEntryView,
   type ProfilesView,
+  type ProfileRemovalViewV1,
 } from "$shared/ipc/bindings";
 import { events } from "$shared/ipc/native-events";
 import { observe } from "$shared/lib/observe";
@@ -19,6 +20,8 @@ let stop: (() => void) | null = null;
 let generation = 0;
 
 export const all = (): ProfileEntryView[] => view?.profiles ?? [];
+export const removals = (): ProfileRemovalViewV1[] => view?.removals ?? [];
+export const removalRecovery = () => view?.removal_recovery ?? null;
 export const current = (): ProfileEntryView | null =>
   view?.profiles.find((profile) => profile.id === view?.current) ?? null;
 export const inPrivate = () => view?.private ?? false;
@@ -79,6 +82,24 @@ export const setAvatar = async (id: string, avatar: AvatarDraft) =>
 export const remove = async (id: string) => {
   const result = await settle(commands.profilesDelete(id), 30_000);
   return applied(result) || result.outcome === "deferred";
+};
+
+/** Reconcile the same confirmed operation; scheduling is not erasure success. */
+export const retryRemoval = async (id: string) => {
+  const reply = await observe(
+    Promise.resolve().then(() => commands.profilesRetryRemoval(id)),
+    5000,
+  );
+  return reply.state === "received" && reply.value.status === "ok" ? reply.value.data : null;
+};
+
+/** Explicit observation/reconciliation only; never creates a removal attempt. */
+export const recheckRemovalInventory = async () => {
+  const reply = await observe(
+    Promise.resolve().then(() => commands.profilesRecheckRemovalInventory()),
+    5000,
+  );
+  return reply.state === "received" && reply.value.status === "ok" ? reply.value.data : null;
 };
 
 export type PhotoPick = { token: string } | "cancelled" | "unsupported" | "unavailable";

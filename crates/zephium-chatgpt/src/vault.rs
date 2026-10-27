@@ -26,9 +26,9 @@ pub enum VaultError {
     Invalid,
 }
 
-/// An issued registration observed in a state-validated native OAuth callback.
+/// Historical issued registration from a previously validated native callback.
 ///
-/// This is retry metadata, **not** a verified identity, authorization or account
+/// This is retained recovery metadata, **not** a verified identity, authorization or account
 /// status. It must never originate in frame-supplied fields or imported tokens.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,6 +39,7 @@ pub struct PendingRegistration {
     pub host_id: String,
 }
 
+#[cfg(test)]
 impl PendingRegistration {
     /// Validate callback-issued metadata without claiming a verified account.
     pub fn new(host_id: &str, client_id: &str) -> Result<Self, VaultError> {
@@ -60,9 +61,9 @@ impl PendingRegistration {
 pub struct Stored {
     /// Cryptographically validated mapping, retained when signing out.
     pub identity: Option<Identity>,
-    /// Unverified callback-issued registration retained for a fresh PKCE retry.
+    /// Unverified callback-issued registration retained for inspection and cleanup.
     pub pending_registration: Option<PendingRegistration>,
-    /// Token record encoded by `Tokens::to_bytes`, never imported from the frame.
+    /// Existing protected token record bytes, never imported from the frame.
     pub tokens: Option<Zeroizing<Vec<u8>>>,
 }
 

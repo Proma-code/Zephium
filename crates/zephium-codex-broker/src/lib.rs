@@ -1,6 +1,6 @@
 //! Original Codex app-server integration for the Windows subscription trial.
 //! Pure catalog/protocol reducers have no process or account authority. Native
-//! ownership is feature-gated and fixed to the reviewed original release;
+//! ownership is feature-gated and admits verified original runtimes;
 //! credential-free fixtures remain separate from explicit user login/turns.
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -193,3 +193,61 @@ pub fn qualify_vault() -> Result<(), &'static str> {
 #[cfg(all(test, not(windows)))]
 #[path = "windows/write_receipt.rs"]
 mod write_receipt;
+
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
+mod removal;
+
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
+mod quota;
+
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
+mod quota_owner;
+
+#[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
+pub fn qualify_quota() -> Result<(), &'static str> {
+    connection::fixtures::qualify_quota()
+}
+
+#[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
+pub fn qualify_removal() -> Result<(), &'static str> {
+    connection::removal_fixtures::qualify()
+}
+
+#[cfg(all(test, not(windows)))]
+#[path = "windows/environment_block.rs"]
+mod environment_block;
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
+mod transport_environment;
+
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
+mod preparation_budget;

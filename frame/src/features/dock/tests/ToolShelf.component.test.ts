@@ -22,6 +22,8 @@ const names = (root: HTMLElement) =>
 
 const avatar = { style: "initials" as const, color: 1, symbol: 0, revision: 0 };
 const ROSTER: ProfilesView = {
+  removal_recovery: null,
+  removals: [],
   current: "p1",
   private: false,
   profiles: [

@@ -127,9 +127,10 @@ export function bootstrapReport(pages: readonly Page[]): Plugin {
           for (const id of Object.keys(item.modules)) {
             if (
               root.surface &&
-              (/\/(?:features|domain)\/work\//u.test(id) || /\/(?:@xyflow|@tiptap)\//u.test(id))
+              (/\/(?:features|domain)\/(?:work|codex)\//u.test(id) ||
+                /\/(?:@xyflow|@tiptap)\//u.test(id))
             )
-              this.error(`Work code in ${name} startup: ${id}`);
+              this.error(`Optional assistant code in ${name} startup: ${id}`);
             const at = id.indexOf("/src/");
             if (at >= 0) modules.add(id.slice(at + 1));
           }

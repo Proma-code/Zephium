@@ -92,7 +92,9 @@ jobs:
           src/features/assist/tests/FaultNote.component.test.ts
           src/features/assist/tests/AssistInteraction.component.test.ts
           src/features/settings/tests/AiSubscriptions.component.test.ts
-          src/features/settings/tests/ChatGptAccount.component.test.ts
+          src/features/settings/tests/LegacyAccountRecovery.component.test.ts
+          src/features/settings/tests/ProfilesPage.component.test.ts
+          src/features/codex/tests/CodexQuota.component.test.ts
           src/features/settings/tests/LocalGateway.component.test.ts
           src/features/settings/tests/OpenCodeGo.component.test.ts
           src/features/settings/tests/AiPage.component.test.ts
@@ -125,6 +127,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p zephium-app --features work-runtime,work-execution --locked profile_deletion
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p zephium-ipc --locked codex
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p zephium-ipc --locked chatgpt::tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p zephium-ipc --locked local_gateway::tests
@@ -149,6 +153,14 @@ jobs:
           python scripts/release/third_party_notices.py target/THIRD_PARTY_NOTICES.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo clippy -p zephium-desktop --all-targets --locked --features windows-subscription-trial -- -D warnings
+      - name: Native Codex desktop ownership and removal composition (synthetic only)
+        run: |
+          $env:TAURI_CONFIG = Get-Content desktop/tauri.windows-subscription-trial.conf.json -Raw
+          $listed = @(cargo test -p zephium-desktop --locked --features windows-subscription-trial codex:: -- --list)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (@($listed | Where-Object { $_ -cmatch '^codex::.+: test$' }).Count -eq 0) { throw 'Expected native Codex desktop composition tests.' }
+          cargo test -p zephium-desktop --locked --features windows-subscription-trial codex:: -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Regenerate complete native IPC bindings and reject drift
         run: |
           $env:TAURI_CONFIG = Get-Content desktop/tauri.windows-subscription-trial.conf.json -Raw
@@ -156,7 +168,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p zephium-desktop --locked --features windows-subscription-trial export_typescript_bindings
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git diff --exit-code -- frame/src/shared/ipc/bindings.ts frame/src/shared/ipc/work-constants.ts
+          git diff --exit-code -- frame/src/shared/ipc/bindings.ts frame/src/shared/ipc/work-constants.ts frame/src/shared/ipc/codex-bindings.ts frame/src/shared/ipc/chatgpt-bindings.ts
       - name: Build unsigned isolated Windows installer
         run: node scripts/windows-trial.mjs --build
       - name: Verify generated installer identity and stage checksums

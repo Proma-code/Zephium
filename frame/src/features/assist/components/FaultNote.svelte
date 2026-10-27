@@ -66,7 +66,9 @@
       </Button>
     </div>
     {#if view.diagnostic.uncertain}<p class="diagnostic-note">
-        {m.assist_chatgpt_outcome_unknown()}
+        {fault.reason === "native_conversation"
+          ? m.assist_codex_unknown()
+          : m.assist_chatgpt_outcome_unknown()}
       </p>{/if}
     {#if failedCode === view.diagnostic.code}<p class="diagnostic-note" role="status">
         {m.assist_diagnostic_copy_failed()}

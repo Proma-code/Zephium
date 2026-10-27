@@ -2,26 +2,15 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { ChatGptViewV1 } from "$shared/ipc/chatgpt-bindings";
 import { chatgptView } from "$shared/testing/chatgpt";
 import { ChatGptSession } from "../session.svelte";
-
 const native = vi.hoisted(() => ({
   read: vi.fn(),
-  signIn: vi.fn(),
-  cancel: vi.fn(),
   signOut: vi.fn(),
-  models: vi.fn(),
   changed: null as (() => void) | null,
 }));
 vi.mock("$shared/ipc/chatgpt-bindings", async () => {
   const { mockChatGptBindings } = await import("$shared/testing/chatgpt");
-  return mockChatGptBindings({
-    chatgptAccount: native.read,
-    chatgptSignIn: native.signIn,
-    chatgptCancel: native.cancel,
-    chatgptSignOut: native.signOut,
-    chatgptRefreshModels: native.models,
-  });
+  return mockChatGptBindings({ chatgptAccount: native.read, chatgptSignOut: native.signOut });
 });
-
 vi.mock("$shared/ipc/native-events", () => ({
   events: {
     workModelsChanged: {
@@ -34,248 +23,128 @@ vi.mock("$shared/ipc/native-events", () => ({
     },
   },
 }));
-
 const profile = "00000000000000000000000001";
-const otherProfile = "00000000000000000000000002";
+const other = "00000000000000000000000002";
 const sessions: ChatGptSession[] = [];
-const owner = (id = profile) => {
-  const session = new ChatGptSession(id);
-  sessions.push(session);
-  return session;
+const owner = () => {
+  const value = new ChatGptSession(profile);
+  sessions.push(value);
+  return value;
 };
-const foreignAttempt = "00000000-0000-4000-8000-000000000002";
-const pending = (attempt = foreignAttempt) =>
-  chatgptView(profile, { state: "signing_in", login_attempt: attempt });
-const connected = () =>
-  chatgptView(profile, { state: "connected", email: "reader@example.com", models: 3 });
-
+const stored = () => chatgptView(profile, { presence: "stored", state: "connected" });
 beforeEach(() => {
   vi.useFakeTimers();
-  for (const command of [native.read, native.signIn, native.cancel, native.signOut, native.models])
-    command.mockReset();
+  native.read.mockReset();
+  native.signOut.mockReset();
   native.read.mockResolvedValue(chatgptView(profile));
-  native.signIn.mockImplementation(async (_profile: string, attempt: string) => pending(attempt));
-  native.cancel.mockResolvedValue(chatgptView(profile, { error: "cancelled" }));
-  native.signOut.mockResolvedValue(chatgptView(profile));
-  native.models.mockResolvedValue(connected());
+  native.signOut.mockResolvedValue(chatgptView(profile, { presence: "stored" }));
 });
-
-afterEach(async () => {
+afterEach(() => {
   for (const session of sessions.splice(0)) session.dispose();
-  await Promise.resolve();
   vi.useRealTimers();
 });
-
-test("account observation never starts login or selects a model", async () => {
+test("clean observation is single flight and never exposes legacy login commands", async () => {
   const session = owner();
   await session.start();
   await session.start();
   expect(native.read).toHaveBeenCalledExactlyOnceWith(profile);
-  expect(session.view?.state).toBe("signed_out");
-  expect(native.signIn).not.toHaveBeenCalled();
-  expect(native.models).not.toHaveBeenCalled();
-});
-
-test("sign-in is single-flight and only native completion becomes connected", async () => {
-  const session = owner();
-  await session.start();
-  const first = session.signIn();
-  expect(await session.signIn()).toBe(false);
-  await first;
-  expect(native.signIn).toHaveBeenCalledExactlyOnceWith(profile, expect.any(String));
-  expect(session.signingIn).toBe(true);
-  expect(session.view?.state).toBe("signing_in");
-  native.read.mockResolvedValue(connected());
-  await vi.advanceTimersByTimeAsync(1000);
-  expect(session.view?.state).toBe("connected");
-  expect(session.view?.models).toBe(3);
-  expect(session.signingIn).toBe(false);
-});
-
-test("another profile's account is never adopted", async () => {
-  native.read.mockResolvedValue({ ...connected(), profile: otherProfile });
-  const session = owner();
-  await session.start();
-  expect(session.view).toBeNull();
-  expect(session.observationFailed).toBe(true);
-  expect(await session.signIn()).toBe(false);
-});
-
-test("cancel wins over a stale start response", async () => {
-  let finish!: (view: ChatGptViewV1) => void;
-  native.signIn.mockImplementation(
-    () => new Promise<ChatGptViewV1>((resolve) => (finish = resolve)),
-  );
-  const session = owner();
-  await session.start();
-  const signingIn = session.signIn();
-  await Promise.resolve();
-  await session.cancel();
-  finish(pending());
-  await signingIn;
-  expect(native.cancel).toHaveBeenCalledExactlyOnceWith(profile, native.signIn.mock.calls[0]![1]);
-  expect(session.view?.state).toBe("signed_out");
-  expect(session.signingIn).toBe(false);
-});
-
-test("disposing a pending owned flow cancels it and ignores late account data", async () => {
-  let finish!: (view: ChatGptViewV1) => void;
-  native.signIn.mockImplementation(
-    () => new Promise<ChatGptViewV1>((resolve) => (finish = resolve)),
-  );
-  const session = owner();
-  await session.start();
-  const signingIn = session.signIn();
-  await Promise.resolve();
-  session.dispose();
-  await Promise.resolve();
-  finish(connected());
-  await signingIn;
-  expect(native.cancel).toHaveBeenCalledExactlyOnceWith(profile, native.signIn.mock.calls[0]![1]);
-  expect(session.view).toBeNull();
-  expect(session.busy).toBeNull();
-});
-
-test("leaving a completed account or observing someone else's flow never disconnects it", async () => {
-  native.read.mockResolvedValueOnce(connected()).mockResolvedValueOnce(pending());
-  const completed = owner();
-  await completed.start();
-  completed.dispose();
-  const observer = owner();
-  await observer.start();
-  observer.dispose();
-  await Promise.resolve();
-  expect(native.cancel).not.toHaveBeenCalled();
+  expect(session.view?.presence).toBe("missing");
+  expect("signIn" in session).toBe(false);
+  expect("cancel" in session).toBe(false);
+  expect("refreshModels" in session).toBe(false);
+  expect(await session.signOut()).toBe(false);
   expect(native.signOut).not.toHaveBeenCalled();
 });
-
-test("denied authorization remains signed out and can be retried explicitly", async () => {
-  native.signIn.mockResolvedValue(chatgptView(profile, { error: "denied" }));
+test("pending-only registration can be explicitly disconnected without email or connected state", async () => {
+  native.read.mockResolvedValue(chatgptView(profile, { presence: "stored" }));
   const session = owner();
   await session.start();
-  await session.signIn();
+  expect(session.view?.email).toBeNull();
   expect(session.view?.state).toBe("signed_out");
-  expect(session.view?.error).toBe("denied");
-  expect(session.signingIn).toBe(false);
-  await session.signIn();
-  expect(native.signIn).toHaveBeenCalledTimes(2);
-});
-
-test("a read timeout is inconclusive, not signed out or connected", async () => {
-  native.read.mockImplementation(() => new Promise<ChatGptViewV1>(() => {}));
-  const session = owner();
-  const started = session.start();
-  await vi.advanceTimersByTimeAsync(5000);
-  await started;
-  expect(session.view).toBeNull();
-  expect(session.observationFailed).toBe(true);
-  expect(native.signIn).not.toHaveBeenCalled();
-});
-
-test("a lost start answer preserves cancellation instead of pretending login failed", async () => {
-  native.signIn.mockImplementation(() => new Promise<ChatGptViewV1>(() => {}));
-  const session = owner();
-  await session.start();
-  const signingIn = session.signIn();
-  await vi.advanceTimersByTimeAsync(20000);
-  await signingIn;
-  expect(session.signingIn).toBe(true);
-  expect(session.observationFailed).toBe(true);
-  expect(session.view?.state).not.toBe("connected");
-  await session.cancel();
-  expect(session.signingIn).toBe(false);
-});
-
-test("bounded polling pauses unconfirmed and only explicit refresh resumes it", async () => {
-  const session = owner();
-  await session.start();
-  await session.signIn();
-  native.read.mockResolvedValue(pending());
-  await vi.advanceTimersByTimeAsync(305000);
-  expect(session.pollingPaused).toBe(true);
-  expect(session.observationFailed).toBe(true);
-  expect(session.view?.state).toBe("signing_in");
-  const reads = native.read.mock.calls.length;
-  await vi.advanceTimersByTimeAsync(10000);
-  expect(native.read).toHaveBeenCalledTimes(reads);
-  expect(native.cancel).not.toHaveBeenCalled();
-  native.read.mockResolvedValue(connected());
-  await session.refresh();
-  expect(session.view?.state).toBe("connected");
-  expect(session.pollingPaused).toBe(false);
-});
-
-test("disconnect reports unconfirmed remote revocation without preserving local connection", async () => {
-  native.read.mockResolvedValue(connected());
-  native.signOut.mockResolvedValue(chatgptView(profile, { revocation_unconfirmed: true }));
-  const session = owner();
-  await session.start();
-  await session.signOut();
-  expect(session.view?.state).toBe("signed_out");
-  expect(session.view?.revocation_unconfirmed).toBe(true);
+  expect(await session.signOut()).toBe(true);
   expect(native.signOut).toHaveBeenCalledExactlyOnceWith(profile);
 });
-
-test("a stale read cannot restore an account after disconnect", async () => {
-  native.read.mockResolvedValueOnce(connected());
+test("unavailable observation is not treated as missing or safely disconnected", async () => {
+  native.read.mockResolvedValue(
+    chatgptView(profile, { presence: "unavailable", state: "unavailable", error: "vault" }),
+  );
   const session = owner();
   await session.start();
-  let finish!: (view: ChatGptViewV1) => void;
-  native.read.mockImplementation(() => new Promise<ChatGptViewV1>((resolve) => (finish = resolve)));
-  const reading = session.refresh();
-  await Promise.resolve();
-  await session.signOut();
-  finish(connected());
-  await reading;
-  expect(session.view?.state).toBe("signed_out");
+  expect(session.view?.presence).toBe("unavailable");
+  expect(await session.signOut()).toBe(false);
+  native.read.mockResolvedValue(stored());
+  await session.refresh();
+  expect(session.view?.presence).toBe("stored");
 });
-
-test("native account changes invalidate an older read and are reconciled once", async () => {
+test("cross-profile and malformed presence never replace an accepted observation", async () => {
+  native.read.mockResolvedValue(stored());
   const session = owner();
   await session.start();
+  for (const value of [
+    { ...stored(), profile: other },
+    { ...stored(), presence: "unknown" },
+    { ...stored(), presence: "missing" },
+  ]) {
+    native.read.mockResolvedValue(value);
+    await session.refresh();
+    expect(session.observationFailed).toBe(true);
+    expect(session.view?.presence).toBe("stored");
+  }
+});
+test("disconnect is single flight and a failed observation is not false success", async () => {
   let finish!: (view: ChatGptViewV1) => void;
-  native.read.mockImplementationOnce(
+  native.read.mockResolvedValue(stored());
+  native.signOut.mockImplementation(
     () => new Promise<ChatGptViewV1>((resolve) => (finish = resolve)),
   );
-  native.read.mockResolvedValue(connected());
-  const reading = session.refresh();
+  const session = owner();
+  await session.start();
+  const disconnect = session.signOut();
+  expect(await session.signOut()).toBe(false);
   await Promise.resolve();
-  native.changed?.();
-  native.changed?.();
-  finish(chatgptView(profile));
-  await reading;
+  finish(chatgptView(profile, { presence: "stored", error: "vault" }));
+  await disconnect;
+  expect(native.signOut).toHaveBeenCalledTimes(1);
+  expect(session.view?.error).toBe("vault");
+});
+test("read timeout remains inconclusive and does not create a missing projection", async () => {
+  native.read.mockImplementation(() => new Promise<ChatGptViewV1>(() => {}));
+  const session = owner();
+  const start = session.start();
+  await vi.advanceTimersByTimeAsync(5000);
+  await start;
+  expect(session.view).toBeNull();
+  expect(session.observationFailed).toBe(true);
+  expect(native.signOut).not.toHaveBeenCalled();
+});
+test("disposal never disconnects and ignores late account data", async () => {
+  let finish!: (view: ChatGptViewV1) => void;
+  native.read.mockImplementation(() => new Promise<ChatGptViewV1>((resolve) => (finish = resolve)));
+  const session = owner();
+  const start = session.start();
   await vi.advanceTimersByTimeAsync(0);
-  expect(native.read).toHaveBeenCalledTimes(3);
-  expect(session.view?.state).toBe("connected");
-});
-
-test("a native busy answer never transfers ownership of another attempt", async () => {
-  native.signIn.mockResolvedValue({ ...pending(), error: "busy" });
-  const session = owner();
-  await session.start();
-  await session.signIn();
   session.dispose();
+  finish(stored());
+  await start;
+  expect(session.view).toBeNull();
+  expect(native.signOut).not.toHaveBeenCalled();
+});
+test("events during disconnect queue one authoritative readback", async () => {
+  let finish!: (view: ChatGptViewV1) => void;
+  native.read.mockResolvedValue(stored());
+  native.signOut.mockImplementation(
+    () => new Promise<ChatGptViewV1>((resolve) => (finish = resolve)),
+  );
+  const session = owner();
+  await session.start();
+  const disconnect = session.signOut();
   await Promise.resolve();
-  expect(native.cancel).not.toHaveBeenCalled();
-});
-
-test("an explicit cancel targets the exact observed attempt", async () => {
-  native.read.mockResolvedValue(pending());
-  const session = owner();
-  await session.start();
-  await session.cancel();
-  expect(native.cancel).toHaveBeenCalledExactlyOnceWith(profile, foreignAttempt);
-});
-
-test("a newly started flow has a fresh attempt id, never reuses its canceled predecessor", async () => {
-  const session = owner();
-  await session.start();
-  await session.signIn();
-  await session.cancel();
-  await session.signIn();
-  const first = native.signIn.mock.calls[0]![1];
-  const second = native.signIn.mock.calls[1]![1];
-  expect(first).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
-  expect(second).not.toBe(first);
-  expect(native.cancel).toHaveBeenCalledExactlyOnceWith(profile, first);
+  native.changed?.();
+  native.changed?.();
+  native.read.mockResolvedValue(chatgptView(profile, { presence: "stored" }));
+  finish(chatgptView(profile, { presence: "stored" }));
+  await disconnect;
+  await vi.advanceTimersByTimeAsync(0);
+  expect(native.read).toHaveBeenCalledTimes(2);
+  expect(session.view?.state).toBe("signed_out");
 });

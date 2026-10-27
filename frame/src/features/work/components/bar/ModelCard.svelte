@@ -1,6 +1,15 @@
 <script module lang="ts">
   import type { WorkModelEntry, WorkModelReasoning } from "$shared/ipc/bindings";
+  import type { CodexEffortV1, CodexEffortSelectionV1 } from "$shared/ipc/codex-bindings";
   import type { Tier } from "./model-tier";
+
+  /** Native metadata is presentation-only: no invented Work wire, pricing or capabilities. */
+  export type NativeCardSubject = {
+    native: { id: string; name: string; source: string };
+    levels: readonly CodexEffortV1[];
+    effort: CodexEffortSelectionV1 | null;
+    defaultAvailable: boolean;
+  };
 
   export type CardSubject = {
     entry: WorkModelEntry;
@@ -23,7 +32,8 @@
   import ProviderMark from "$shared/ui/ProviderMark";
   import * as m from "$shared/i18n/messages";
   import { ArrowDown01Icon } from "../../lib/icons";
-  import ModelEffort from "./ModelEffort.svelte";
+  import { codexEffort } from "$domain/codex";
+  import ModelEffort, { type DisplayEffort } from "./ModelEffort.svelte";
   import ModelEffortMark from "./ModelEffortMark.svelte";
   import "$shared/ui/Button/control.css";
   import "$shared/ui/Shine/shine.css";
@@ -34,16 +44,18 @@
     region,
     ontoggle,
     onEffort,
+    onNativeEffort,
     onstir,
     pill = $bindable(),
   }: {
-    subject: CardSubject;
+    subject: CardSubject | NativeCardSubject;
     /** The card shows the effort control in place of the model. */
     expanded: boolean;
     /** The id of the face the effort button opens. */
     region: string;
     ontoggle: () => void;
-    onEffort: (level: WorkModelReasoning) => void;
+    onEffort?: (level: WorkModelReasoning) => void;
+    onNativeEffort?: (level: CodexEffortSelectionV1) => void;
     /** Something is happening in the effort control: the person is still using it. */
     onstir?: () => void;
     pill?: HTMLElement;
@@ -55,10 +67,20 @@
     flagship: m.model_character_flagship,
   };
 
-  const name = $derived(modelName(subject.entry));
+  const native = $derived("native" in subject ? subject.native : null);
+  const name = $derived("native" in subject ? subject.native.name : modelName(subject.entry));
+  const identity = $derived("native" in subject ? subject.native.id : subject.entry.id);
+  const provider = $derived("native" in subject ? "open_ai" : subject.entry.model.provider);
+  const effortLabel = (level: DisplayEffort) =>
+    native ? codexEffort(level) : effortName(level as WorkModelReasoning);
+  function changed(level: DisplayEffort) {
+    if ("native" in subject) onNativeEffort?.({ kind: "explicit", effort: level });
+    else if (level !== "none" && level !== "minimal") onEffort?.(level);
+  }
 
   /** What the model is like, then only what limits it. */
   const character = $derived.by(() => {
+    if ("native" in subject) return `${subject.native.source} · ${m.codex_picker_text_only()}`;
     const { entry, tier } = subject;
     const words: string[] = [];
     const connection = modelConnection(entry);
@@ -77,7 +99,7 @@
   });
 
   const price = $derived(
-    subject.entry.price
+    "entry" in subject && subject.entry.price
       ? m.model_price({
           input: dollars(subject.entry.price.input),
           output: dollars(subject.entry.price.output),
@@ -85,14 +107,37 @@
       : undefined,
   );
 
-  const live = $derived(subject.levels.length > 1 && subject.effort !== null);
+  const nativeSubject = $derived("native" in subject ? subject : null);
+  const explicitEffort = $derived(
+    nativeSubject
+      ? nativeSubject.effort?.kind === "explicit"
+        ? nativeSubject.effort.effort
+        : null
+      : (subject.effort as WorkModelReasoning | null),
+  );
+  const defaultSelected = $derived(nativeSubject?.effort?.kind === "default");
+  const selectedLabel = $derived(
+    defaultSelected
+      ? m.codex_effort_default()
+      : explicitEffort
+        ? effortLabel(explicitEffort)
+        : m.codex_choose_effort(),
+  );
+  const live = $derived(
+    nativeSubject
+      ? nativeSubject.effort !== null &&
+          nativeSubject.levels.length + Number(nativeSubject.defaultAvailable) > 1
+      : subject.levels.length > 1 && subject.effort !== null,
+  );
 
   /** The control is built while it shows and for the moment it leaves, so its orb never turns unseen. */
   let built = $state(false);
   let face = $state<HTMLElement>();
   $effect(() => {
     if (expanded && built)
-      face?.querySelector<HTMLElement>('[role="slider"]')?.focus({ preventScroll: true });
+      face
+        ?.querySelector<HTMLElement>('[role="slider"], .native-presets button')
+        ?.focus({ preventScroll: true });
   });
   $effect(() => {
     if (expanded) {
@@ -113,10 +158,8 @@
 >
   {#if character}<span class="sr-only" id={`${region}-description`}>{character}</span>{/if}
   <div class="face model" inert={expanded}>
-    {#key subject.entry.id}<div class="identity" aria-hidden="true">
-        <span class="tile ui-shine"
-          ><ProviderMark provider={subject.entry.model.provider} size={20} /></span
-        >
+    {#key identity}<div class="identity" aria-hidden="true">
+        <span class="tile ui-shine"><ProviderMark {provider} size={20} /></span>
         <span class="who">
           <span class="name" title={price}>{name}</span>
           {#if character}<span class="character">{character}</span>{/if}
@@ -128,19 +171,29 @@
         class="pill ui-control ui-shine ui-shine-press"
         aria-expanded={expanded}
         aria-controls={region}
-        aria-label={m.model_effort_choose({ level: effortName(subject.effort) })}
+        aria-label={m.model_effort_choose({ level: selectedLabel })}
         onclick={ontoggle}
       >
         <span class="pill-mark"
-          ><ModelEffortMark levels={subject.levels} level={subject.effort} /></span
+          >{#if explicitEffort}<ModelEffortMark
+              levels={subject.levels}
+              level={explicitEffort}
+            />{/if}</span
         >
-        <span class="pill-label" data-level={subject.effort}>{effortName(subject.effort)}</span>
+        <span class="pill-label" data-level={explicitEffort ?? undefined}>{selectedLabel}</span>
         <span class="pill-chevron"><Icon icon={ArrowDown01Icon} size={12} strokeWidth={2.2} /></span
         >
-      </button>{:else}<span class="fixed-effort">{m.model_effort_fixed()}</span>{/if}
+      </button>{:else}<span class="fixed-effort"
+        >{native
+          ? subject.effort
+            ? selectedLabel
+            : m.codex_choose_effort()
+          : m.model_effort_fixed()}</span
+      >{/if}
   </div>
   <div
     class="face effort"
+    class:presets={!!nativeSubject && defaultSelected}
     id={region}
     role="presentation"
     inert={!expanded}
@@ -149,15 +202,55 @@
     onpointermove={onstir}
     onkeydown={onstir}
   >
-    {#if built}<ModelEffort
-        levels={subject.levels}
-        value={subject.effort}
-        onchange={onEffort}
-      />{/if}
+    {#if built}
+      {#if nativeSubject && defaultSelected}
+        <div class="native-presets" role="group" aria-label={m.codex_pick_effort()}>
+          {#each nativeSubject.levels as level (level)}<button
+              type="button"
+              class="ui-control"
+              onclick={() => onNativeEffort?.({ kind: "explicit", effort: level })}
+              >{codexEffort(level)}</button
+            >{/each}
+        </div>
+      {:else}<ModelEffort levels={subject.levels} value={explicitEffort} onchange={changed} />{/if}
+      {#if nativeSubject?.defaultAvailable}
+        <button
+          type="button"
+          class="native-default ui-control"
+          aria-pressed={defaultSelected}
+          aria-label={m.codex_effort_use_default()}
+          title={m.codex_effort_default_hint()}
+          onclick={() => onNativeEffort?.({ kind: "default" })}
+          >{m.codex_effort_use_default()}</button
+        >
+      {/if}
+    {/if}
   </div>
 </section>
 
 <style>
+  .native-presets {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    flex: 1;
+    min-inline-size: 0;
+    gap: 4px;
+    padding: 4px;
+  }
+
+  .native-presets button,
+  .native-default {
+    padding: 4px 8px;
+    color: var(--color-text);
+    font-size: var(--text-label);
+  }
+
+  .native-default {
+    flex: none;
+    margin: 4px 8px 4px 0;
+  }
+
   .card {
     display: grid;
     flex: none;
@@ -181,6 +274,11 @@
 
   .model {
     padding-inline: 12px 10px;
+  }
+
+  .effort.presets {
+    block-size: auto;
+    min-block-size: 60px;
   }
 
   .effort {

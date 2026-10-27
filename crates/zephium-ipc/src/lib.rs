@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 
 pub mod chatgpt;
+pub mod codex;
 pub mod local_gateway;
 pub mod opencode_go;
 pub mod page_assist;
@@ -345,6 +346,66 @@ pub struct ProfilesView {
     pub current: Option<String>,
     pub private: bool,
     pub profiles: Vec<ProfileEntryView>,
+    /// Canonical removal progress, including profiles no longer in the roster.
+    /// This is observation only, never authority to erase or resume an account.
+    pub removals: Vec<ProfileRemovalViewV1>,
+    /// Availability of the native protected-removal inventory. None is not a
+    /// proof of absence; it means this composition has no installed participant.
+    pub removal_recovery: Option<ProfileRemovalRecoveryV1>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileRemovalRecoveryV1 {
+    Verified,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileRemovalPhaseV1 {
+    AwaitingExplicitRetry,
+    PreparingNative,
+    Authorizing,
+    Cleanup,
+    ErasingBrowser,
+    Finalizing,
+    AcknowledgingNative,
+    FailedClosed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileRemovalNativeV1 {
+    Unconfirmed,
+    NotConfigured,
+    SignedOutSettled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileRemovalCleanupV1 {
+    NotStarted,
+    Unconfirmed,
+    Verified,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct ProfileRemovalViewV1 {
+    pub profile: String,
+    pub phase: ProfileRemovalPhaseV1,
+    pub native: ProfileRemovalNativeV1,
+    pub cleanup: ProfileRemovalCleanupV1,
+    pub blocked: bool,
+}
+
+/// Admission of reconciliation for an existing removal, not a deletion result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileRemovalRetryV1 {
+    Scheduled,
+    NotPending,
+    Blocked,
 }
 
 /// One ordered space owned by the focused profile.
@@ -1486,3 +1547,6 @@ mod bookmark_tests {
         assert!(!invalid.iter().any(BookmarkCall::validate));
     }
 }
+
+/// Secret-free original Codex quota presentation; no observation authority.
+pub mod codex_quota;

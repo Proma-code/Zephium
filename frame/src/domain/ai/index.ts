@@ -7,7 +7,6 @@ export {
   modelEffort,
   entryOf,
   keyState,
-  hasChatGptModels,
   hasGatewayModels,
   hasGoModels,
   type KeyedProvider,

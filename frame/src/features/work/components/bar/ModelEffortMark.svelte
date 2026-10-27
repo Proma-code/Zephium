@@ -1,8 +1,5 @@
-<script lang="ts">
-  import type { WorkModelReasoning } from "$shared/ipc/bindings";
-
-  let { levels, level }: { levels: readonly WorkModelReasoning[]; level: WorkModelReasoning } =
-    $props();
+<script lang="ts" generics="T extends string">
+  let { levels, level }: { levels: readonly T[]; level: T } = $props();
 
   const reach = $derived(
     levels.length > 1 ? Math.max(0, levels.indexOf(level)) / (levels.length - 1) : 1,

@@ -6,10 +6,9 @@ use zephium_ipc::chatgpt::{ChatGptCommand, ChatGptViewV1};
 mod live {
     use super::*;
     use std::collections::HashMap;
-    use zephium_chatgpt::service::{Fault, Service};
+    use zephium_chatgpt::service::{Fault, Presence, Service};
     use zephium_core::ids::ProfileId;
-    use zephium_core::work::model::*;
-    use zephium_ipc::chatgpt::{ChatGptFaultV1, ChatGptStateV1};
+    use zephium_ipc::chatgpt::{ChatGptFaultV1, ChatGptPresenceV1, ChatGptStateV1};
 
     #[cfg(feature = "windows-subscription-trial")]
     const VAULT_NAMESPACE: &str = "app.zephium.subscription-trial";
@@ -19,7 +18,6 @@ mod live {
     static REGISTRY: OnceLock<Arc<Registry>> = OnceLock::new();
 
     struct Registry {
-        app: tauri::AppHandle,
         services: Mutex<HashMap<ProfileId, Arc<Service>>>,
         foreground: std::sync::RwLock<Option<String>>,
         scope_epoch: std::sync::atomic::AtomicU64,
@@ -57,13 +55,6 @@ mod live {
             }
             service.scope().ok()
         }
-        fn get(&self, profile: ProfileId) -> Option<Arc<Service>> {
-            let services = self.services.lock().ok()?;
-            if self.closed.load(std::sync::atomic::Ordering::Acquire) {
-                return None;
-            }
-            services.get(&profile).cloned()
-        }
         fn close(&self) {
             let services = super::super::subscription_registry::close(
                 &self.services,
@@ -80,14 +71,14 @@ mod live {
             &self,
             profile: ProfileId,
             require_foreground: bool,
-        ) -> Result<Arc<Service>, Fault> {
+        ) -> Result<Option<Arc<Service>>, Fault> {
             use zephium_core::ports::store::Store;
             let mut services = self.services.lock().map_err(|_| Fault::Vault)?;
             if self.closed.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(Fault::Cancelled);
             }
             if let Some(service) = services.get(&profile) {
-                return Ok(service.clone());
+                return Ok(Some(service.clone()));
             }
             if require_foreground
                 && self
@@ -104,28 +95,23 @@ mod live {
                 return Err(Fault::Busy);
             }
             let store = APP_STORE.get().ok_or(Fault::Vault)?;
-            let host = match store
-                .app_setting(HOST_KEY)
-                .filter(|value| !value.is_empty())
-            {
-                Some(host) => host,
-                None => {
-                    let host = zephium_chatgpt::oauth::new_host_id().map_err(Fault::from)?;
-                    if !store.set_app_setting(HOST_KEY.into(), host.clone()) {
-                        return Err(Fault::Vault);
-                    }
-                    host
-                }
+            let Some(host) =
+                zephium_chatgpt::service::existing_host(store.app_setting_readback(HOST_KEY))?
+            else {
+                return Ok(None);
             };
-            let service = Arc::new(Service::new(
-                profile.to_string(),
-                host,
-                Arc::new(
-                    zephium_chatgpt::vault::SystemVault::new(VAULT_NAMESPACE)
-                        .map_err(|_| Fault::Vault)?,
-                ),
-                Arc::new(zephium_app::work_models::chatgpt_session_changed),
-            )?);
+            let service = Arc::new(
+                Service::new(
+                    profile.to_string(),
+                    host,
+                    Arc::new(
+                        zephium_chatgpt::vault::SystemVault::new(VAULT_NAMESPACE)
+                            .map_err(|_| Fault::Vault)?,
+                    ),
+                    Arc::new(zephium_app::work_models::chatgpt_session_changed),
+                )
+                .map_err(|_| Fault::Vault)?,
+            );
             service.set_foreground(
                 self.foreground.read().ok().is_some_and(|current| {
                     current.as_deref() == Some(profile.to_string().as_str())
@@ -133,104 +119,45 @@ mod live {
             );
             services.insert(profile, service.clone());
             drop(services);
-            Ok(service)
-        }
-    }
-
-    struct AccountModelClient {
-        service: Arc<Service>,
-        model: String,
-        lease: zephium_chatgpt::service::Lease,
-        /// One Work run owns this client. A failed or dropped call is never
-        /// replayed by model-driven helper reassignment within that run.
-        terminal: tokio::sync::Mutex<Option<WorkModelError>>,
-    }
-    impl WorkModelClient for AccountModelClient {
-        fn call<'a>(
-            &'a self,
-            request: WorkModelRequest,
-            events: &'a (dyn Fn(WorkModelEvent) + Send + Sync),
-        ) -> WorkModelFuture<'a> {
-            Box::pin(async move {
-                if request.model.provider != WorkModelProvider::OpenAi
-                    || request.model.wire != WorkModelWire::OpenAiResponses
-                    || request.model.model != self.model
-                {
-                    return Err(WorkModelError::ChatGpt {
-                        fault: ChatGptModelFault::Unsupported,
-                    });
-                }
-                let mut terminal = self.terminal.lock().await;
-                if let Some(error) = *terminal {
-                    return Err(error);
-                }
-                // Set before dispatch, not only on return: dropping this future
-                // must not reopen the same run's client for a second request.
-                *terminal = Some(WorkModelError::ChatGpt {
-                    fault: ChatGptModelFault::Unavailable,
-                });
-                let result = self.service.call(self.lease, request, events).await;
-                *terminal = match &result {
-                    Ok(_) => None,
-                    Err(error @ WorkModelError::ChatGpt { .. }) => Some(*error),
-                    Err(_) => Some(WorkModelError::ChatGpt {
-                        fault: ChatGptModelFault::Unavailable,
-                    }),
-                };
-                result
-            })
+            Ok(Some(service))
         }
     }
 
     impl zephium_app::work_models::WorkChatGptSession for Registry {
         fn erase_profile(&self, profile: ProfileId, deadline: std::time::Instant) -> bool {
-            let Ok(service) = self.service(profile, false) else {
-                return false;
+            let service = match self.service(profile, false) {
+                Ok(service) => service,
+                Err(_) => return false,
             };
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 return false;
             }
             tauri::async_runtime::block_on(async move {
-                tokio::time::timeout(remaining, service.erase())
-                    .await
-                    .is_ok_and(|result| result.is_ok())
+                tokio::time::timeout(remaining, async move {
+                    if let Some(service) = service {
+                        service.erase().await
+                    } else {
+                        let vault = zephium_chatgpt::vault::SystemVault::new(VAULT_NAMESPACE)
+                            .map_err(|_| Fault::Vault)?;
+                        tokio::task::spawn_blocking(move || {
+                            use zephium_chatgpt::vault::AccountVault;
+                            vault.forget(&profile.to_string())
+                        })
+                        .await
+                        .map_err(|_| Fault::Vault)?
+                        .map_err(|_| Fault::Vault)
+                    }
+                })
+                .await
+                .is_ok_and(|result| result.is_ok())
             })
-        }
-        fn entries(&self, profile: ProfileId) -> Vec<WorkModelEntry> {
-            self.get(profile)
-                .map(|service| service.models().iter().map(|model| model.entry()).collect())
-                .unwrap_or_default()
-        }
-        fn client(
-            &self,
-            profile: ProfileId,
-            model: &str,
-        ) -> Result<Arc<dyn WorkModelClient>, WorkModelError> {
-            let service = self.get(profile).ok_or(WorkModelError::ChatGpt {
-                fault: ChatGptModelFault::SignedOut,
-            })?;
-            if !service.models().iter().any(|entry| entry.slug == model) {
-                return Err(WorkModelError::ChatGpt {
-                    fault: ChatGptModelFault::SignedOut,
-                });
-            }
-            let lease = service.lease().ok_or(WorkModelError::ChatGpt {
-                fault: ChatGptModelFault::SignedOut,
-            })?;
-            Ok(Arc::new(AccountModelClient {
-                service,
-                model: model.into(),
-                lease,
-                terminal: tokio::sync::Mutex::new(None),
-            }))
         }
     }
 
-    pub(super) fn install(app: &tauri::AppHandle) {
+    pub(super) fn install(_app: &tauri::AppHandle) {
         let registry = REGISTRY.get_or_init(|| {
             Arc::new(Registry {
-                app: app.clone(),
                 services: Mutex::new(HashMap::new()),
                 foreground: std::sync::RwLock::new(None),
                 scope_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -309,13 +236,10 @@ mod live {
         match fault {
             Fault::Invalid => ChatGptFaultV1::Invalid,
             Fault::Offline => ChatGptFaultV1::Offline,
-            Fault::Denied => ChatGptFaultV1::Denied,
             Fault::Cancelled => ChatGptFaultV1::Cancelled,
             Fault::Timeout => ChatGptFaultV1::Timeout,
             Fault::Protocol => ChatGptFaultV1::Protocol,
             Fault::Vault => ChatGptFaultV1::Vault,
-            Fault::SessionExpired => ChatGptFaultV1::SessionExpired,
-            Fault::UsageLimit => ChatGptFaultV1::UsageLimit,
             Fault::Busy => ChatGptFaultV1::Busy,
         }
     }
@@ -325,16 +249,17 @@ mod live {
         ChatGptViewV1 {
             version: 1,
             profile,
-            state: if current.signing_in {
-                ChatGptStateV1::SigningIn
-            } else if current.connected {
+            state: if current.connected {
                 ChatGptStateV1::Connected
             } else {
                 ChatGptStateV1::SignedOut
             },
             email: current.email,
-            models: current.models.try_into().unwrap_or(0),
-            login_attempt: current.login_attempt,
+            presence: match current.presence {
+                Presence::Missing => ChatGptPresenceV1::Missing,
+                Presence::Stored => ChatGptPresenceV1::Stored,
+                Presence::Unavailable => ChatGptPresenceV1::Unavailable,
+            },
             error: error.or(current.fault).map(fault),
             revocation_unconfirmed: current.revocation_unconfirmed,
         }
@@ -370,58 +295,41 @@ mod live {
         Some(profile)
     }
 
-    async fn open_browser(
-        app: tauri::AppHandle,
-        service: std::sync::Weak<Service>,
-        attempt: String,
-        url: zeroize::Zeroizing<String>,
-    ) -> bool {
-        // The service supplies only its constructed fixed-origin OAuth URL.
-        if !url.starts_with("https://auth.openai.com/api/accounts/authorize?") {
-            return false;
-        }
-        let (send, receive) = tokio::sync::oneshot::channel();
-        let app_for_open = app.clone();
-        if app
-            .run_on_main_thread(move || {
-                use windows::core::{w, HSTRING, PCWSTR};
-                use windows::Win32::UI::Shell::ShellExecuteW;
-                use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-                if shutdown_started(&app_for_open)
-                    || service.upgrade().is_none_or(|service| {
-                        service.view().login_attempt.as_deref() != Some(attempt.as_str())
-                    })
-                {
-                    let _ = send.send(false);
-                    return;
-                }
-                let target = HSTRING::from(url.as_str());
-                // SAFETY: an exact HTTPS authorization URL is held for the call;
-                // no executable, arbitrary scheme, shell command or arguments are accepted.
-                let result = unsafe {
-                    ShellExecuteW(
-                        None,
-                        w!("open"),
-                        &target,
-                        PCWSTR::null(),
-                        PCWSTR::null(),
-                        SW_SHOWNORMAL,
-                    )
-                };
-                let _ = send.send(result.0 as usize > 32);
-            })
-            .is_err()
+    // A missing installation key is not proof that protected registration data
+    // is absent. Probe the exact profile without inventing or adopting a host.
+    async fn observe_unbound(profile: &str) -> ChatGptViewV1 {
+        let mut view = ChatGptViewV1::unavailable(profile.to_owned());
+        let Ok(vault) = zephium_chatgpt::vault::SystemVault::new(VAULT_NAMESPACE) else {
+            return view;
+        };
+        let owner = profile.to_owned();
+        let record = tokio::task::spawn_blocking(move || {
+            use zephium_chatgpt::vault::AccountVault;
+            vault.load(&owner)
+        })
+        .await;
+        match record
+            .map(zephium_chatgpt::service::unbound_presence)
+            .unwrap_or(Presence::Unavailable)
         {
-            return false;
+            Presence::Missing => {
+                view.presence = ChatGptPresenceV1::Missing;
+                view.state = ChatGptStateV1::SignedOut;
+                view.error = None;
+            }
+            Presence::Stored => {
+                view.presence = ChatGptPresenceV1::Stored;
+                view.error = Some(ChatGptFaultV1::Vault);
+            }
+            Presence::Unavailable => view.error = Some(ChatGptFaultV1::Vault),
         }
-        receive.await.unwrap_or(false)
+        view
     }
 
     pub(super) async fn dispatch(
         caller: WebviewWindow,
         expected: String,
         action: ChatGptCommand,
-        attempt: Option<String>,
     ) -> ChatGptViewV1 {
         let Some(registry) = REGISTRY.get() else {
             return ChatGptViewV1::unavailable(expected);
@@ -436,7 +344,14 @@ mod live {
             return ChatGptViewV1::unavailable(expected);
         }
         let service = match registry.service(profile, true) {
-            Ok(service) => service,
+            Ok(Some(service)) => service,
+            Ok(None) => {
+                let result = observe_unbound(&expected).await;
+                if !registry.owns_scope(&expected, scope_epoch) {
+                    return ChatGptViewV1::unavailable(expected);
+                }
+                return result;
+            }
             Err(error) => {
                 let mut view = ChatGptViewV1::unavailable(expected);
                 view.error = Some(fault(error));
@@ -448,29 +363,7 @@ mod live {
         };
         let result = match action {
             ChatGptCommand::Account => service.load_scoped(service_scope).await,
-            ChatGptCommand::SignIn => {
-                match attempt.filter(|id| zephium_chatgpt::service::valid_attempt(id)) {
-                    Some(attempt) => {
-                        let app = registry.app.clone();
-                        let weak = Arc::downgrade(&service);
-                        let expected = attempt.clone();
-                        service
-                            .sign_in_scoped(service_scope, attempt, move |url| {
-                                open_browser(app, weak, expected, url)
-                            })
-                            .await
-                    }
-                    None => Err(Fault::Invalid),
-                }
-            }
-            ChatGptCommand::Cancel => {
-                match attempt.filter(|id| zephium_chatgpt::service::valid_attempt(id)) {
-                    Some(attempt) => service.cancel_scoped(service_scope, &attempt).await,
-                    None => Err(Fault::Invalid),
-                }
-            }
             ChatGptCommand::SignOut => service.sign_out_scoped(service_scope).await,
-            ChatGptCommand::RefreshModels => service.refresh_models_scoped(service_scope).await,
         };
         if !registry.owns_scope(&expected, scope_epoch) {
             return ChatGptViewV1::unavailable(expected);
@@ -513,15 +406,14 @@ async fn dispatch(
     caller: WebviewWindow,
     expected: String,
     action: ChatGptCommand,
-    attempt: Option<String>,
 ) -> ChatGptViewV1 {
     #[cfg(all(windows, feature = "work-product"))]
     {
-        live::dispatch(caller, expected, action, attempt).await
+        live::dispatch(caller, expected, action).await
     }
     #[cfg(not(all(windows, feature = "work-product")))]
     {
-        let _ = (caller, action, attempt);
+        let _ = (caller, action);
         ChatGptViewV1::unavailable(expected)
     }
 }
@@ -531,53 +423,12 @@ pub(crate) async fn chatgpt_account(
     caller: WebviewWindow,
     expected_profile: String,
 ) -> ChatGptViewV1 {
-    dispatch(caller, expected_profile, ChatGptCommand::Account, None).await
-}
-#[tauri::command]
-pub(crate) async fn chatgpt_sign_in(
-    caller: WebviewWindow,
-    expected_profile: String,
-    attempt: String,
-) -> ChatGptViewV1 {
-    dispatch(
-        caller,
-        expected_profile,
-        ChatGptCommand::SignIn,
-        Some(attempt),
-    )
-    .await
-}
-#[tauri::command]
-pub(crate) async fn chatgpt_cancel(
-    caller: WebviewWindow,
-    expected_profile: String,
-    attempt: String,
-) -> ChatGptViewV1 {
-    dispatch(
-        caller,
-        expected_profile,
-        ChatGptCommand::Cancel,
-        Some(attempt),
-    )
-    .await
+    dispatch(caller, expected_profile, ChatGptCommand::Account).await
 }
 #[tauri::command]
 pub(crate) async fn chatgpt_sign_out(
     caller: WebviewWindow,
     expected_profile: String,
 ) -> ChatGptViewV1 {
-    dispatch(caller, expected_profile, ChatGptCommand::SignOut, None).await
-}
-#[tauri::command]
-pub(crate) async fn chatgpt_refresh_models(
-    caller: WebviewWindow,
-    expected_profile: String,
-) -> ChatGptViewV1 {
-    dispatch(
-        caller,
-        expected_profile,
-        ChatGptCommand::RefreshModels,
-        None,
-    )
-    .await
+    dispatch(caller, expected_profile, ChatGptCommand::SignOut).await
 }

@@ -647,8 +647,12 @@ mod product {
     struct Models;
 
     impl ModelSource for Models {
-        fn entry<'a>(&'a self, profile: &'a ProfileId) -> BoxFuture<'a, Option<ModelChoice>> {
+        fn entry<'a>(&'a self, profile: &'a ProfileId) -> BoxFuture<'a, Option<PageBackendChoice>> {
             Box::pin(async move {
+                if crate::codex::page_requested(*profile) {
+                    return crate::codex::page_choice(*profile)
+                        .map(PageBackendChoice::NativeConversation);
+                }
                 let (entry, _) = zephium_app::work_models::resolve_entry_for(
                     *profile,
                     WorkModelRole::Page,
@@ -657,27 +661,44 @@ mod product {
                 .await
                 .ok()?;
                 let effort = zephium_app::work_models::lead_effort(*profile, &entry);
-                Some(ModelChoice { entry, effort })
+                Some(PageBackendChoice::Model(ModelChoice { entry, effort }))
             })
+        }
+        fn reserve_native<'a>(
+            &'a self,
+            profile: &'a ProfileId,
+            expected: NativeConversationChoice,
+            draft: NativeConversationDraft,
+        ) -> BoxFuture<'a, Result<Box<dyn NativeConversationReservation>, PageBackendError>>
+        {
+            Box::pin(async move { crate::codex::reserve_page(*profile, expected, draft) })
         }
         fn resolve<'a>(
             &'a self,
             profile: &'a ProfileId,
             source: zephium_app::work_models::WorkCallSource,
-        ) -> BoxFuture<'a, Result<ResolvedModel, WorkModelError>> {
+        ) -> BoxFuture<'a, Result<ResolvedPageBackend, PageBackendError>> {
             Box::pin(async move {
+                if crate::codex::page_requested(*profile) {
+                    // Native turns have exactly one admission route: the
+                    // move-only reservation acquired before Page.say().
+                    return Err(PageBackendError::NativeConversation(
+                        zephium_ipc::page_assist::PageAssistNativeFaultV1::ScopeChanged,
+                    ));
+                }
                 let (entry, client) = zephium_app::work_models::resolve_entry_for(
                     *profile,
                     WorkModelRole::Page,
                     Some(source),
                 )
-                .await?;
+                .await
+                .map_err(PageBackendError::Model)?;
                 let effort = zephium_app::work_models::lead_effort(*profile, &entry);
-                Ok(ResolvedModel {
+                Ok(ResolvedPageBackend::Model(ResolvedModel {
                     entry,
                     effort,
                     client,
-                })
+                }))
             })
         }
     }
@@ -959,7 +980,18 @@ mod product {
                 .collect()
         }
         fn load(&self, profile: &ProfileId, id: &str) -> Option<String> {
-            self.0.chat(*profile, id)
+            let body = self.0.chat(*profile, id)?;
+            match self.0.codex_call(
+                *profile,
+                zephium_core::codex_store::Call::History {
+                    conversation: id.to_owned(),
+                },
+            ) {
+                zephium_core::codex_store::Reply::Association(association) => {
+                    crate::codex::restore_history(body, association.as_ref())
+                }
+                _ => None,
+            }
         }
         fn save(&self, profile: &ProfileId, entry: &StoredConversation, body: String) -> bool {
             self.0.save_chat(

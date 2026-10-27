@@ -23,6 +23,13 @@ pub struct Scope {
     generation: u64,
 }
 impl Scope {
+    #[cfg(all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    ))]
+    pub(crate) fn native_generation(&self) -> u64 {
+        self.generation
+    }
     pub fn new(profile: String, connection: [u8; 16], generation: u64) -> Result<Self, Fault> {
         if !identifier(&profile) || connection == [0; 16] || generation == 0 {
             return Err(Fault::InvalidInput);

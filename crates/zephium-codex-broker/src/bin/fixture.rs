@@ -6,6 +6,8 @@ fn main() {
         let result = match (mode, args.len()) {
             (Some("transport"), 2) => zephium_codex_broker::qualify_transport(),
             (Some("owner"), 2) => zephium_codex_broker::qualify_owner(),
+            (Some("quota"), 2) => zephium_codex_broker::qualify_quota(),
+            (Some("removal"), 2) => zephium_codex_broker::qualify_removal(),
             (Some("vault"), 2) => zephium_codex_broker::qualify_vault(),
             (Some("compatibility"), 4) => match args[2].to_str() {
                 Some(version) => zephium_codex_broker::qualify_compatibility(

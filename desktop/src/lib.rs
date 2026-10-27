@@ -71,6 +71,7 @@ mod blocker_service;
 mod browser_credentials;
 mod browser_import;
 mod chatgpt;
+mod codex;
 mod content_fullscreen;
 mod default_browser;
 mod diagnostics;
@@ -883,6 +884,7 @@ impl ShutdownCoordinator {
         self.terminal_started.store(true, Ordering::Release);
         drop(admission);
         chatgpt::stop();
+        codex::stop();
         local_gateway::stop();
         opencode_go::stop();
     }
@@ -943,6 +945,10 @@ impl ShutdownCoordinator {
             let operations = work.operations.clone();
             let coordinator = self.clone();
             tauri::async_runtime::spawn(async move {
+                if !codex::drained().await {
+                    coordinator.terminal_failure.store(true, Ordering::Release);
+                    diagnostic!("shutdown: Codex process cleanup was not proven");
+                }
                 if !chatgpt::drained().await {
                     coordinator.terminal_failure.store(true, Ordering::Release);
                     diagnostic!("shutdown: ChatGPT account mutation cleanup was not proven");
@@ -1776,6 +1782,8 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             blocker_retry,
             blocker_refresh_sources,
             profiles_delete,
+            profiles::profiles_retry_removal,
+            profiles::profiles_recheck_removal_inventory,
             profiles::profiles_get,
             profiles::profiles_create,
             profiles::profiles_switch,
@@ -5781,6 +5789,7 @@ fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
         && !coordinator.terminal_failure.load(Ordering::Acquire)
     {
         chatgpt::stop();
+        codex::stop();
         local_gateway::stop();
         opencode_go::stop();
         return;
@@ -5897,11 +5906,16 @@ pub fn run() {
     let specta = specta_builder();
     let existing_handler = specta.invoke_handler();
     let account_handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
+        codex::codex_account,
+        codex::codex_check_connection,
+        codex::codex_connect,
+        codex::codex_cancel_login,
+        codex::codex_logout,
+        codex::codex_refresh_models,
+        codex::codex_refresh_quota,
+        codex::codex_select_model,
         chatgpt::chatgpt_account,
-        chatgpt::chatgpt_sign_in,
-        chatgpt::chatgpt_cancel,
         chatgpt::chatgpt_sign_out,
-        chatgpt::chatgpt_refresh_models,
         opencode_go::go_status,
         opencode_go::go_save,
         opencode_go::go_check,
@@ -5939,7 +5953,8 @@ pub fn run() {
     let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
     let app = builder
         .invoke_handler(move |invoke| {
-            if zephium_ipc::chatgpt::ChatGptCommand::owns(invoke.message.command())
+            if zephium_ipc::codex::CodexCommand::owns(invoke.message.command())
+                || zephium_ipc::chatgpt::ChatGptCommand::owns(invoke.message.command())
                 || zephium_ipc::local_gateway::GatewayCommand::owns(invoke.message.command())
                 || zephium_ipc::opencode_go::GoCommand::owns(invoke.message.command())
             {
@@ -6072,6 +6087,7 @@ pub fn run() {
                 updates::schedule_native_checks(app.handle());
                 work_models::install(app.handle());
                 chatgpt::install(app.handle());
+                codex::install(app.handle());
                 local_gateway::install();
                 opencode_go::install();
                 account::install(app.handle());
@@ -6541,6 +6557,7 @@ pub fn run() {
                 }
                 Projection::Profiles(view) => {
                     chatgpt::profiles_changed(&view);
+                    codex::profiles_changed(&view);
                     local_gateway::profiles_changed(&view);
                     opencode_go::profiles_changed(&view);
                     emit_to_privileged(&emit_handle, MAIN_LABEL, "zephium:profiles", &view)

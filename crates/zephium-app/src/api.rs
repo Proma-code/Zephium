@@ -731,6 +731,17 @@ pub enum Command {
         operation: u64,
         attempt: u8,
     },
+    /// Explicit reconciliation of an already-admitted removal. No new
+    /// operation/attempt/intent is created and the original completion remains
+    /// independently tracked by the canonical deletion coordinator.
+    /// Explicit native inventory observation; never admits a deletion.
+    RecheckProfileRemovalInventory {
+        reply: SyncSender<zephium_ipc::ProfileRemovalRetryV1>,
+    },
+    RetryProfileRemoval {
+        profile: ProfileId,
+        reply: SyncSender<zephium_ipc::ProfileRemovalRetryV1>,
+    },
     /// One bounded-backoff retry for journal reconciliation, native erasure,
     /// or local SQLite finalization.
     ProfileDeletionRetry {

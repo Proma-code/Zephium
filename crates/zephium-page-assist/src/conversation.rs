@@ -241,6 +241,27 @@ impl Conversation {
                 }
                 text.push_str(delta);
             }
+            Event::TextSnapshot { block, text: next } => {
+                if !matches!(
+                    state,
+                    ReplyState::Working | ReplyState::Waiting | ReplyState::Paused
+                ) || next.len() > MAX_TEXT_BYTES
+                {
+                    return None;
+                }
+                let index = usize::from(*block);
+                if index == blocks.len() && index < MAX_BLOCKS {
+                    blocks.push(Block::Text {
+                        text: String::new(),
+                        cites: Vec::new(),
+                    });
+                }
+                let Some(Block::Text { text, cites }) = blocks.get_mut(index) else {
+                    return None;
+                };
+                *text = next.clone();
+                cites.clear();
+            }
             Event::Cites { block, cites: next } => match blocks.get_mut(usize::from(*block)) {
                 Some(Block::Text { cites, .. }) => *cites = next.clone(),
                 _ => return None,
@@ -362,6 +383,48 @@ mod tests {
         };
         assert!(c.apply(reply, forged).is_none());
         assert!(c.apply(99, Event::Cancelled).is_none());
+    }
+
+    #[test]
+    fn native_text_snapshot_replaces_and_clears_only_active_bounded_text() {
+        let mut c = conversation();
+        let (reply, _) = c.begin_reply();
+        let snapshot = |text: &str| Event::TextSnapshot {
+            block: 0,
+            text: text.into(),
+        };
+        assert!(c.apply(reply, snapshot("provisional")).is_some());
+        assert!(c.apply(reply, snapshot("corrected")).is_some());
+        assert_eq!(
+            c.blocks(reply).unwrap(),
+            &[Block::Text {
+                text: "corrected".into(),
+                cites: vec![]
+            }]
+        );
+        assert!(c
+            .apply(reply, snapshot(&"x".repeat(MAX_TEXT_BYTES + 1)))
+            .is_none());
+        assert!(c.apply(reply + 1, snapshot("wrong reply")).is_none());
+        assert!(c
+            .apply(
+                reply,
+                Event::TextSnapshot {
+                    block: 2,
+                    text: "gap".into()
+                }
+            )
+            .is_none());
+        assert!(c.apply(reply, snapshot("")).is_some());
+        assert!(c.apply(reply, Event::Done { cost: None }).is_some());
+        assert!(c.apply(reply, snapshot("late")).is_none());
+        assert_eq!(
+            c.blocks(reply).unwrap(),
+            &[Block::Text {
+                text: String::new(),
+                cites: vec![]
+            }]
+        );
     }
 
     #[test]

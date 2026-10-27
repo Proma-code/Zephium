@@ -197,7 +197,11 @@ impl Shell {
             native_erasure_verified,
         } in pending_deletions
         {
-            let phase = if native_erasure_verified {
+            let phase = if self.profile_deletion.native_participant.is_some() {
+                ProfileDeletionPhase::CleanupReady {
+                    engine_verified: native_erasure_verified,
+                }
+            } else if native_erasure_verified {
                 ProfileDeletionPhase::FinalizeReady
             } else {
                 ProfileDeletionPhase::NativeReady
@@ -210,6 +214,9 @@ impl Shell {
             // cancels any runtime-only work restored by a future caller.
             self.apply_profile_tombstone(profile);
         }
+        self.recover_native_profile_removals(
+            std::time::Instant::now() + PROFILE_DELETION_STORE_TIMEOUT,
+        );
         let recovered_deletions: Vec<ProfileId> =
             self.profile_deletion.states.keys().copied().collect();
         let recovery_deadline = std::time::Instant::now() + PROFILE_DELETION_STORE_TIMEOUT;
@@ -238,6 +245,11 @@ impl Shell {
         }
 
         let Some(space) = active_space
+            .filter(|space| {
+                self.spaces
+                    .get(*space)
+                    .is_some_and(|space| !self.profile_deletion_quarantines(space.profile))
+            })
             .or_else(|| {
                 self.profiles
                     .default_profile()

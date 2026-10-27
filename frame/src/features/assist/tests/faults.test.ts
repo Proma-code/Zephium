@@ -158,6 +158,7 @@ test("post-admission and unclassified HTTP failures warn that the request may ha
 
 test("all native ChatGPT issues produce finite copyable codes and actionable text", () => {
   const issues = [
+    "retired",
     "invalid_request",
     "signed_out",
     "not_eligible",
@@ -278,4 +279,60 @@ test("missing accounting for a continuation is a halt, not a malformed or reject
     fix: null,
     diagnostic: { uncertain: true },
   });
+});
+
+test("native Codex history states preserve distinct evidence without automatic replay", () => {
+  const uncertain = faultView({ reason: "native_conversation", fault: "history_uncertain" });
+  expect(uncertain).toMatchObject({
+    retry: "no",
+    diagnostic: { code: "CODEX/HISTORY_UNCERTAIN", uncertain: false },
+  });
+  expect(uncertain.message).toContain("final reply");
+  const diverged = faultView({ reason: "native_conversation", fault: "history_diverged" });
+  expect(diverged).toMatchObject({
+    retry: "no",
+    diagnostic: { code: "CODEX/HISTORY_DIVERGED", uncertain: false },
+  });
+  expect(diverged.message).toContain("not part of the original Codex thread");
+  expect(diverged.message).not.toContain("signed out");
+});
+
+test.each([
+  "unavailable",
+  "unsupported_input",
+  "scope_changed",
+  "protocol",
+  "limit",
+  "outcome_unknown",
+  "history_uncertain",
+  "history_diverged",
+  "upstream",
+  "timeout",
+  "cancelled",
+] as const)("Codex %s remains a finite native diagnostic", (fault) => {
+  const view = faultView({ reason: "native_conversation", fault });
+  expect(view.diagnostic?.code).toBe(`CODEX/${fault.toUpperCase()}`);
+  expect(view.message).not.toContain("Zephium AI");
+  expect(view.retry).toBe("no");
+});
+
+test("native proven not-sent is distinct from uncertain output and never auto-retries", () => {
+  const view = faultView({ reason: "native_conversation", fault: "not_sent" });
+  expect(view.message).toBe(
+    "This message was not sent to Codex. You can continue the conversation.",
+  );
+  expect(view.retry).toBe("no");
+  expect(view.diagnostic).toEqual({ code: "CODEX/NOT_SENT", uncertain: false });
+  expect(
+    faultView({ reason: "native_conversation", fault: "outcome_unknown" }).diagnostic?.uncertain,
+  ).toBe(true);
+});
+
+
+test("a retired direct source is actionable without a retry, inferred send or billing fallback", () => {
+  const view = faultView({ reason: "chat_gpt", fault: "retired" });
+  expect(view.message).toContain("retired");
+  expect(view.retry).toBe("no");
+  expect(view.diagnostic).toEqual({ code: "CHATGPT/LEGACY/-/RETIRED", uncertain: false });
+  expect(view.fix).not.toBeNull();
 });

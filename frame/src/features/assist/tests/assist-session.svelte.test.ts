@@ -12,8 +12,17 @@ vi.mock("$shared/ipc/bindings", async () => {
     pageAssistClose: native.close,
   });
 });
+const advisory = vi.hoisted(() => ({
+  listen: vi.fn(),
+  stop: vi.fn(),
+  pageStop: vi.fn(),
+  receive: null as (() => void) | null,
+}));
 vi.mock("$shared/ipc/native-events", () => ({
-  events: { pageAssistChanged: { listen: async () => () => {} } },
+  events: {
+    pageAssistChanged: { listen: async () => advisory.pageStop },
+    workModelsChanged: { listen: advisory.listen },
+  },
 }));
 const owners: AssistSession[] = [];
 const flush = async () => {
@@ -60,6 +69,14 @@ function expectDraft(session: AssistSession) {
   expect(session.notice).toEqual({ reason: "busy" });
 }
 beforeEach(() => {
+  advisory.stop.mockReset();
+  advisory.pageStop.mockReset();
+  advisory.listen.mockReset();
+  advisory.receive = null;
+  advisory.listen.mockImplementation(async (receive: () => void) => {
+    advisory.receive = receive;
+    return advisory.stop;
+  });
   for (const command of Object.values(native)) command.mockReset();
   native.close.mockResolvedValue(true);
   native.read.mockImplementation(async (space: string, tab: string | null) =>
@@ -176,4 +193,46 @@ test("disposing a profile ignores late completion without mutating its replaceme
   expect(native.ask).toHaveBeenCalledTimes(2);
   next.resolve({ reply: 2, fault: null });
   expect(await second).toBe(true);
+});
+
+test("native model readiness advisory refreshes Page without focus or settings, and disposes with its owner", async () => {
+  const session = await owner();
+  const before = native.read.mock.calls.length;
+  native.read.mockResolvedValue(status([], { availability: "no_model" }));
+  const stale = advisory.receive!;
+  stale();
+  await flush();
+  expect(native.read).toHaveBeenCalledTimes(before + 1);
+  expect(session.status?.availability).toBe("no_model");
+  native.read.mockResolvedValue(status());
+  stale();
+  await flush();
+  expect(session.status?.availability).toBe("ready");
+  session.dispose();
+  expect(advisory.stop).toHaveBeenCalledTimes(1);
+  expect(advisory.pageStop).toHaveBeenCalledTimes(1);
+  const stopped = native.read.mock.calls.length;
+  stale();
+  await flush();
+  expect(native.read).toHaveBeenCalledTimes(stopped);
+});
+
+test("a late model-listener registration is released after disposal, not adopted by a new lifetime", async () => {
+  let finish!: (stop: () => void) => void;
+  advisory.listen.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+  );
+  const session = new AssistSession("profile-a");
+  owners.push(session);
+  const starting = session.start();
+  await flush();
+  session.dispose();
+  const lateStop = vi.fn();
+  finish(lateStop);
+  await starting;
+  expect(lateStop).toHaveBeenCalledTimes(1);
+  expect(advisory.pageStop).toHaveBeenCalledTimes(1);
 });

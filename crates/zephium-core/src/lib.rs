@@ -3,8 +3,8 @@
 pub mod accelerator;
 pub mod blocker;
 pub mod bookmarks;
-pub mod commands;
 pub mod codex_store;
+pub mod commands;
 pub mod downloads;
 pub mod extensions;
 pub mod geometry;
@@ -18,6 +18,7 @@ pub mod macos;
 pub mod navigation;
 /// Markdown notes the person owns, described by an index built from the files.
 pub mod notes;
+pub mod page_choice;
 pub mod permissions;
 pub mod ports;
 pub mod profiles;

@@ -298,30 +298,30 @@ struct FakeModels {
 }
 
 impl ModelSource for FakeModels {
-    fn entry<'a>(&'a self, _profile: &'a ProfileId) -> BoxFuture<'a, Option<ModelChoice>> {
+    fn entry<'a>(&'a self, _profile: &'a ProfileId) -> BoxFuture<'a, Option<PageBackendChoice>> {
         let entry = self.entry.clone();
         let effort = self.effort;
         Box::pin(async move {
-            Some(ModelChoice {
+            Some(PageBackendChoice::Model(ModelChoice {
                 entry,
                 effort: Some(effort),
-            })
+            }))
         })
     }
     fn resolve<'a>(
         &'a self,
         _profile: &'a ProfileId,
         _source: WorkCallSource,
-    ) -> BoxFuture<'a, Result<ResolvedModel, WorkModelError>> {
+    ) -> BoxFuture<'a, Result<ResolvedPageBackend, PageBackendError>> {
         let entry = self.entry.clone();
         let client: Arc<dyn WorkModelClient> = self.client.clone();
         let effort = self.effort;
         Box::pin(async move {
-            Ok(ResolvedModel {
+            Ok(ResolvedPageBackend::Model(ResolvedModel {
                 entry,
                 effort: Some(effort),
                 client,
-            })
+            }))
         })
     }
 }
@@ -1685,17 +1685,12 @@ async fn real_page_prompt_and_tools_complete_through_offline_chatgpt_wire_withou
                     .all(|key| properties.contains_key(key.as_str().unwrap())));
             }
         }
-        assert!(body["input"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|message| message["role"] == "user"
-                && message["content"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|part| part["type"] == "input_text"
-                        && part["text"].as_str().unwrap().contains("مرحبا"))));
+        assert!(body["input"].as_array().unwrap().iter().any(|message| {
+            message["role"] == "user"
+                && message["content"].as_array().unwrap().iter().any(|part| {
+                    part["type"] == "input_text" && part["text"].as_str().unwrap().contains("مرحبا")
+                })
+        }));
     }
 }
 
@@ -2143,4 +2138,940 @@ async fn unknown_chatgpt_usage_keeps_cancellation_of_the_following_call() {
     ));
     assert_eq!(h.requests().len(), 2);
     assert_eq!(h.client.turns.lock().unwrap().len(), 1);
+}
+
+struct NativeFixture {
+    drafts: Mutex<Vec<NativeConversationDraft>>,
+    acquire_wait: Mutex<Option<oneshot::Receiver<()>>>,
+    response_wait: Mutex<Option<oneshot::Receiver<()>>>,
+    force_busy: AtomicBool,
+    reserved: AtomicBool,
+    released_unsent: std::sync::atomic::AtomicUsize,
+    reserve_failure: Mutex<Option<PageAssistNativeFaultV1>>,
+    validate_failure: Mutex<Option<PageAssistNativeFaultV1>>,
+    requests: Mutex<Vec<NativeConversationRequest>>,
+    callbacks: Mutex<Vec<NativeConversationEvents>>,
+    cancels: Mutex<Vec<Arc<AtomicBool>>>,
+    snapshots: Vec<String>,
+    outcome: Mutex<NativeConversationOutcome>,
+    hold: bool,
+    ignore_callback_error: bool,
+    failure: Mutex<Option<PageAssistNativeFaultV1>>,
+    dropped: Arc<AtomicBool>,
+}
+struct NativeFixtureCancel(Arc<AtomicBool>);
+impl Drop for NativeFixtureCancel {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+struct NativeFixtureReservation {
+    client: Arc<NativeFixture>,
+    draft: Option<NativeConversationDraft>,
+    handed: bool,
+}
+impl Drop for NativeFixtureReservation {
+    fn drop(&mut self) {
+        if !self.handed {
+            self.client.reserved.store(false, Ordering::SeqCst);
+            self.client.released_unsent.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+impl NativeConversationReservation for NativeFixtureReservation {
+    fn validate(&self) -> Result<(), PageAssistNativeFaultV1> {
+        self.client
+            .validate_failure
+            .lock()
+            .unwrap()
+            .map_or(Ok(()), Err)
+    }
+    fn commit(
+        mut self: Box<Self>,
+        reply: u32,
+        cancel: Arc<AtomicBool>,
+        events: NativeConversationEvents,
+    ) -> BoxFuture<'static, Result<NativeConversationOutcome, PageAssistNativeFaultV1>> {
+        // Exact actor handoff is synchronous, even when the returned waiter
+        // is dropped before its first poll.
+        self.handed = true;
+        let draft = self.draft.take().unwrap();
+        self.client
+            .requests
+            .lock()
+            .unwrap()
+            .push(NativeConversationRequest {
+                conversation: draft.conversation,
+                reply,
+                new_conversation: draft.new_conversation,
+                previous_reply: draft.previous_reply,
+                text: draft.text,
+            });
+        self.client.callbacks.lock().unwrap().push(events.clone());
+        self.client.cancels.lock().unwrap().push(cancel.clone());
+        let cancel_on_drop = NativeFixtureCancel(cancel);
+        let dropped = DropFlag(self.client.dropped.clone());
+        Box::pin(async move {
+            let _drop = dropped;
+            let _cancel = cancel_on_drop;
+            for text in &self.client.snapshots {
+                let result = events(NativeConversationEvent::TextSnapshot { text: text.clone() });
+                if !self.client.ignore_callback_error {
+                    result?;
+                }
+            }
+            let response_wait = self.client.response_wait.lock().unwrap().take();
+            if let Some(wait) = response_wait {
+                let _ = wait.await;
+            }
+            if self.client.hold {
+                std::future::pending::<()>().await;
+            }
+            if let Some(fault) = *self.client.failure.lock().unwrap() {
+                return Err(fault);
+            }
+            let result = self.client.outcome.lock().unwrap().clone();
+            // Only fixture actor settlement releases its dispatched slot.
+            // A dropped waiter does not fabricate this original disposition.
+            self.client.reserved.store(false, Ordering::SeqCst);
+            Ok(result)
+        })
+    }
+}
+struct NativeModels {
+    client: Arc<NativeFixture>,
+    changed: bool,
+}
+fn native_choice() -> NativeConversationChoice {
+    NativeConversationChoice {
+        id: "native-catalog-id".into(),
+        name: "Original Name".into(),
+        source: PageAssistModelSourceV1::Codex,
+        effort: Some("minimal".into()),
+    }
+}
+impl ModelSource for NativeModels {
+    fn entry<'a>(&'a self, _: &'a ProfileId) -> BoxFuture<'a, Option<PageBackendChoice>> {
+        Box::pin(async { Some(PageBackendChoice::NativeConversation(native_choice())) })
+    }
+    fn resolve<'a>(
+        &'a self,
+        _: &'a ProfileId,
+        _: WorkCallSource,
+    ) -> BoxFuture<'a, Result<ResolvedPageBackend, PageBackendError>> {
+        Box::pin(async {
+            panic!("native Page must reserve before transcript commit, never resolve in the turn")
+        })
+    }
+    fn reserve_native<'a>(
+        &'a self,
+        _: &'a ProfileId,
+        expected: NativeConversationChoice,
+        draft: NativeConversationDraft,
+    ) -> BoxFuture<'a, Result<Box<dyn NativeConversationReservation>, PageBackendError>> {
+        Box::pin(async move {
+            if self.changed || expected != native_choice() {
+                return Err(PageBackendError::NativeConversation(
+                    PageAssistNativeFaultV1::ScopeChanged,
+                ));
+            }
+            if let Some(fault) = *self.client.reserve_failure.lock().unwrap() {
+                return Err(PageBackendError::NativeConversation(fault));
+            }
+            if self.client.force_busy.load(Ordering::SeqCst)
+                || self
+                    .client
+                    .reserved
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+            {
+                return Err(PageBackendError::Busy);
+            }
+            self.client.drafts.lock().unwrap().push(draft.clone());
+            let reservation = Box::new(NativeFixtureReservation {
+                client: self.client.clone(),
+                draft: Some(draft),
+                handed: false,
+            });
+            let wait = self.client.acquire_wait.lock().unwrap().take();
+            if let Some(wait) = wait {
+                let _ = wait.await;
+            }
+            Ok(reservation as Box<dyn NativeConversationReservation>)
+        })
+    }
+}
+fn native_harness(
+    final_response: Option<&str>,
+    snapshots: Vec<String>,
+    hold: bool,
+    changed: bool,
+    ignore_callback_error: bool,
+) -> (Harness, Arc<NativeFixture>) {
+    let mut h = harness(vec![]);
+    let native = Arc::new(NativeFixture {
+        drafts: Mutex::new(Vec::new()),
+        acquire_wait: Mutex::new(None),
+        response_wait: Mutex::new(None),
+        force_busy: AtomicBool::new(false),
+        reserved: AtomicBool::new(false),
+        released_unsent: std::sync::atomic::AtomicUsize::new(0),
+        reserve_failure: Mutex::new(None),
+        validate_failure: Mutex::new(None),
+        requests: Mutex::new(Vec::new()),
+        callbacks: Mutex::new(Vec::new()),
+        cancels: Mutex::new(Vec::new()),
+        snapshots,
+        outcome: Mutex::new(NativeConversationOutcome {
+            status: NativeConversationStatus::Completed,
+            final_response: final_response.map(str::to_owned),
+        }),
+        hold,
+        ignore_callback_error,
+        failure: Mutex::new(None),
+        dropped: Arc::new(AtomicBool::new(false)),
+    });
+    let mut ports = h.service.ports().clone();
+    ports.models = Arc::new(NativeModels {
+        client: native.clone(),
+        changed,
+    });
+    h.service = PageAssist::new(ports);
+    (h, native)
+}
+
+#[tokio::test]
+async fn native_text_is_exact_and_has_no_page_history_tools_or_cost() {
+    let (h, native) = native_harness(
+        Some("Authoritative corrected answer"),
+        vec!["Provisional".into()],
+        false,
+        false,
+        false,
+    );
+    let status = h.service.status(SPACE, Some(TAB)).await;
+    let model = status.model.unwrap();
+    assert_eq!(model.name, "Original Name");
+    assert_eq!(model.source, PageAssistModelSourceV1::Codex);
+    assert_eq!(model.capabilities, PageAssistCapabilitiesV1::TextOnly);
+    assert_eq!(model.effort.as_deref(), Some("minimal"));
+    assert!(
+        status.page.is_none()
+            && status.selection.is_none()
+            && status.suggestions.is_empty()
+            && !status.can_pick
+    );
+    let words = "  مرحباً\r\n$50000\t<exact>  ";
+    h.ask(words, false).await.unwrap();
+    h.settle().await;
+    h.ask("Second exact question", false).await.unwrap();
+    h.settle().await;
+    let requests = native.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].text, words);
+    assert_eq!(requests[1].text, "Second exact question");
+    assert_eq!(requests[0].conversation, requests[1].conversation);
+    assert_ne!(requests[0].reply, requests[1].reply);
+    assert!(requests[0].new_conversation);
+    assert!(!requests[1].new_conversation);
+    assert_eq!(requests[0].previous_reply, None);
+    assert_eq!(requests[1].previous_reply, Some(requests[0].reply));
+    let callback = native.callbacks.lock().unwrap()[0].clone();
+    assert_eq!(
+        callback(NativeConversationEvent::TextSnapshot {
+            text: "late after completion".into()
+        }),
+        Err(PageAssistNativeFaultV1::Cancelled)
+    );
+    assert_eq!(h.page.lock().reads, 0);
+    assert!(
+        h.page.lock().acted.is_empty()
+            && h.work.0.lock().unwrap().is_empty()
+            && h.requests().is_empty()
+    );
+    assert_eq!(
+        h.blocks().await,
+        vec![PageAssistBlockV1::Text {
+            text: "Authoritative corrected answer".into(),
+            cites: vec![]
+        }]
+    );
+    assert!(matches!(
+        h.reply().await,
+        PageAssistMessageV1::Reply {
+            state: PageAssistReplyStateV1::Done,
+            cost: None,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn native_unsupported_input_is_refused_before_any_read_or_dispatch() {
+    let (h, native) = native_harness(Some("unused"), vec![], false, false, false);
+    let conversation = h.conversation().await;
+    for (suggestion, attachments) in [
+        (None, vec![PageAssistAttachV1::Page { tab: TAB.into() }]),
+        (
+            None,
+            vec![PageAssistAttachV1::Selection { tab: TAB.into() }],
+        ),
+        (
+            None,
+            vec![PageAssistAttachV1::Element {
+                tab: TAB.into(),
+                pick: "not-even-admitted".into(),
+            }],
+        ),
+        (Some(PageAssistSuggestionV1::Summarize), vec![]),
+    ] {
+        let result = h
+            .service
+            .ask(PageAssistAskV1 {
+                space: SPACE.into(),
+                conversation: conversation.clone(),
+                text: "Question".into(),
+                suggestion,
+                attachments,
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(PageAssistFaultV1::NativeConversation {
+                fault: PageAssistNativeFaultV1::UnsupportedInput
+            })
+        ));
+    }
+    assert_eq!(h.page.lock().reads, 0);
+    assert!(native.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn native_empty_completed_result_removes_provisional_text_without_fake_cost() {
+    let (h, _) = native_harness(None, vec!["not a final item".into()], false, false, false);
+    h.ask("hello", false).await.unwrap();
+    h.settle().await;
+    assert_eq!(
+        h.blocks().await,
+        vec![PageAssistBlockV1::Text {
+            text: String::new(),
+            cites: vec![]
+        }]
+    );
+    assert!(matches!(
+        h.reply().await,
+        PageAssistMessageV1::Reply {
+            state: PageAssistReplyStateV1::Done,
+            cost: None,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn native_changed_choice_and_oversize_output_never_dispatch_or_claim_done() {
+    let (h, native) = native_harness(Some("unused"), vec![], false, true, false);
+    assert_eq!(
+        h.ask("hello", false).await,
+        Err(PageAssistFaultV1::NativeConversation {
+            fault: PageAssistNativeFaultV1::ScopeChanged
+        })
+    );
+    assert!(native.requests.lock().unwrap().is_empty());
+    assert!(h
+        .service
+        .status(SPACE, Some(TAB))
+        .await
+        .conversation
+        .messages
+        .is_empty());
+    let (h, native) = native_harness(
+        Some("ignored callback failure must not hide overflow"),
+        vec!["x".repeat(24 * 1024 + 1)],
+        false,
+        false,
+        true,
+    );
+    h.ask("hello", false).await.unwrap();
+    h.settle().await;
+    assert_eq!(native.requests.lock().unwrap().len(), 1);
+    assert!(matches!(
+        h.reply().await,
+        PageAssistMessageV1::Reply {
+            state: PageAssistReplyStateV1::Failed,
+            fault: Some(PageAssistFaultV1::NativeConversation {
+                fault: PageAssistNativeFaultV1::Limit
+            }),
+            cost: None,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn native_stop_drops_owned_reply_and_rejects_retained_callback() {
+    let (h, native) = native_harness(None, vec!["partial".into()], true, false, false);
+    h.ask("hello", false).await.unwrap();
+    for _ in 0..20 {
+        if !h.blocks().await.is_empty() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(h.service.stop(SPACE));
+    h.settle().await;
+    assert!(native.dropped.load(Ordering::SeqCst));
+    let callback = native.callbacks.lock().unwrap()[0].clone();
+    assert_eq!(
+        callback(NativeConversationEvent::TextSnapshot {
+            text: "stale".into()
+        }),
+        Err(PageAssistNativeFaultV1::Cancelled)
+    );
+    assert_eq!(
+        h.blocks().await,
+        vec![PageAssistBlockV1::Text {
+            text: "partial".into(),
+            cites: vec![]
+        }]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn native_timeout_drops_reply_once_without_retry() {
+    let (h, native) = native_harness(None, vec![], true, false, false);
+    h.ask("hello", false).await.unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(91)).await;
+    h.settle().await;
+    assert!(native.dropped.load(Ordering::SeqCst));
+    assert_eq!(native.requests.lock().unwrap().len(), 1);
+    assert!(matches!(
+        h.reply().await,
+        PageAssistMessageV1::Reply {
+            fault: Some(PageAssistFaultV1::NativeConversation {
+                fault: PageAssistNativeFaultV1::Timeout
+            }),
+            cost: None,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn native_noncompleted_terminals_never_become_done_or_retry() {
+    for (status, expected_fault, expected_state) in [
+        (
+            NativeConversationStatus::Failed,
+            Some(PageAssistNativeFaultV1::Upstream),
+            PageAssistReplyStateV1::Failed,
+        ),
+        (
+            NativeConversationStatus::Unknown,
+            Some(PageAssistNativeFaultV1::OutcomeUnknown),
+            PageAssistReplyStateV1::Failed,
+        ),
+        (
+            NativeConversationStatus::Interrupted,
+            None,
+            PageAssistReplyStateV1::Cancelled,
+        ),
+    ] {
+        let (h, native) = native_harness(
+            Some("must not be called a final answer"),
+            vec!["partial".into()],
+            false,
+            false,
+            false,
+        );
+        native.outcome.lock().unwrap().status = status;
+        h.ask("hello", false).await.unwrap();
+        h.settle().await;
+        assert_eq!(native.requests.lock().unwrap().len(), 1);
+        let PageAssistMessageV1::Reply {
+            state, fault, cost, ..
+        } = h.reply().await
+        else {
+            panic!("reply");
+        };
+        assert_eq!(state, expected_state);
+        assert_eq!(
+            fault,
+            expected_fault.map(|fault| PageAssistFaultV1::NativeConversation { fault })
+        );
+        assert!(cost.is_none());
+        assert_eq!(
+            h.blocks().await,
+            vec![PageAssistBlockV1::Text {
+                text: "partial".into(),
+                cites: vec![]
+            }]
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_callback_fault_precedes_the_actors_following_transport_failure() {
+    let (h, native) = native_harness(None, vec!["x".repeat(24 * 1024 + 1)], false, false, true);
+    *native.failure.lock().unwrap() = Some(PageAssistNativeFaultV1::Cancelled);
+    h.ask("hello", false).await.unwrap();
+    h.settle().await;
+    assert!(matches!(
+        h.reply().await,
+        PageAssistMessageV1::Reply {
+            state: PageAssistReplyStateV1::Failed,
+            fault: Some(PageAssistFaultV1::NativeConversation {
+                fault: PageAssistNativeFaultV1::Limit
+            }),
+            cost: None,
+            ..
+        }
+    ));
+    assert_eq!(native.requests.lock().unwrap().len(), 1);
+    let callback = native.callbacks.lock().unwrap()[0].clone();
+    assert_eq!(
+        callback(NativeConversationEvent::TextSnapshot {
+            text: "stale".into()
+        }),
+        Err(PageAssistNativeFaultV1::Limit)
+    );
+}
+
+#[tokio::test]
+async fn native_genuine_terminal_survives_unconfirmed_local_history_settlement() {
+    let (h, native) = native_harness(
+        Some("Genuine original final answer"),
+        vec!["provisional".into()],
+        false,
+        false,
+        false,
+    );
+    native.outcome.lock().unwrap().status = NativeConversationStatus::HistoryUncertain;
+    h.ask("hello", false).await.unwrap();
+    h.settle().await;
+    assert_eq!(native.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        h.blocks().await,
+        vec![PageAssistBlockV1::Text {
+            text: "Genuine original final answer".into(),
+            cites: vec![]
+        }]
+    );
+    assert!(matches!(
+        h.reply().await,
+        PageAssistMessageV1::Reply {
+            state: PageAssistReplyStateV1::Failed,
+            fault: Some(PageAssistFaultV1::NativeConversation {
+                fault: PageAssistNativeFaultV1::HistoryUncertain
+            }),
+            cost: None,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn native_previous_reply_tracks_intervening_visible_non_native_history() {
+    let (h, native) = native_harness(Some("answer"), vec![], false, false, false);
+    h.ask("first", false).await.unwrap();
+    h.settle().await;
+    let conversation = h.conversation().await;
+    let intervening = {
+        let mut state = h.service.state();
+        let live = state.live.get_mut(&conversation).unwrap();
+        live.conversation
+            .say("Other backend question", None, vec![], None);
+        let (reply, _) = live.conversation.begin_reply();
+        live.conversation
+            .apply(reply, PageAssistEventV1::Done { cost: None });
+        reply
+    };
+    h.ask("next exact words", false).await.unwrap();
+    h.settle().await;
+    let requests = native.requests.lock().unwrap();
+    assert_eq!(requests[1].previous_reply, Some(intervening));
+    assert_ne!(requests[1].previous_reply, Some(requests[0].reply));
+    assert!(!requests[1].new_conversation);
+}
+
+#[tokio::test]
+async fn native_history_divergence_stays_distinct_from_unknown_provider_outcome() {
+    let (h, native) = native_harness(None, vec![], false, false, false);
+    *native.reserve_failure.lock().unwrap() = Some(PageAssistNativeFaultV1::HistoryDiverged);
+    assert_eq!(
+        h.ask("new exact question", false).await,
+        Err(PageAssistFaultV1::NativeConversation {
+            fault: PageAssistNativeFaultV1::HistoryDiverged
+        })
+    );
+    assert!(h
+        .service
+        .status(SPACE, Some(TAB))
+        .await
+        .conversation
+        .messages
+        .is_empty());
+    assert_eq!(h.page.lock().reads, 0);
+    assert!(h.requests().is_empty());
+}
+
+fn native_ask(conversation: String, text: &str) -> PageAssistAskV1 {
+    PageAssistAskV1 {
+        space: SPACE.into(),
+        conversation,
+        text: text.into(),
+        suggestion: None,
+        attachments: vec![],
+    }
+}
+async fn reserve_started(native: &NativeFixture) {
+    for _ in 0..100 {
+        if !native.drafts.lock().unwrap().is_empty() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("reservation did not start");
+}
+#[tokio::test]
+async fn native_busy_or_reserve_refusal_leaves_transcript_and_events_unchanged() {
+    for busy in [true, false] {
+        let (h, native) = native_harness(Some("unused"), vec![], false, false, false);
+        let before = h.service.status(SPACE, Some(TAB)).await.conversation;
+        let events = h.sink.0.lock().unwrap().len();
+        if busy {
+            native.force_busy.store(true, Ordering::SeqCst);
+        } else {
+            *native.reserve_failure.lock().unwrap() = Some(PageAssistNativeFaultV1::Unavailable);
+        }
+        let result = h
+            .service
+            .ask(native_ask(before.id.clone(), "not committed"))
+            .await;
+        assert!(matches!(
+            result,
+            Err(PageAssistFaultV1::Busy)
+                | Err(PageAssistFaultV1::NativeConversation {
+                    fault: PageAssistNativeFaultV1::Unavailable
+                })
+        ));
+        assert_eq!(
+            h.service.status(SPACE, Some(TAB)).await.conversation,
+            before
+        );
+        assert_eq!(h.sink.0.lock().unwrap().len(), events);
+        assert!(native.requests.lock().unwrap().is_empty());
+    }
+}
+#[tokio::test]
+async fn native_reservation_handoff_precedes_task_poll_and_dropped_waiter_keeps_actor_ownership() {
+    let (h, native) = native_harness(Some("answer"), vec![], false, false, false);
+    let conversation = h.conversation().await;
+    let (reply, task) = h
+        .service
+        .ask(native_ask(conversation.clone(), "  exact\r\nwords  "))
+        .await
+        .unwrap();
+    assert_eq!(native.requests.lock().unwrap().len(), 1);
+    assert!(native.reserved.load(Ordering::SeqCst));
+    assert_eq!(native.drafts.lock().unwrap()[0].text, "  exact\r\nwords  ");
+    task.await;
+    assert_eq!(native.requests.lock().unwrap().len(), 1);
+    assert_eq!(native.requests.lock().unwrap()[0].reply, reply);
+    assert!(!native.reserved.load(Ordering::SeqCst));
+    let (_, task) = h
+        .service
+        .ask(native_ask(conversation, "cancel before first poll"))
+        .await
+        .unwrap();
+    drop(task);
+    assert!(native.reserved.load(Ordering::SeqCst));
+    assert_eq!(native.released_unsent.load(Ordering::SeqCst), 0);
+    assert_eq!(native.requests.lock().unwrap().len(), 2);
+    assert!(native.dropped.load(Ordering::SeqCst));
+    let callback = native.callbacks.lock().unwrap().last().unwrap().clone();
+    assert_eq!(
+        callback(NativeConversationEvent::TextSnapshot {
+            text: "late".into()
+        }),
+        Err(PageAssistNativeFaultV1::Cancelled)
+    );
+}
+#[tokio::test]
+async fn native_held_reservation_does_not_append_and_competing_ask_is_busy() {
+    let (h, native) = native_harness(Some("answer"), vec![], false, false, false);
+    let before = h.service.status(SPACE, Some(TAB)).await.conversation;
+    let (release, wait) = oneshot::channel();
+    *native.acquire_wait.lock().unwrap() = Some(wait);
+    let service = h.service.clone();
+    let id = before.id.clone();
+    let first = tokio::spawn(async move { service.ask(native_ask(id, "first")).await });
+    reserve_started(&native).await;
+    assert_eq!(
+        h.service.status(SPACE, Some(TAB)).await.conversation,
+        before
+    );
+    assert!(matches!(
+        h.service.ask(native_ask(before.id, "second")).await,
+        Err(PageAssistFaultV1::Busy)
+    ));
+    assert!(native.requests.lock().unwrap().is_empty());
+    release.send(()).unwrap();
+    let (_, task) = first.await.unwrap().unwrap();
+    task.await;
+    assert_eq!(native.requests.lock().unwrap().len(), 1);
+    assert_eq!(native.requests.lock().unwrap()[0].text, "first");
+}
+#[tokio::test(start_paused = true)]
+async fn native_reserve_timeout_drops_queued_ownership_without_visible_history() {
+    let (h, native) = native_harness(Some("unused"), vec![], false, false, false);
+    let before = h.service.status(SPACE, Some(TAB)).await.conversation;
+    let (_release, wait) = oneshot::channel();
+    *native.acquire_wait.lock().unwrap() = Some(wait);
+    let service = h.service.clone();
+    let id = before.id.clone();
+    let task = tokio::spawn(async move { service.ask(native_ask(id, "timeout")).await });
+    reserve_started(&native).await;
+    tokio::time::advance(NATIVE_RESERVE_TIMEOUT + Duration::from_millis(1)).await;
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(PageAssistFaultV1::NativeConversation {
+            fault: PageAssistNativeFaultV1::Timeout
+        })
+    ));
+    assert!(!native.reserved.load(Ordering::SeqCst));
+    assert_eq!(native.released_unsent.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        h.service.status(SPACE, Some(TAB)).await.conversation,
+        before
+    );
+    assert!(native.requests.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn native_scope_validation_after_reserve_refuses_before_history_commit() {
+    let (h, native) = native_harness(Some("unused"), vec![], false, false, false);
+    let before = h.service.status(SPACE, Some(TAB)).await.conversation;
+    *native.validate_failure.lock().unwrap() = Some(PageAssistNativeFaultV1::ScopeChanged);
+    assert!(matches!(
+        h.service
+            .ask(native_ask(before.id.clone(), "scope changed"))
+            .await,
+        Err(PageAssistFaultV1::NativeConversation {
+            fault: PageAssistNativeFaultV1::ScopeChanged
+        })
+    ));
+    assert_eq!(
+        h.service.status(SPACE, Some(TAB)).await.conversation,
+        before
+    );
+    assert_eq!(native.released_unsent.load(Ordering::SeqCst), 1);
+    assert!(native.requests.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn native_revalidates_ai_transcript_and_same_conversation_reopen_after_reservation() {
+    for change in ["ai", "transcript", "reopen"] {
+        let (h, native) = native_harness(Some("first answer"), vec![], false, false, false);
+        h.ask("first", false).await.unwrap();
+        h.settle().await;
+        native.drafts.lock().unwrap().clear();
+        let before = h.service.status(SPACE, Some(TAB)).await.conversation;
+        let (release, wait) = oneshot::channel();
+        *native.acquire_wait.lock().unwrap() = Some(wait);
+        let service = h.service.clone();
+        let id = before.id.clone();
+        let task =
+            tokio::spawn(async move { service.ask(native_ask(id, "must not append")).await });
+        reserve_started(&native).await;
+        match change {
+            "ai" => {
+                h.ai.0.store(false, Ordering::Release);
+            }
+            "transcript" => {
+                let reply = before
+                    .messages
+                    .iter()
+                    .rev()
+                    .find_map(|m| {
+                        if let PageAssistMessageV1::Reply { id, .. } = m {
+                            Some(*id)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap();
+                h.service.apply(
+                    &before.id,
+                    reply,
+                    PageAssistEventV1::Cost {
+                        cost: PageAssistCostV1::Hosted {
+                            model: "fixture".into(),
+                            credits: Some("1".into()),
+                        },
+                    },
+                );
+            }
+            "reopen" => {
+                h.service.leave(SPACE);
+                let _ = h.service.current(SPACE, profile());
+                assert!(h.service.open(SPACE, &before.id));
+            }
+            _ => unreachable!(),
+        }
+        release.send(()).unwrap();
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(PageAssistFaultV1::AiOff)
+                | Err(PageAssistFaultV1::NativeConversation {
+                    fault: PageAssistNativeFaultV1::ScopeChanged
+                })
+        ));
+        let state = h.service.state();
+        assert_eq!(
+            state.live[&before.id].conversation.messages().len(),
+            before.messages.len()
+        );
+        drop(state);
+        assert_eq!(native.requests.lock().unwrap().len(), 1);
+        assert_eq!(native.released_unsent.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn native_dropped_unpolled_or_inflight_waiter_cleans_only_page_lifetime_not_actor_slot() {
+    for polled in [false, true] {
+        let (h, native) = native_harness(Some("not yet delivered"), vec![], true, false, false);
+        let id = h.conversation().await;
+        let (_, task) = h
+            .service
+            .ask(native_ask(id.clone(), "words"))
+            .await
+            .unwrap();
+        assert_eq!(native.requests.lock().unwrap().len(), 1);
+        if polled {
+            let running = tokio::spawn(task);
+            tokio::task::yield_now().await;
+            running.abort();
+            let _ = running.await;
+        } else {
+            drop(task);
+        }
+        assert!(!h.service.state().running.contains_key(&id));
+        assert!(native.reserved.load(Ordering::SeqCst));
+        assert!(native.dropped.load(Ordering::SeqCst));
+        assert_eq!(native.released_unsent.load(Ordering::SeqCst), 0);
+        assert!(h.sink.0.lock().unwrap().iter().any(|event| matches!(
+            event.kind,
+            PageAssistEventV1::Failed {
+                fault: PageAssistFaultV1::NativeConversation {
+                    fault: PageAssistNativeFaultV1::OutcomeUnknown
+                }
+            }
+        )));
+        assert!(!h
+            .sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.kind, PageAssistEventV1::Done { .. })));
+        assert!(matches!(
+            h.service.ask(native_ask(id, "explicit next attempt")).await,
+            Err(PageAssistFaultV1::Busy)
+        ));
+        assert_eq!(native.requests.lock().unwrap().len(), 1);
+    }
+}
+#[tokio::test]
+async fn native_dropped_old_waiter_does_not_clear_replacement_page_lifetime() {
+    let (h, native) = native_harness(Some("answer"), vec![], true, false, false);
+    let id = h.conversation().await;
+    let (reply, task) = h.service.ask(native_ask(id.clone(), "old")).await.unwrap();
+    let replacement = Arc::new(Cancel::default());
+    {
+        let mut state = h.service.state();
+        let running = state.running.get_mut(&id).unwrap();
+        // Even a reused reply number is not the same native Page lifetime.
+        running.cancel = replacement.clone();
+    }
+    let before = h.sink.0.lock().unwrap().len();
+    drop(task);
+    let state = h.service.state();
+    let running = state.running.get(&id).unwrap();
+    assert_eq!(running.reply, reply);
+    assert!(Arc::ptr_eq(&running.cancel, &replacement));
+    assert_eq!(h.sink.0.lock().unwrap().len(), before);
+    assert!(native.reserved.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn native_stop_before_first_waiter_poll_reaches_the_exact_writer_cancel_bit() {
+    let (h, native) = native_harness(None, vec![], true, false, false);
+    let id = h.conversation().await;
+    let (_, task) = h
+        .service
+        .ask(native_ask(id, "stop while queued"))
+        .await
+        .unwrap();
+    let cancel = native.cancels.lock().unwrap()[0].clone();
+    assert!(!cancel.load(Ordering::Acquire));
+    assert!(h.service.stop(SPACE));
+    assert!(cancel.load(Ordering::Acquire));
+    assert!(native.reserved.load(Ordering::SeqCst));
+    assert_eq!(native.requests.lock().unwrap().len(), 1);
+    drop(task);
+    assert!(native.reserved.load(Ordering::SeqCst));
+    assert_eq!(native.released_unsent.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn native_proven_never_started_is_not_sent_not_done_or_interrupted() {
+    let (h, native) = native_harness(None, vec![], false, false, false);
+    native.outcome.lock().unwrap().status = NativeConversationStatus::NeverStarted;
+    h.ask("not sent after proven actor disposition", false)
+        .await
+        .unwrap();
+    h.settle().await;
+    assert_eq!(native.requests.lock().unwrap().len(), 1);
+    assert!(h.sink.0.lock().unwrap().iter().any(|event| matches!(
+        event.kind,
+        PageAssistEventV1::Failed {
+            fault: PageAssistFaultV1::NativeConversation {
+                fault: PageAssistNativeFaultV1::NotSent
+            }
+        }
+    )));
+    assert!(!h.sink.0.lock().unwrap().iter().any(|event| matches!(
+        event.kind,
+        PageAssistEventV1::Done { .. } | PageAssistEventV1::Cancelled
+    )));
+    assert!(h.blocks().await.is_empty());
+}
+
+#[tokio::test]
+async fn native_old_polled_terminal_cannot_mutate_or_clear_same_number_new_lifetime() {
+    let (h, native) = native_harness(Some("old terminal"), vec![], false, false, false);
+    let (release, wait) = oneshot::channel();
+    *native.response_wait.lock().unwrap() = Some(wait);
+    let id = h.conversation().await;
+    let (reply, task) = h
+        .service
+        .ask(native_ask(id.clone(), "old question"))
+        .await
+        .unwrap();
+    let task = tokio::spawn(task);
+    tokio::task::yield_now().await;
+    let replacement = Arc::new(Cancel::default());
+    {
+        let mut state = h.service.state();
+        state.running.get_mut(&id).unwrap().cancel = replacement.clone();
+    }
+    let before = h.sink.0.lock().unwrap().len();
+    release.send(()).unwrap();
+    task.await.unwrap();
+    let state = h.service.state();
+    let running = state.running.get(&id).unwrap();
+    assert_eq!(running.reply, reply);
+    assert!(Arc::ptr_eq(&running.cancel, &replacement));
+    assert_eq!(h.sink.0.lock().unwrap().len(), before);
+    assert_eq!(native.requests.lock().unwrap().len(), 1);
 }

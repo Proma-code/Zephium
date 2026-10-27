@@ -1,7 +1,7 @@
 //! Serialized, profile-bound barriers for original Codex thread continuity.
 use super::*;
 use zephium_core::codex_store::{
-    Association, Call, Dispatch, Fault, MAX_ASSOCIATIONS, Reply, Scope, Terminal,
+    Association, Call, Dispatch, Fault, Reply, Scope, Terminal, MAX_ASSOCIATIONS,
 };
 
 impl Hub {
@@ -19,6 +19,17 @@ impl Hub {
             Ok(conn) => conn,
             Err(_) => return Reply::Failed(Fault::Unavailable),
         };
+        if matches!(call, Call::InspectOwner) {
+            // Owner plus association absence must be one coherent read snapshot.
+            // This transaction performs no SQL writes and grants no admission.
+            return (|| {
+                let tx = conn.transaction()?;
+                let reply = execute(&tx, Call::InspectOwner)?;
+                tx.commit()?;
+                Ok::<_, rusqlite::Error>(reply)
+            })()
+            .unwrap_or(Reply::Failed(Fault::Corrupt));
+        }
         if !call.mutates() {
             return execute(conn, call).unwrap_or(Reply::Failed(Fault::Corrupt));
         }
@@ -127,6 +138,38 @@ fn next_revision(revision: u64) -> Option<u64> {
     revision.checked_add(1).filter(|v| *v <= i64::MAX as u64)
 }
 fn execute(conn: &Connection, call: Call) -> rusqlite::Result<Reply> {
+    if matches!(call, Call::InspectOwner) {
+        let current = scope(conn)?;
+        let owners: i64 =
+            conn.query_row("SELECT count(*) FROM codex_owner", [], |row| row.get(0))?;
+        if owners != i64::from(current.is_some()) {
+            return failed(Fault::Corrupt);
+        }
+        let count: i64 = conn.query_row("SELECT count(*) FROM codex_conversations", [], |row| {
+            row.get(0)
+        })?;
+        if count < 0 || count > MAX_ASSOCIATIONS as i64 || (current.is_none() && count != 0) {
+            return failed(Fault::Corrupt);
+        }
+        if let Some(owner) = current {
+            let mut statement = conn.prepare("SELECT conversation FROM codex_conversations")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                let conversation = row?;
+                if !zephium_core::codex_store::valid_conversation(&conversation) {
+                    return failed(Fault::Corrupt);
+                }
+                let value = read(conn, &conversation)?.ok_or(rusqlite::Error::InvalidQuery)?;
+                if value.scope.incarnation != owner.incarnation
+                    || value.scope.grant_epoch > owner.grant_epoch
+                {
+                    return failed(Fault::Corrupt);
+                }
+            }
+        }
+        return Ok(Reply::Owner(current));
+    }
+
     if let Call::History { conversation } = &call {
         let value = read(conn, conversation)?;
         if let Some(value) = &value {
@@ -168,7 +211,7 @@ fn execute(conn: &Connection, call: Call) -> rusqlite::Result<Reply> {
         | Call::Begin { scope, .. }
         | Call::RecordTurn { scope, .. }
         | Call::Settle { scope, .. } => *scope,
-        Call::Open { .. } | Call::History { .. } => unreachable!(),
+        Call::InspectOwner | Call::Open { .. } | Call::History { .. } => unreachable!(),
     };
     let Some(current) = scope(conn)? else {
         return failed(Fault::Conflict);

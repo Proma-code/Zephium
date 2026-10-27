@@ -864,13 +864,12 @@ fn schema_allows_absent_thread_only_for_explicit_skipped_and_preserves_unique_or
         (1, 2, None, None),
         (2, 2, Some("turn"), Some(1)),
     ] {
-        assert!(
-            conn.execute(
+        assert!(conn
+            .execute(
                 "INSERT INTO codex_conversations VALUES('bad',?1,1,NULL,1,?2,?3,?4,?5)",
                 params![[7_u8; 16].as_slice(), state, reply, turn, outcome]
             )
-            .is_err()
-        );
+            .is_err());
     }
     for page in ["skip-a", "skip-b"] {
         conn.execute(
@@ -879,25 +878,23 @@ fn schema_allows_absent_thread_only_for_explicit_skipped_and_preserves_unique_or
         )
         .unwrap();
     }
-    assert!(
-        conn.execute(
+    assert!(conn
+        .execute(
             "UPDATE codex_conversations SET turn_id='not-unsent' WHERE conversation='skip-a'",
             []
         )
-        .is_err()
-    );
+        .is_err());
     conn.execute(
         "UPDATE codex_conversations SET thread_id='owned' WHERE conversation='skip-a'",
         [],
     )
     .unwrap();
-    assert!(
-        conn.execute(
+    assert!(conn
+        .execute(
             "UPDATE codex_conversations SET thread_id='owned' WHERE conversation='skip-b'",
             []
         )
-        .is_err()
-    );
+        .is_err());
 }
 #[test]
 fn skipped_none_reopens_as_history_not_a_thread_or_permission_to_replay() {
@@ -993,4 +990,119 @@ fn skipped_none_reopens_as_history_not_a_thread_or_permission_to_replay() {
         .unwrap(),
         Reply::Failed(Fault::IncarnationMismatch)
     );
+}
+
+#[test]
+fn inspect_owner_is_read_only_registered_and_preserves_real_scope() {
+    let mut hub = Hub::in_memory().unwrap();
+    let profile = ProfileId::from(731);
+    assert_eq!(
+        hub.codex_call(profile, Call::InspectOwner),
+        Reply::Failed(Fault::NotRegistered)
+    );
+    hub.registry.insert(profile);
+    assert_eq!(
+        hub.codex_call(profile, Call::InspectOwner),
+        Reply::Owner(None)
+    );
+    assert_eq!(
+        hub.codex_call(profile, Call::InspectOwner),
+        Reply::Owner(None)
+    );
+    let conn = hub.profile_conn(profile).unwrap();
+    assert_eq!(
+        conn.query_row::<i64, _, _>("SELECT count(*) FROM codex_owner", [], |row| row.get(0))
+            .unwrap(),
+        0
+    );
+    let Reply::Scope(scope) = hub.codex_call(
+        profile,
+        Call::Open {
+            incarnation: [7; 16],
+        },
+    ) else {
+        panic!("open")
+    };
+    assert_eq!(
+        hub.codex_call(profile, Call::InspectOwner),
+        Reply::Owner(Some(scope))
+    );
+    let association = bind(&mut hub, profile, scope);
+    assert_eq!(
+        hub.codex_call(profile, Call::InspectOwner),
+        Reply::Owner(Some(scope))
+    );
+    assert_eq!(
+        hub.codex_call(
+            profile,
+            Call::Load {
+                scope,
+                conversation: association.conversation.clone()
+            }
+        ),
+        Reply::Association(Some(association))
+    );
+    hub.registry.remove(&profile);
+    assert_eq!(
+        hub.codex_call(profile, Call::InspectOwner),
+        Reply::Failed(Fault::NotRegistered)
+    );
+}
+#[test]
+fn inspect_owner_never_reports_unbound_for_orphan_or_malformed_state() {
+    let (mut hub, profile, scope) = setup();
+    bind(&mut hub, profile, scope);
+    hub.profile_conn(profile)
+        .unwrap()
+        .execute("DELETE FROM codex_owner", [])
+        .unwrap();
+    assert_eq!(
+        hub.codex_call(profile, Call::InspectOwner),
+        Reply::Failed(Fault::Corrupt)
+    );
+    let (mut hub, profile, scope) = setup();
+    bind(&mut hub, profile, scope);
+    hub.profile_conn(profile)
+        .unwrap()
+        .execute(
+            "UPDATE codex_conversations SET incarnation=?1",
+            [[9u8; 16].as_slice()],
+        )
+        .unwrap();
+    assert_eq!(
+        hub.codex_call(profile, Call::InspectOwner),
+        Reply::Failed(Fault::Corrupt)
+    );
+    let (mut hub, profile, _) = setup();
+    hub.profile_conn(profile)
+        .unwrap()
+        .execute("PRAGMA ignore_check_constraints=ON", [])
+        .unwrap();
+    hub.profile_conn(profile)
+        .unwrap()
+        .execute("UPDATE codex_owner SET grant_epoch=0", [])
+        .unwrap();
+    assert_eq!(
+        hub.codex_call(profile, Call::InspectOwner),
+        Reply::Failed(Fault::Corrupt)
+    );
+}
+
+#[test]
+fn inspect_owner_rejects_unrecognized_or_extra_owner_rows() {
+    for remove_recognized in [false, true] {
+        let (mut hub, profile, _) = setup();
+        let conn = hub.profile_conn(profile).unwrap();
+        conn.execute("PRAGMA ignore_check_constraints=ON", [])
+            .unwrap();
+        conn.execute("INSERT INTO codex_owner(singleton,schema_version,incarnation,grant_epoch) VALUES(2,1,?1,1)", [[8u8;16].as_slice()]).unwrap();
+        if remove_recognized {
+            conn.execute("DELETE FROM codex_owner WHERE singleton=1", [])
+                .unwrap();
+        }
+        assert_eq!(
+            hub.codex_call(profile, Call::InspectOwner),
+            Reply::Failed(Fault::Corrupt)
+        );
+    }
 }

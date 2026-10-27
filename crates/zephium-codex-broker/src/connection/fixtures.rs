@@ -29,7 +29,9 @@ impl Associations for MemoryAssociations {
         }
         let fail = durable::Reply::Failed(durable::Fault::Conflict);
         let requested = match &call {
-            durable::Call::Open { .. } | durable::Call::History { .. } => None,
+            durable::Call::Open { .. }
+            | durable::Call::History { .. }
+            | durable::Call::InspectOwner => None,
             durable::Call::AdvanceGrant { expected } => Some(*expected),
             durable::Call::Load { scope, .. }
             | durable::Call::Bind { scope, .. }
@@ -42,6 +44,7 @@ impl Associations for MemoryAssociations {
             return durable::Reply::Failed(durable::Fault::StaleGrant);
         }
         match call {
+            durable::Call::InspectOwner => durable::Reply::Owner(memory.scope),
             durable::Call::Open { incarnation } => {
                 if let Some(scope) = memory.scope {
                     if scope.incarnation != incarnation {
@@ -338,7 +341,7 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
             scope: association_scope,
         },
         ConfigProjection::V164Plus,
-        Instant::now() + Duration::from_secs(10),
+        PreparationBudget::ordinary(Instant::now() + Duration::from_secs(10)).into(),
         &cancel,
     )
     .map_err(|_| "owner-handshake")?;
@@ -355,6 +358,7 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
     let mut guarded_failure = false;
     let mut history_uncertain = false;
     let mut skipped = 0;
+    let mut quota_fault = None;
     let skips_success = matches!(
         scenario,
         Scenario::CancelBeforeActor
@@ -414,14 +418,29 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
                         .refresh_catalog(&scope, &cancel)
                         .map_err(|_| "owner-model-list")?;
                 }
+                Event::Quota(view) => {
+                    if let zephium_provider_accounts::quota::QuotaState::Error(fault) = view.state {
+                        quota_fault = Some(fault);
+                    }
+                }
                 Event::Catalog(_) if !started => {
                     started = true;
+                    if matches!(scenario, Scenario::QuotaExpired) {
+                        // Controlled elapsed observation deadline, not a changed
+                        // production timeout. Its eventual owned reply is late.
+                        let pending = connection
+                            .pending
+                            .values_mut()
+                            .find(|pending| matches!(pending.kind, PendingKind::Quota(_)))
+                            .ok_or("quota-pending-fixture")?;
+                        pending.deadline = Instant::now();
+                    }
                     let mut text = if matches!(scenario, Scenario::ColdRestore) {
                         request(2, false)
                     } else {
                         request(1, true)
                     };
-                    if matches!(scenario, Scenario::TwoTurns) {
+                    if scenario.three_turns() {
                         text.effort = EffortSelection::Default;
                     }
                     text.admission =
@@ -479,6 +498,9 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
                     terminals += 1;
                     let expected = match scenario {
                         Scenario::TwoTurns
+                        | Scenario::QuotaExpired
+                        | Scenario::QuotaMalformed
+                        | Scenario::QuotaRefused
                         | Scenario::ColdRestore
                         | Scenario::CancelBeforeActor
                         | Scenario::CancelDuringPreparation
@@ -486,7 +508,9 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
                         | Scenario::CancelBeforeWrite => conversation::Outcome::Completed,
                         Scenario::Cancel => conversation::Outcome::Interrupted,
                         Scenario::Invalidate => conversation::Outcome::Unknown,
-                        Scenario::RevisionBeforeWrite
+                        Scenario::QuotaReplacement
+                        | Scenario::QuotaCoalesced
+                        | Scenario::RevisionBeforeWrite
                         | Scenario::LostSettleAck
                         | Scenario::LostStartAck
                         | Scenario::LostBindAck
@@ -505,7 +529,7 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
                     {
                         return Err("owner-cold-text");
                     }
-                    if matches!(scenario, Scenario::TwoTurns)
+                    if scenario.three_turns()
                         && result.final_response()
                             != Some(match terminals {
                                 1 => "synthetic first answer",
@@ -518,7 +542,7 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
                 }
                 Event::Conversation(conversation::Event::Closed { .. }) => {
                     closed += 1;
-                    if matches!(scenario, Scenario::TwoTurns) && !second {
+                    if scenario.three_turns() && !second {
                         let mut divergent = request(2, false);
                         divergent.previous_reply = Some(99);
                         if connection.start_text(&scope, divergent, &cancel)
@@ -532,7 +556,7 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
                         connection
                             .start_text(&scope, next, &cancel)
                             .map_err(|_| "owner-second")?;
-                    } else if matches!(scenario, Scenario::TwoTurns) && closed == 2 && !third {
+                    } else if scenario.three_turns() && closed == 2 && !third {
                         third = true;
                         let mut next = request(3, false);
                         next.previous_reply = Some(2);
@@ -587,13 +611,30 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
                 } else {
                     2
                 })
-            || (matches!(scenario, Scenario::TwoTurns) && closed == 3)
+            || (scenario.three_turns() && closed == 3)
             || (matches!(scenario, Scenario::Cancel | Scenario::ColdRestore) && closed == 1)
         {
-            if (matches!(scenario, Scenario::TwoTurns) && (terminals != 3 || !retried || !third))
+            if (scenario.three_turns() && (terminals != 3 || !retried || !third))
                 || (matches!(scenario, Scenario::Cancel | Scenario::ColdRestore) && terminals != 1)
             {
                 return Err("owner-counts");
+            }
+            if matches!(scenario, Scenario::QuotaExpired)
+                && quota_fault != Some(zephium_provider_accounts::quota::QuotaFault::TimedOut)
+            {
+                return Err("quota-expiry-not-observed");
+            }
+            if matches!(scenario, Scenario::QuotaMalformed)
+                && quota_fault
+                    != Some(zephium_provider_accounts::quota::QuotaFault::InvalidPercentage)
+            {
+                return Err("quota-malformation-not-observed");
+            }
+            if matches!(scenario, Scenario::QuotaRefused)
+                && quota_fault
+                    != Some(zephium_provider_accounts::quota::QuotaFault::ProviderRefused)
+            {
+                return Err("quota-refusal-not-observed");
             }
             connection.close().map_err(|_| "owner-transcript-close")?;
             break;
@@ -608,7 +649,7 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
         }
     } else {
         let record = record.ok_or("owner-store-record")?;
-        if matches!(scenario, Scenario::TwoTurns)
+        if scenario.three_turns()
             && (!matches!(record.dispatch, durable::Dispatch::Settled { reply: 3, .. })
                 || record.thread_id.as_deref() != Some("synthetic-owned-thread"))
         {
@@ -697,4 +738,125 @@ pub(crate) fn qualify() -> Result<(), &'static str> {
         println!("{marker}: native-code=0");
     }
     Ok(())
+}
+
+/// Separate later qualifier; the existing fifteen-owner inventory is unchanged.
+pub(crate) fn qualify_quota() -> Result<(), &'static str> {
+    quota_replacement(Scenario::QuotaReplacement)?;
+    println!("codex-quota-account-replacement-late-reply-ignored: native-code=0");
+    quota_replacement(Scenario::QuotaCoalesced)?;
+    println!("codex-quota-same-pump-account-replacement-coalesced: native-code=0");
+    for (scenario, marker) in [
+        (
+            Scenario::QuotaRefused,
+            "codex-quota-provider-refusal-turn-settled",
+        ),
+        (
+            Scenario::QuotaExpired,
+            "codex-quota-expired-read-late-reply-turn-settled",
+        ),
+        (
+            Scenario::QuotaMalformed,
+            "codex-quota-malformed-reading-turn-settled",
+        ),
+    ] {
+        run(scenario)?;
+        println!("{marker}: native-code=0");
+    }
+    Ok(())
+}
+
+fn quota_replacement(scenario: Scenario) -> Result<(), &'static str> {
+    let (session, runtime) = crate::windows::fixtures::owner_session(scenario)?;
+    let mut adapter = MemoryAssociations::default();
+    let store_scope = durable::Scope {
+        incarnation: [8; 16],
+        grant_epoch: 1,
+    };
+    if adapter.call(durable::Call::Open {
+        incarnation: store_scope.incarnation,
+    }) != durable::Reply::Scope(store_scope)
+    {
+        return Err("quota-store");
+    }
+    let scope =
+        Scope::new("synthetic-quota-profile".into(), [7; 16], 1).map_err(|_| "quota-scope")?;
+    let stop = AtomicBool::new(false);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut owner = Connection::bootstrap_session(
+        scope.clone(),
+        session,
+        runtime.clone(),
+        StoreBinding {
+            associations: Box::new(adapter),
+            scope: store_scope,
+        },
+        ConfigProjection::V164Plus,
+        PreparationBudget::ordinary(deadline).into(),
+        &stop,
+    )
+    .map_err(|_| "quota-bootstrap")?;
+    let mut ready = 0;
+    let mut reread = false;
+    loop {
+        if Instant::now() >= deadline {
+            return Err("quota-replacement-timeout");
+        }
+        let events = owner
+            .poll(&scope, &stop)
+            .map_err(|_| "quota-replacement-poll")?;
+        for event in events {
+            match event.into_event() {
+                Event::Account(AccountState::ChatGpt) => {
+                    ready += 1;
+                    if ready == 1 && matches!(scenario, Scenario::QuotaCoalesced) {
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(runtime.temp().join("quota-batch-go"))
+                            .map_err(|_| "quota-batch-go")?;
+                        while !runtime.temp().join("quota-batch-ready").exists() {
+                            if Instant::now() >= deadline {
+                                return Err("quota-batch-ready");
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                }
+                Event::Account(AccountState::Unknown) if ready == 1 && !reread => {
+                    reread = true;
+                    owner
+                        .read_account(&scope, &stop)
+                        .map_err(|_| "quota-new-account-read")?;
+                }
+                Event::Quota(view)
+                    if matches!(
+                        view.state,
+                        zephium_provider_accounts::quota::QuotaState::Available(_)
+                            | zephium_provider_accounts::quota::QuotaState::Stale { .. }
+                    ) =>
+                {
+                    return Err("quota-old-account-leak")
+                }
+                _ => (),
+            }
+        }
+        if ready == 2 && owner.pending.is_empty() {
+            let view = owner.quota(&scope).map_err(|_| "quota-new-projection")?;
+            if view.checking
+                || !matches!(
+                    view.state,
+                    zephium_provider_accounts::quota::QuotaState::Unavailable(_)
+                )
+            {
+                return Err("quota-replaced-projection");
+            }
+            owner.close().map_err(|_| "quota-replacement-close")?;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Arc::try_unwrap(runtime)
+        .map_err(|_| "quota-runtime-retained")?
+        .close()
 }

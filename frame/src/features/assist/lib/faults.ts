@@ -6,6 +6,7 @@ import type {
   ChatGptModelFault,
   PageAssistAvailabilityV1,
   PageAssistFaultV1,
+  PageAssistNativeFaultV1,
 } from "$shared/ipc/bindings";
 
 type FaultFix = { label: string; command: string };
@@ -33,6 +34,7 @@ const models = (label: string): FaultFix => ({ label, command: "settings.ai" });
 
 /** Every way a reply can end early, said as the person can act on it. */
 export function faultView(reason: PageAssistFaultV1): FaultView {
+  if (reason.reason === "native_conversation") return nativeConversationFault(reason.fault);
   if (reason.reason === "chat_gpt") return chatGptFault(reason.fault);
   if (reason.reason !== "model") return pageFault(reason.reason);
   const view = modelFault(reason.fault);
@@ -40,6 +42,36 @@ export function faultView(reason: PageAssistFaultV1): FaultView {
   if (milliseconds !== null && Number.isSafeInteger(milliseconds) && milliseconds > 0)
     return { ...view, wait: Math.ceil(milliseconds / 1000) };
   return view.retry === "wait" ? { ...view, retry: "now", wait: null } : view;
+}
+
+const nativeConversationMessages = {
+  unavailable: m.assist_codex_unavailable,
+  unsupported_input: m.assist_codex_unsupported_input,
+  scope_changed: m.assist_codex_scope_changed,
+  protocol: m.assist_codex_protocol,
+  limit: m.assist_codex_limit,
+  outcome_unknown: m.assist_codex_unknown,
+  history_uncertain: m.assist_codex_history_uncertain,
+  history_diverged: m.assist_codex_history_diverged,
+  not_sent: m.assist_codex_not_sent,
+  upstream: m.assist_codex_upstream,
+  timeout: m.assist_codex_timeout,
+  cancelled: m.assist_codex_cancelled,
+} satisfies Record<PageAssistNativeFaultV1, () => string>;
+
+function nativeConversationFault(value: PageAssistNativeFaultV1): FaultView {
+  const fault = Object.hasOwn(nativeConversationMessages, value) ? value : "protocol";
+  return {
+    message: nativeConversationMessages[fault](),
+    fix: ["unavailable", "scope_changed"].includes(fault)
+      ? models(m.assist_fix_open_models())
+      : null,
+    retry: "no",
+    diagnostic: {
+      code: `CODEX/${fault.toUpperCase()}`,
+      uncertain: ["outcome_unknown", "timeout", "protocol"].includes(fault),
+    },
+  };
 }
 
 const chatGptStages = {
@@ -62,6 +94,7 @@ const chatGptFields = {
 } satisfies Record<ChatGptFailureField, string>;
 
 const chatGptIssues = {
+  retired: { code: "RETIRED", message: m.assist_chatgpt_retired, retry: "no" },
   invalid_request: {
     code: "INVALID_REQUEST",
     message: m.assist_chatgpt_invalid_request,
@@ -119,7 +152,7 @@ function chatGptFault(fault: ChatGptModelFault): FaultView {
     message: classification.message(),
     retry: classification.retry,
     fix:
-      knownIssue === "signed_out" || knownIssue === "not_eligible" || knownIssue === "unsupported"
+      knownIssue === "retired" || knownIssue === "signed_out" || knownIssue === "not_eligible" || knownIssue === "unsupported"
         ? models(m.assist_fix_open_models())
         : null,
     diagnostic: {
@@ -210,7 +243,9 @@ function modelFault(fault: Extract<PageAssistFaultV1, { reason: "model" }>["faul
   }
 }
 
-function pageFault(reason: Exclude<PageAssistFaultV1["reason"], "model" | "chat_gpt">): FaultView {
+function pageFault(
+  reason: Exclude<PageAssistFaultV1["reason"], "model" | "chat_gpt" | "native_conversation">,
+): FaultView {
   switch (reason) {
     case "unreadable":
       return { message: m.assist_fault_unreadable(), fix: null, retry: "now" };

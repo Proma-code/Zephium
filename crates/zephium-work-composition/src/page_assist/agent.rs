@@ -22,8 +22,9 @@ use zephium_page_assist::stream::CiteRewriter;
 use zephium_page_assist::{css, guard, prompt, suggest, text};
 
 use super::port::{
-    BringRequest, Glow, ReadFailure, ResolvedModel, Role, StepEffect, StepFailure, StepRequest,
-    WorkStart,
+    BringRequest, Glow, NativeConversationEvent, NativeConversationReservation,
+    NativeConversationStatus, PageBackendChoice, PageBackendError, ReadFailure, ResolvedModel,
+    ResolvedPageBackend, Role, StepEffect, StepFailure, StepRequest, WorkStart,
 };
 use super::tools::{self, Call, ItemCall};
 use super::{
@@ -55,6 +56,8 @@ pub(super) struct Reply {
     pub(super) profile: ProfileId,
     pub(super) reply: u32,
     pub(super) words: String,
+    pub(super) native: std::sync::Mutex<Option<NativeTurn>>,
+    pub(super) backend: PageBackendChoice,
     pub(super) suggestion: Option<PageAssistSuggestionV1>,
     pub(super) attachments: Vec<Admitted>,
     pub(super) cancel: Arc<Cancel>,
@@ -95,7 +98,27 @@ type ToolOutcome = Result<String, String>;
 
 impl Reply {
     fn apply(&self, kind: PageAssistEventV1) -> bool {
-        self.service.apply(&self.conversation, self.reply, kind)
+        if !matches!(self.backend, PageBackendChoice::NativeConversation(_)) {
+            return self.service.apply(&self.conversation, self.reply, kind);
+        }
+        let event = {
+            let mut state = self.service.state();
+            if state.running.get(&self.conversation).is_none_or(|running| {
+                running.reply != self.reply || !Arc::ptr_eq(&running.cancel, &self.cancel)
+            }) {
+                return false;
+            }
+            state.live.get_mut(&self.conversation).and_then(|live| {
+                let event = live.conversation.apply(self.reply, kind);
+                if event.is_some() {
+                    live.revision = Arc::new(());
+                }
+                event
+            })
+        };
+        let sent = event.is_some();
+        self.service.emit_all(event);
+        sent
     }
 
     fn note(&self, fact: std::fmt::Arguments<'_>) {
@@ -285,11 +308,11 @@ impl Reply {
             match tokio::time::timeout(READ_TIMEOUT, ports.page.read(tab, facts.epoch)).await {
                 Ok(Ok(readout)) if readout.epoch == facts.epoch => readout,
                 Ok(Ok(_)) | Ok(Err(ReadFailure::PageChanged)) => {
-                    return Err(PageAssistFaultV1::PageChanged)
+                    return Err(PageAssistFaultV1::PageChanged);
                 }
                 Ok(Err(ReadFailure::NotReady)) => return Err(PageAssistFaultV1::Loading),
                 Ok(Err(ReadFailure::Unavailable)) | Err(_) => {
-                    return Err(PageAssistFaultV1::Unreadable)
+                    return Err(PageAssistFaultV1::Unreadable);
                 }
             };
         let page = readout::page_read(
@@ -522,8 +545,104 @@ fn add_usage(total: &mut WorkModelUsage, usage: &WorkModelUsage) {
     };
 }
 
+/// Only native turns need an eager handoff followed by an independently
+/// cancellable waiter. This guard never releases actor-owned turn capacity.
+struct NativeTaskGuard {
+    service: PageAssist,
+    conversation: String,
+    reply: u32,
+    cancel: Arc<Cancel>,
+    callback_state: Arc<std::sync::Mutex<NativeCallbackState>>,
+    leased: Arc<AtomicBool>,
+    finished: bool,
+}
+impl Drop for NativeTaskGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.callback_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .open = false;
+        self.cancel.cancel(CancelReason::Gone);
+        self.leased.store(false, Ordering::Release);
+        let event = {
+            let mut state = self.service.state();
+            if state.running.get(&self.conversation).is_none_or(|running| {
+                running.reply != self.reply || !Arc::ptr_eq(&running.cancel, &self.cancel)
+            }) {
+                return;
+            }
+            state.running.remove(&self.conversation);
+            state.live.get_mut(&self.conversation).and_then(|live| {
+                let event = live.conversation.apply(
+                    self.reply,
+                    PageAssistEventV1::Failed {
+                        fault: PageAssistFaultV1::NativeConversation {
+                            fault: PageAssistNativeFaultV1::OutcomeUnknown,
+                        },
+                    },
+                );
+                if event.is_some() {
+                    live.revision = Arc::new(());
+                }
+                event
+            })
+        };
+        self.service.emit_all(event);
+        self.service.persist(&self.conversation);
+    }
+}
+struct NativeTask {
+    // Drop callback/lifetime guard before the owned waiter; its cancellation
+    // guard then signals the native actor, without freeing its turn slot.
+    guard: NativeTaskGuard,
+    inner: super::TurnTask,
+}
+impl std::future::Future for NativeTask {
+    type Output = ();
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let this = self.get_mut();
+        let result = this.inner.as_mut().poll(cx);
+        if result.is_ready() {
+            this.guard.finished = true;
+        }
+        result
+    }
+}
+pub(super) fn task(reply: Reply) -> super::TurnTask {
+    let callback_state = reply
+        .native
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .map(|turn| turn.callback_state.clone());
+    match callback_state {
+        Some(callback_state) => {
+            let guard = NativeTaskGuard {
+                service: reply.service.clone(),
+                conversation: reply.conversation.clone(),
+                reply: reply.reply,
+                cancel: reply.cancel.clone(),
+                callback_state,
+                leased: reply.leased.clone(),
+                finished: false,
+            };
+            Box::pin(NativeTask {
+                guard,
+                inner: Box::pin(run(reply)),
+            })
+        }
+        None => Box::pin(run(reply)),
+    }
+}
+
 /// Runs one admitted reply to its end.
-pub(super) async fn run(reply: Reply) {
+async fn run(reply: Reply) {
     let end = tokio::select! {
         biased;
         reason = reply.cancel.cancelled() => End::Cancelled(reason),
@@ -556,7 +675,11 @@ pub(super) async fn run(reply: Reply) {
         if state
             .running
             .get(&reply.conversation)
-            .is_some_and(|running| running.reply == reply.reply)
+            .is_some_and(|running| {
+                running.reply == reply.reply
+                    && (!matches!(reply.backend, PageBackendChoice::NativeConversation(_))
+                        || Arc::ptr_eq(&running.cancel, &reply.cancel))
+            })
         {
             state.running.remove(&reply.conversation);
         }
@@ -564,16 +687,172 @@ pub(super) async fn run(reply: Reply) {
     reply.service.persist(&reply.conversation);
 }
 
+fn native_fault(fault: PageAssistNativeFaultV1) -> End {
+    End::Failed(PageAssistFaultV1::NativeConversation { fault })
+}
+
+/// Fences callbacks even if a broken adapter retains them after the future ends.
+struct NativeCallbackState {
+    open: bool,
+    fault: Option<PageAssistNativeFaultV1>,
+}
+struct NativeCallbackLease(Arc<std::sync::Mutex<NativeCallbackState>>);
+impl Drop for NativeCallbackLease {
+    fn drop(&mut self) {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).open = false;
+    }
+}
+
+pub(super) struct NativeTurn {
+    future: super::port::BoxFuture<
+        'static,
+        Result<super::port::NativeConversationOutcome, PageAssistNativeFaultV1>,
+    >,
+    callback_state: Arc<std::sync::Mutex<NativeCallbackState>>,
+    _lease: NativeCallbackLease,
+    deadline: tokio::time::Instant,
+}
+/// Synchronous local handoff before a caller can drop an unpolled TurnTask.
+/// Native callbacks may arrive immediately; Page's running identity is installed.
+pub(super) fn commit_native(reply: &Reply, native: Box<dyn NativeConversationReservation>) {
+    debug_assert!(reply.suggestion.is_none() && reply.attachments.is_empty());
+    let active = Arc::new(std::sync::Mutex::new(NativeCallbackState {
+        open: true,
+        fault: None,
+    }));
+    let callback_state = active.clone();
+    let _lease = NativeCallbackLease(active.clone());
+    let service = reply.service.clone();
+    let conversation = reply.conversation.clone();
+    let reply_id = reply.reply;
+    let cancel = reply.cancel.clone();
+    let events: super::port::NativeConversationEvents = Arc::new(move |event| {
+        let mut active = active.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(fault) = active.fault {
+            return Err(fault);
+        }
+        if !active.open || cancel.reason().is_some() {
+            return Err(PageAssistNativeFaultV1::Cancelled);
+        }
+        let NativeConversationEvent::TextSnapshot { text } = event;
+        if text.len() > zephium_page_assist::conversation::MAX_TEXT_BYTES {
+            active.fault = Some(PageAssistNativeFaultV1::Limit);
+            return Err(PageAssistNativeFaultV1::Limit);
+        }
+        let event = {
+            let mut state = service.state();
+            if state.running.get(&conversation).is_none_or(|running| {
+                running.reply != reply_id || !Arc::ptr_eq(&running.cancel, &cancel)
+            }) {
+                active.fault = Some(PageAssistNativeFaultV1::ScopeChanged);
+                return Err(PageAssistNativeFaultV1::ScopeChanged);
+            }
+            state
+                .live
+                .get_mut(&conversation)
+                .and_then(|live| {
+                    let event = live
+                        .conversation
+                        .apply(reply_id, PageAssistEventV1::TextSnapshot { block: 0, text });
+                    if event.is_some() {
+                        live.revision = Arc::new(());
+                    }
+                    event
+                })
+                .ok_or(PageAssistNativeFaultV1::ScopeChanged)?
+        };
+        service.emit_all([event]);
+        Ok(())
+    });
+    let future = native.commit(reply.reply, reply.cancel.native.clone(), events);
+    *reply.native.lock().unwrap_or_else(|p| p.into_inner()) = Some(NativeTurn {
+        future,
+        callback_state,
+        _lease,
+        deadline: tokio::time::Instant::now() + CALL_TIMEOUT,
+    });
+}
+
+async fn native_body(reply: &Reply, native: NativeTurn) -> End {
+    let NativeTurn {
+        future,
+        callback_state,
+        _lease,
+        deadline,
+    } = native;
+    let result = tokio::time::timeout_at(deadline, future).await;
+    let callback_fault = {
+        let mut state = callback_state.lock().unwrap_or_else(|p| p.into_inner());
+        // Join callbacks before projecting the authoritative terminal text.
+        // A retained emitter cannot race a late delta over that final snapshot.
+        state.open = false;
+        state.fault
+    };
+    if let Some(fault) = callback_fault {
+        return native_fault(fault);
+    }
+    let outcome = match result {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(fault)) => return native_fault(fault),
+        Err(_) => return native_fault(PageAssistNativeFaultV1::Timeout),
+    };
+    match outcome.status {
+        NativeConversationStatus::Completed | NativeConversationStatus::HistoryUncertain => {
+            let text = outcome.final_response.unwrap_or_default();
+            if text.len() > zephium_page_assist::conversation::MAX_TEXT_BYTES {
+                return native_fault(PageAssistNativeFaultV1::Limit);
+            }
+            if !reply.apply(PageAssistEventV1::TextSnapshot { block: 0, text }) {
+                return native_fault(PageAssistNativeFaultV1::ScopeChanged);
+            }
+            if outcome.status == NativeConversationStatus::HistoryUncertain {
+                native_fault(PageAssistNativeFaultV1::HistoryUncertain)
+            } else {
+                End::Done(None)
+            }
+        }
+        NativeConversationStatus::NeverStarted => {
+            if outcome.final_response.is_some() {
+                native_fault(PageAssistNativeFaultV1::Protocol)
+            } else {
+                native_fault(PageAssistNativeFaultV1::NotSent)
+            }
+        }
+        NativeConversationStatus::Interrupted => End::Cancelled(CancelReason::Stopped),
+        NativeConversationStatus::Failed => native_fault(PageAssistNativeFaultV1::Upstream),
+        NativeConversationStatus::Unknown => native_fault(PageAssistNativeFaultV1::OutcomeUnknown),
+    }
+}
+
 async fn body(reply: &Reply) -> End {
     let ports = reply.service.ports();
+    if matches!(&reply.backend, PageBackendChoice::NativeConversation(_)) {
+        let reservation = reply
+            .native
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        return match reservation {
+            Some(reservation) => native_body(reply, reservation).await,
+            None => native_fault(PageAssistNativeFaultV1::ScopeChanged),
+        };
+    }
     let source = WorkCallSource::Page {
         conversation: reply.conversation.clone(),
         reply: reply.reply,
     };
     reply.phase(Some(PageAssistPhaseV1::Thinking));
-    let model = match ports.models.resolve(&reply.profile, source).await {
-        Ok(model) => model,
-        Err(error) => return End::Failed(fault::model_fault(error, false)),
+    let backend = match ports.models.resolve(&reply.profile, source).await {
+        Ok(backend) => backend,
+        Err(PageBackendError::Busy) => return End::Failed(PageAssistFaultV1::Busy),
+        Err(PageBackendError::Model(error)) => {
+            return End::Failed(fault::model_fault(error, false));
+        }
+        Err(PageBackendError::NativeConversation(fault)) => return native_fault(fault),
+    };
+    let model = match (&reply.backend, backend) {
+        (PageBackendChoice::Model(_), ResolvedPageBackend::Model(model)) => model,
+        _ => return native_fault(PageAssistNativeFaultV1::ScopeChanged),
     };
     let hosted = model.entry.model.provider == zephium_core::work::model::WorkModelProvider::Cloud;
     reply.note(format_args!(
@@ -1127,7 +1406,10 @@ async fn read_after_open(reply: &Reply, tab: &str, host: &str, place: &str) -> T
     }
     reply.phase(Some(PageAssistPhaseV1::Thinking));
     match read {
-        Ok(index) => Ok(format!("Opened {host} in {place} ({handle}).\n{}", reply.page_block(index))),
+        Ok(index) => Ok(format!(
+            "Opened {host} in {place} ({handle}).\n{}",
+            reply.page_block(index)
+        )),
         Err(PageAssistFaultV1::Sensitive) => Ok(format!(
             "Opened {host} in {place} ({handle}). It is a sensitive site and is never read; the person continues there."
         )),
@@ -1214,7 +1496,9 @@ async fn restyle(
         )
     });
     reply.phase(Some(PageAssistPhaseV1::Thinking));
-    Ok(format!("Proposed “{summary}” for {site}: {rules} rules passed. The person applies it from the card."))
+    Ok(format!(
+        "Proposed “{summary}” for {site}: {rules} rules passed. The person applies it from the card."
+    ))
 }
 
 fn transcript(reply: &Reply) -> String {

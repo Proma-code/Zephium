@@ -209,7 +209,10 @@ impl QuotaWindow {
 pub struct QuotaBucket {
     /// Bounded machine bucket identifier, if reported; never an account identifier.
     pub id: Option<String>,
-    /// Optional known plan or `Other`; no arbitrary plan or label text is retained.
+    /// Optional bounded original bucket label, for escaped text presentation only.
+    /// It is not an account identifier, model selection, or entitlement claim.
+    pub name: Option<String>,
+    /// Optional known plan or `Other`; no arbitrary plan text is retained.
     pub plan: Option<QuotaPlan>,
     /// Only windows actually present in this bucket, not inferred from its plan.
     pub windows: Vec<QuotaWindow>,
@@ -484,6 +487,7 @@ pub fn parse_claude_statusline(
         if !windows.is_empty() {
             buckets.push(QuotaBucket {
                 id: None,
+                name: None,
                 plan: None,
                 windows,
             });
@@ -598,6 +602,15 @@ fn codex_bucket(value: &Value, map_id: Option<&str>) -> Result<QuotaBucket, Quot
     if map_id.zip(reported_id).is_some_and(|(key, id)| key != id) {
         return Err(QuotaFault::InvalidShape);
     }
+    let name = present(fields, "limitName")
+        .map(|value| {
+            let name = value.as_str().ok_or(QuotaFault::InvalidShape)?;
+            if name.len() > 256 || name.chars().any(char::is_control) {
+                return Err(QuotaFault::InvalidShape);
+            }
+            Ok(name.to_owned())
+        })
+        .transpose()?;
     let plan = present(fields, "planType")
         .map(|value| {
             Ok(match value.as_str().ok_or(QuotaFault::InvalidShape)? {
@@ -620,6 +633,9 @@ fn codex_bucket(value: &Value, map_id: Option<&str>) -> Result<QuotaBucket, Quot
     ] {
         if let Some(window) = present(fields, field) {
             let fields = object(window)?;
+            // Original core protocol RateLimitWindow documents 0–100 in both
+            // rust-v0.163.0 and rust-v0.164.0. The app-server's i32 transport
+            // representation does not independently authorize out-of-range data.
             let used_percent = optional_number(
                 fields,
                 "usedPercent",
@@ -637,6 +653,7 @@ fn codex_bucket(value: &Value, map_id: Option<&str>) -> Result<QuotaBucket, Quot
     }
     Ok(QuotaBucket {
         id: map_id.or(reported_id).map(str::to_owned),
+        name,
         plan,
         windows,
     })

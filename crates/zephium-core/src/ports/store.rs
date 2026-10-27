@@ -532,6 +532,16 @@ pub trait Store {
         AppSettingReadback::Unavailable
     }
 
+    /// Reads or atomically commits this registered profile's complete Page choice.
+    /// Committed is returned only after the durable transaction and readback.
+    fn page_choice_call(
+        &self,
+        _profile: ProfileId,
+        _call: crate::page_choice::Call,
+    ) -> crate::page_choice::Reply {
+        crate::page_choice::Reply::Failed(crate::page_choice::Fault::Unavailable)
+    }
+
     /// Enqueues an ordered application-setting mutation. `true` means the
     /// bounded adapter accepted the command; durability is established by a
     /// later `flush`/`flush_until` barrier. `false` is a definite rejection.

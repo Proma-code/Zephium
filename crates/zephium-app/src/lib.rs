@@ -35,6 +35,7 @@ mod actor;
 mod api;
 mod lookup;
 mod onboarding;
+pub mod profile_removal;
 mod reply;
 mod shell;
 mod store_reads;

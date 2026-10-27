@@ -11,7 +11,7 @@ import { PROFILE, entry, models } from "$shared/testing/work-models";
 import { goView, goQuotaReading } from "$shared/testing/opencode-go";
 import { gatewayView } from "$shared/testing/gateway";
 import { chatgptView } from "$shared/testing/chatgpt";
-import type { ChatGptViewV1 } from "$shared/ipc/chatgpt-bindings";
+import { codexView } from "$shared/testing/codex";
 import { emitNativeEvent } from "$shared/testing/native-events";
 import { accountFixture } from "$shared/testing/account";
 
@@ -51,6 +51,26 @@ vi.mock("$shared/ipc/bindings", async () => {
   });
 });
 
+const codex = vi.hoisted(() => ({
+  read: vi.fn(),
+  check: vi.fn(),
+  connect: vi.fn(),
+  cancel: vi.fn(),
+  logout: vi.fn(),
+  models: vi.fn(),
+  select: vi.fn(),
+}));
+vi.mock("$shared/ipc/codex-bindings", () => ({
+  commands: {
+    codexAccount: codex.read,
+    codexCheckConnection: codex.check,
+    codexConnect: codex.connect,
+    codexCancelLogin: codex.cancel,
+    codexLogout: codex.logout,
+    codexRefreshModels: codex.models,
+    codexSelectModel: codex.select,
+  },
+}));
 const chatgpt = vi.hoisted(() => ({
   read: vi.fn(),
   signIn: vi.fn(),
@@ -62,10 +82,7 @@ vi.mock("$shared/ipc/chatgpt-bindings", async () => {
   const { mockChatGptBindings } = await import("$shared/testing/chatgpt");
   return mockChatGptBindings({
     chatgptAccount: chatgpt.read,
-    chatgptSignIn: chatgpt.signIn,
-    chatgptCancel: chatgpt.cancel,
     chatgptSignOut: chatgpt.signOut,
-    chatgptRefreshModels: chatgpt.models,
   });
 });
 const go = vi.hoisted(() => ({
@@ -93,6 +110,8 @@ vi.mock("$shared/ipc/gateway-bindings", async () => {
   });
 });
 beforeEach(() => {
+  for (const command of Object.values(codex)) command.mockReset();
+
   for (const command of Object.values(go)) command.mockReset();
   go.read.mockResolvedValue(goView(PROFILE));
   go.disconnect.mockResolvedValue(goView(PROFILE));
@@ -103,9 +122,6 @@ beforeEach(() => {
   native.openUrl.mockRejectedValue(new Error("mock browser unavailable"));
   for (const command of Object.values(chatgpt)) command.mockReset();
   chatgpt.read.mockResolvedValue(chatgptView(PROFILE));
-  chatgpt.signIn.mockImplementation(async (_profile: string, attempt: string) =>
-    chatgptView(PROFILE, { state: "signing_in", login_attempt: attempt }),
-  );
   chatgpt.cancel.mockResolvedValue(chatgptView(PROFILE));
   chatgpt.signOut.mockResolvedValue(chatgptView(PROFILE));
 });
@@ -133,7 +149,9 @@ test("the trigger is the model's mark and words, and the menu changes the model"
   native.choose.mockResolvedValue(view("openai/gpt-6-sol", "openai/gpt-6-sol"));
   const screen = await render(ModelPicker, { profile: PROFILE, onsettings: vi.fn() });
 
-  const trigger = screen.getByRole("button", { name: "Model: Claude Opus 5.5, Medium effort" });
+  const trigger = screen.getByRole("button", {
+    name: "Work · Model: Claude Opus 5.5, Medium effort",
+  });
   await expect.element(trigger).toHaveTextContent(/Opus 5\.5\s*·\s*Medium/u);
   expect(trigger.element().querySelector("svg")).not.toBeNull();
   await trigger.click();
@@ -501,7 +519,7 @@ test("a model whose wire sets no effort shows no effort control", async () => {
   });
   native.read.mockResolvedValue(plain);
   const screen = await render(ModelPicker, { profile: PROFILE, onsettings: vi.fn() });
-  await screen.getByRole("button", { name: "Model: Mistral Medium 3.5" }).click();
+  await screen.getByRole("button", { name: "Work · Model: Mistral Medium 3.5" }).click();
   await expect
     .element(page.getByRole("option", { name: /Mistral Medium 3\.5/u }))
     .toHaveAttribute("aria-selected", "true");
@@ -518,7 +536,9 @@ test("without any key the control opens provider connection choices, not an API-
   await screen.getByRole("button", { name: "Connect a model" }).click();
   await page.getByRole("tab", { name: "OpenAI, choose a connection" }).click();
   await expect.element(page.getByRole("button", { name: "API key", exact: true })).toBeVisible();
-  await expect.element(page.getByRole("button", { name: "ChatGPT", exact: true })).toBeVisible();
+  expect(
+    page.getByRole("button", { name: "Legacy direct account", exact: true }).query(),
+  ).toBeNull();
   expect(onsettings).not.toHaveBeenCalled();
   expect(chatgpt.signIn).not.toHaveBeenCalled();
 });
@@ -679,24 +699,6 @@ test("a hosted model the plan leaves out names the plan that opens it and leads 
   expect(native.command).toHaveBeenCalledWith("settings.account");
 });
 
-test("ChatGPT models have a usable picker seat without an OpenAI API key", async () => {
-  native.ready.mockImplementation(ready(true));
-  native.account.mockResolvedValue({ account: accountFixture(), fault: null, retry_after: null });
-  const accountModel = entry("open_ai", "gpt-account", "GPT Account", false, ["lead"], {
-    id: "chatgpt/gpt-account",
-    price: null,
-  });
-  const accountView = models({});
-  accountView.entries.push(accountModel);
-  accountView.effective.lead = accountModel.id;
-  native.read.mockResolvedValue(accountView);
-  const screen = await render(ModelPicker, { profile: PROFILE, onsettings: vi.fn() });
-  await screen.getByRole("button", { name: "Model: GPT Account" }).click();
-  await expect.element(page.getByRole("tab", { name: "OpenAI", exact: true })).toBeVisible();
-  await expect.element(page.getByRole("option", { name: /GPT Account/u })).toBeVisible();
-  await expect.element(page.getByRole("option", { name: /GPT-6 Sol/u })).not.toBeInTheDocument();
-});
-
 function bothConnections() {
   const value = view("openai/gpt-6-luna");
   value.entries.push(
@@ -708,173 +710,31 @@ function bothConnections() {
   return value;
 }
 
-test("one OpenAI provider keeps clean model names and separates source catalogs outside their titles", async () => {
-  native.ready.mockImplementation(ready(true));
-  native.read.mockResolvedValue(bothConnections());
-  native.account.mockResolvedValue({ account: accountFixture(), fault: null, retry_after: null });
-  native.choose.mockClear();
-  chatgpt.read.mockResolvedValue(chatgptView(PROFILE, { state: "connected", models: 1 }));
-  const screen = await render(ModelPicker, { profile: PROFILE });
-  const trigger = screen.getByRole("button", { name: /Model: GPT-6 Luna/u });
-  await trigger.click();
-  expect(page.getByRole("tab", { name: "OpenAI", exact: true }).all()).toHaveLength(1);
-  await expect
-    .element(page.getByRole("option", { name: /GPT-6 Luna/u }))
-    .toHaveAttribute("data-id", "openai/gpt-6-luna");
-  await page.getByRole("button", { name: "ChatGPT", exact: true }).click();
-  await expect
-    .element(page.getByRole("option", { name: /GPT-6 Luna/u }))
-    .toHaveAttribute("data-id", "chatgpt/gpt-6-luna");
-  await expect.element(trigger).not.toHaveTextContent("API");
-  await expect.element(trigger).not.toHaveTextContent("ChatGPT");
-  expect(native.choose).not.toHaveBeenCalled();
-  await page.getByRole("button", { name: "Search models" }).click();
-  await page.getByRole("combobox").fill("gpt-6 luna");
-  const api = page.getByRole("group", { name: "OpenAI · API key", exact: true });
-  const account = page.getByRole("group", { name: "OpenAI · ChatGPT", exact: true });
-  await expect
-    .element(api.getByRole("option", { name: /GPT-6 Luna/u }))
-    .toHaveAttribute("data-id", "openai/gpt-6-luna");
-  await expect
-    .element(account.getByRole("option", { name: /GPT-6 Luna/u }))
-    .toHaveAttribute("data-id", "chatgpt/gpt-6-luna");
-});
-
-test("the OpenAI source choice starts native login only after explicit consent, and switching cancels its own pending attempt", async () => {
-  native.ready.mockImplementation(ready(false));
-  native.read.mockResolvedValue(models({}));
-  native.choose.mockClear();
-  let finish!: (view: ChatGptViewV1) => void;
-  chatgpt.signIn.mockImplementation(
-    () => new Promise<ChatGptViewV1>((resolve) => (finish = resolve)),
-  );
-  const screen = await render(ModelPicker, { profile: PROFILE });
-  await screen.getByRole("button", { name: "Connect a model" }).click();
-  await page.getByRole("tab", { name: "OpenAI, choose a connection" }).click();
-  const source = page.getByRole("button", { name: "ChatGPT", exact: true });
-  (source.element() as HTMLElement).focus();
-  await userEvent.keyboard("{Enter}");
-  await expect
-    .element(page.getByText("Continue opens your system browser", { exact: false }))
-    .toBeVisible();
-  expect(chatgpt.signIn).not.toHaveBeenCalled();
-  const consent = page.getByRole("button", { name: "Continue with ChatGPT" });
-  (consent.element() as HTMLElement).focus();
-  await userEvent.keyboard("{Enter}");
-  await expect.element(page.getByRole("button", { name: "Cancel sign-in" })).toBeVisible();
-  await expect.element(page.getByRole("button", { name: "Cancel sign-in" })).toHaveFocus();
-  await page.getByRole("button", { name: "API key", exact: true }).click();
-  await expect.element(page.getByRole("button", { name: "Add key", exact: true })).toBeVisible();
-  await expect.poll(() => chatgpt.cancel.mock.calls.length).toBe(1);
-  expect(chatgpt.cancel).toHaveBeenCalledWith(PROFILE, chatgpt.signIn.mock.calls[0]![1]);
-  finish(chatgptView(PROFILE, { state: "connected", email: "stale@example.com", models: 1 }));
-  await page.getByRole("button", { name: "ChatGPT", exact: true }).click();
-  await expect.element(page.getByText("Not connected", { exact: true })).toBeVisible();
-  expect(page.getByText("stale@example.com", { exact: false }).query()).toBeNull();
-  expect(native.choose).not.toHaveBeenCalled();
-});
-
-test("Escape cancels a pending popover sign-in and reopening observes instead of restarting", async () => {
-  native.ready.mockImplementation(ready(true));
-  native.read.mockResolvedValue(view("openai/gpt-6-luna"));
-  const screen = await render(ModelPicker, { profile: PROFILE });
-  await screen.getByRole("button", { name: /Model: GPT-6 Luna/u }).click();
-  await page.getByRole("button", { name: "ChatGPT", exact: true }).click();
-  await page.getByRole("button", { name: "Continue with ChatGPT" }).click();
-  await userEvent.keyboard("{Escape}");
-  await expect.poll(() => chatgpt.cancel.mock.calls.length).toBe(1);
-  await screen.getByRole("button", { name: /Model: GPT-6 Luna/u }).click();
-  await page.getByRole("button", { name: "ChatGPT", exact: true }).click();
-  await expect.element(page.getByText("Not connected", { exact: true })).toBeVisible();
-  expect(chatgpt.signIn).toHaveBeenCalledTimes(1);
-});
-
-test("disconnecting ChatGPT keeps the API catalog and does not select a billing fallback", async () => {
-  native.ready.mockImplementation(ready(true));
-  native.read.mockResolvedValue(bothConnections());
-  native.choose.mockClear();
-  chatgpt.read.mockResolvedValue(chatgptView(PROFILE, { state: "connected", models: 1 }));
-  const screen = await render(ModelPicker, { profile: PROFILE });
-  await screen.getByRole("button", { name: /Model: GPT-6 Luna/u }).click();
-  await page.getByRole("button", { name: "ChatGPT", exact: true }).click();
-  await page.getByRole("button", { name: "Disconnect ChatGPT" }).click();
-  await expect.element(page.getByText("Not connected", { exact: true })).toBeVisible();
-  native.read.mockResolvedValue(view("openai/gpt-6-luna"));
-  emitNativeEvent("workModelsChanged", { version: 1 });
-  await page.getByRole("button", { name: "API key", exact: true }).click();
-  await expect.element(page.getByRole("option", { name: /GPT-6 Luna/u })).toBeVisible();
-  expect(chatgpt.signOut).toHaveBeenCalledExactlyOnceWith(PROFILE);
-  expect(native.choose).not.toHaveBeenCalled();
-});
-
-test("subscription quota stays unknown with no external button masquerading as an in-app check", async () => {
-  native.ready.mockImplementation(ready(true));
-  native.read.mockResolvedValue(bothConnections());
-  native.choose.mockClear();
-  chatgpt.read.mockResolvedValue(chatgptView(PROFILE, { state: "connected", models: 1 }));
-  const screen = await render(ModelPicker, { profile: PROFILE });
-  await screen.getByRole("button", { name: /Model: GPT-6 Luna/u }).click();
-  await page.getByRole("button", { name: "ChatGPT", exact: true }).click();
-  await expect.element(page.getByText("Quota unavailable")).toBeVisible();
-  expect(native.openUrl).not.toHaveBeenCalled();
-  await expect.element(page.getByRole("button", { name: /usage|quota/iu })).not.toBeInTheDocument();
-  expect(native.choose).not.toHaveBeenCalled();
-  expect(chatgpt.signIn).not.toHaveBeenCalled();
-});
-
-test("an unavailable saved subscription keeps its source pane instead of presenting an API billing fallback", async () => {
-  native.ready.mockImplementation(ready(true));
-  const unavailable = view("openai/gpt-6-luna");
-  unavailable.chosen.page = "chatgpt/gpt-6-luna";
-  unavailable.effective.page = null;
-  native.read.mockResolvedValue(unavailable);
-  native.choose.mockClear();
-  const screen = await render(ModelPicker, { profile: PROFILE, role: "page" });
-  await screen.getByRole("button", { name: "Model" }).click();
-  await expect
-    .element(page.getByRole("tab", { name: "OpenAI", exact: true }))
-    .toHaveAttribute("aria-selected", "true");
-  await expect
-    .element(page.getByRole("button", { name: "ChatGPT", exact: true }))
-    .toHaveAttribute("aria-pressed", "true");
-  await expect
-    .element(page.getByText("Saved ChatGPT model unavailable", { exact: false }))
-    .toBeVisible();
-  await expect.element(page.getByRole("button", { name: "Continue with ChatGPT" })).toBeVisible();
-  expect(page.getByRole("option", { name: /GPT-6 Luna/u }).query()).toBeNull();
-  expect(native.choose).not.toHaveBeenCalled();
-});
-
-test("connected account controls remain compact enough to show model choices beside quota errors", async () => {
-  await page.viewport(1200, 800);
+test("legacy direct catalogue is not offered or silently replaced by an API choice", async () => {
   native.ready.mockImplementation(ready(true));
   const state = bothConnections();
-  for (const model of ["gpt-small", "gpt-large"])
-    state.entries.push(
-      entry("open_ai", model, model, false, ["lead", "page"], {
-        id: `chatgpt/${model}`,
-        price: null,
-      }),
-    );
+  state.effective.page = "chatgpt/gpt-6-luna";
+  state.chosen.page = "chatgpt/gpt-6-luna";
   native.read.mockResolvedValue(state);
-  chatgpt.read.mockResolvedValue(
-    chatgptView(PROFILE, {
-      state: "connected",
-      models: 3,
-      email: "reader@example.com",
-      error: "usage_limit",
-    }),
-  );
-  const screen = await render(ModelPicker, { profile: PROFILE });
-  await screen.getByRole("button", { name: /Model: GPT-6 Luna/u }).click();
-  await page.getByRole("button", { name: "ChatGPT", exact: true }).click();
-  await expect.element(page.getByRole("alert")).toHaveTextContent("usage limit");
-  await expect.element(page.getByRole("button", { name: "Refresh models" })).toBeVisible();
-  await expect.element(page.getByRole("button", { name: "Disconnect ChatGPT" })).toBeVisible();
-  await expect.element(page.getByRole("button", { name: /usage|quota/iu })).not.toBeInTheDocument();
-  const list = page.getByRole("listbox").element() as HTMLElement;
-  await expect.poll(() => list.getBoundingClientRect().height).toBeGreaterThanOrEqual(102);
-  expect(list.querySelectorAll('[role="option"]')).toHaveLength(3);
+  const screen = await render(ModelPicker, { profile: PROFILE, role: "page" });
+  await screen.getByRole("button", { name: "Model: GPT-6 Luna", exact: true }).click();
+  await expect
+    .element(screen.getByText("This saved direct connection is retired.", { exact: false }))
+    .toBeVisible();
+  expect(page.getByRole("button", { name: "Continue with ChatGPT" }).query()).toBeNull();
+  expect(
+    page.getByRole("button", { name: "Legacy direct account", exact: true }).query(),
+  ).toBeNull();
+  expect(
+    page
+      .getByRole("option")
+      .all()
+      .some((row) => row.element().getAttribute("data-id")?.startsWith("chatgpt/")),
+  ).toBe(false);
+  expect(native.choose).not.toHaveBeenCalled();
+  expect(chatgpt.signIn).not.toHaveBeenCalled();
+  expect(chatgpt.signOut).not.toHaveBeenCalled();
+  expect(chatgpt.read).not.toHaveBeenCalled();
 });
 
 test("a narrow non-reasoning account card keeps its fixed-effort label in flow and exposes connection context accessibly", async () => {
@@ -884,11 +744,11 @@ test("a narrow non-reasoning account card keeps its fixed-effort label in flow a
   state.effective.lead = "chatgpt/gpt-6-luna";
   state.chosen.lead = "chatgpt/gpt-6-luna";
   native.read.mockResolvedValue(state);
-  chatgpt.read.mockResolvedValue(chatgptView(PROFILE, { state: "connected", models: 1 }));
+  chatgpt.read.mockResolvedValue(chatgptView(PROFILE, { state: "connected", presence: "stored" }));
   const screen = await render(ModelPicker, { profile: PROFILE });
-  await screen.getByRole("button", { name: "Model: GPT-6 Luna", exact: true }).click();
+  await screen.getByRole("button", { name: "Work · Model: GPT-6 Luna", exact: true }).click();
   const card = page.getByRole("region", { name: "GPT-6 Luna", exact: true });
-  await expect.element(card).toHaveAccessibleDescription(/Connection: ChatGPT/u);
+  await expect.element(card).toHaveAccessibleDescription(/Connection: Legacy direct account/u);
   const fixed = page.getByText("Its own pace", { exact: true }).element() as HTMLElement;
   const identity = card.element().querySelector<HTMLElement>(".identity")!;
   expect(getComputedStyle(fixed).position).toBe("static");
@@ -935,7 +795,7 @@ test("one custom provider seat offers independent endpoint and local gateway sou
     }),
   );
   const screen = await render(ModelPicker, { profile: PROFILE });
-  await screen.getByRole("button", { name: "Model: Example", exact: true }).click();
+  await screen.getByRole("button", { name: "Work · Model: Example", exact: true }).click();
   await expect
     .element(screen.getByRole("button", { name: "Local gateway", exact: true }))
     .toHaveAttribute("aria-pressed", "true");
@@ -1011,7 +871,7 @@ test("OpenCode Go has its own provider seat, clean models, and no automatic cata
     }),
   );
   const screen = await render(ModelPicker, { profile: PROFILE });
-  await screen.getByRole("button", { name: "Model: Example", exact: true }).click();
+  await screen.getByRole("button", { name: "Work · Model: Example", exact: true }).click();
   await expect
     .element(screen.getByRole("tab", { name: "OpenCode Go", exact: true }))
     .toHaveAttribute("aria-selected", "true");
@@ -1034,7 +894,7 @@ test("OpenCode Go has its own provider seat, clean models, and no automatic cata
   await screen.getByRole("tab", { name: "OpenAI", exact: true }).click();
   expect(native.choose).toHaveBeenCalledTimes(choices);
   await expect
-    .element(screen.getByRole("button", { name: "Model: Example", exact: true }))
+    .element(screen.getByRole("button", { name: "Work · Model: Example", exact: true }))
     .toBeVisible();
   await screen.getByRole("tab", { name: "OpenCode Go", exact: true }).click();
   native.read.mockResolvedValue({
@@ -1114,7 +974,7 @@ test("Go quota refresh leaves model choice untouched and stale quota remains dis
 });
 
 test.each([
-  ["open_ai", "chatgpt/example", "ChatGPT", "32K context budget"],
+  ["open_ai", "chatgpt/example", "Legacy direct account", "32K context budget"],
   ["open_code_go", `opencode-go/${"a".repeat(32)}/example`, "OpenCode Go", "32K context budget"],
   ["compatible", `gateway/${"a".repeat(32)}/example`, "Local gateway", "32K context budget"],
   ["open_ai", "openai/example", "API key", "32K context"],
@@ -1150,51 +1010,32 @@ test.each([
 );
 
 test.each([true, false])(
-  "Page-only ChatGPT effort stays available with signed-out Zephium (service available: %s)",
+  "retired Page selection never offers effort mutation or silently changes source (service available: %s)",
   async (available) => {
-    await page.viewport(1000, 800);
     const id = "chatgpt/gpt-6.1-sol";
     const state = models({});
     state.entries.push(
-      entry("open_ai", "gpt-6.1-sol", "GPT-6.1 Sol", false, ["page"], {
-        id,
-        price: null,
-      }),
+      entry("open_ai", "gpt-6.1-sol", "GPT-6.1 Sol", false, ["page"], { id, price: null }),
     );
     state.effective.page = id;
     state.chosen.page = id;
     state.efforts.push({ id, levels: ["low", "medium", "high", "xhigh", "max"], effort: "medium" });
-    expect(state.effort).toBeNull();
-    expect(state.effective.lead).toBeNull();
     native.read.mockResolvedValue(state);
     native.account.mockResolvedValue({
       account: accountFixture({ available, signed_in: false }),
       fault: null,
       retry_after: null,
     });
-    chatgpt.read.mockResolvedValue(chatgptView(PROFILE, { state: "connected", models: 1 }));
-    native.effort.mockImplementation(async (_profile: string, effort: WorkModelReasoning) => ({
-      ...state,
-      efforts: state.efforts.map((row) => (row.id === id ? { ...row, effort } : row)),
-      effort: null,
-    }));
-    const commandsBefore = native.command.mock.calls.length;
-    const choicesBefore = native.choose.mock.calls.length;
     const screen = await render(ModelPicker, { profile: PROFILE, role: "page" });
-    await screen
-      .getByRole("button", { name: "Model: GPT-6.1 Sol, Medium effort", exact: true })
-      .click();
-    await screen.getByRole("button", { name: "Effort: Medium", exact: true }).click();
-    const slider = screen.getByRole("slider", { name: "Effort", exact: true });
-    await expect.element(slider).toHaveAttribute("aria-valuemax", "4");
-    await userEvent.keyboard("{End}");
-    await expect.element(slider).toHaveAttribute("aria-valuetext", "Max");
-    expect(native.effort).toHaveBeenLastCalledWith(PROFILE, "max");
+    await screen.getByRole("button", { name: "Model: GPT-6.1 Sol", exact: true }).click();
     await expect
-      .element(screen.getByRole("button", { name: "Model: GPT-6.1 Sol, Max effort", exact: true }))
+      .element(screen.getByText("This saved direct connection is retired.", { exact: false }))
       .toBeVisible();
-    expect(native.command).toHaveBeenCalledTimes(commandsBefore);
-    expect(native.choose).toHaveBeenCalledTimes(choicesBefore);
+    expect(screen.getByRole("button", { name: /^Effort:/u }).query()).toBeNull();
+    expect(screen.getByRole("slider", { name: "Effort", exact: true }).query()).toBeNull();
+    expect(native.effort).not.toHaveBeenCalled();
+    expect(native.choose).not.toHaveBeenCalled();
+    expect(chatgpt.read).not.toHaveBeenCalled();
   },
 );
 
@@ -1260,4 +1101,312 @@ test("profile replacement discards queued effort without applying it to the new 
   await expect
     .element(screen.getByRole("button", { name: "Model: GPT-6 Luna, Max effort", exact: true }))
     .toBeVisible();
+});
+
+test("Codex is Page-only and opening other provider controls does not prepare it", async () => {
+  native.read.mockResolvedValue(view("openai/gpt-6-sol"));
+  const screen = await render(ModelPicker, { profile: PROFILE, role: "lead" });
+  await screen.getByRole("button", { name: /Model:/u }).click();
+  expect(page.getByRole("button", { name: "Codex", exact: true }).query()).toBeNull();
+  expect(codex.read).not.toHaveBeenCalled();
+});
+
+test("Page Codex uses original catalog and exact supported effort without a Work model shim", async () => {
+  native.read.mockResolvedValue(view("openai/gpt-6-sol"));
+  const original = {
+    id: "original-picker-id",
+    name: "Original Native Name",
+    efforts: ["minimal", "high"] as const,
+    default_effort: "high" as const,
+  };
+  const catalog = codexView(PROFILE, {
+    state: "connected",
+    models: [{ ...original, efforts: [...original.efforts] }],
+  });
+  codex.read.mockResolvedValue(catalog);
+  codex.select.mockImplementation(async (_profile: string, selection) => ({
+    ...catalog,
+    selection,
+    page_selected: true,
+  }));
+  const screen = await render(ModelPicker, { profile: PROFILE, role: "page" });
+  expect(codex.read).not.toHaveBeenCalled();
+  await screen.getByRole("button", { name: /Model/u }).click();
+  await page.getByRole("tab", { name: "OpenAI", exact: true }).click();
+  await page.getByRole("button", { name: "Codex", exact: true }).click();
+  await expect
+    .element(page.getByRole("option", { name: "Original Native Name", exact: true }))
+    .toBeVisible();
+  expect(codex.read).toHaveBeenCalledExactlyOnceWith(PROFILE);
+  expect(codex.select).not.toHaveBeenCalled();
+  expect(codex.connect).not.toHaveBeenCalled();
+  expect(page.getByRole("combobox", { name: "Codex model" }).query()).toBeNull();
+  expect(page.getByRole("button", { name: "Use in sidebar", exact: true }).query()).toBeNull();
+  await page.getByRole("option", { name: "Original Native Name", exact: true }).click();
+  expect(codex.select).toHaveBeenCalledExactlyOnceWith(PROFILE, {
+    model: "original-picker-id",
+    effort: { kind: "default" },
+  });
+  expect(native.choose).not.toHaveBeenCalledWith(PROFILE, "page", "original-picker-id");
+});
+
+test("retained Codex trigger needs no process preparation until its panel opens", async () => {
+  native.read.mockResolvedValue(view("openai/gpt-6-sol"));
+  const screen = await render(ModelPicker, {
+    profile: PROFILE,
+    role: "page",
+    nativeModel: {
+      id: "native-id",
+      name: "Original Native Name",
+      source: "codex",
+      capabilities: "text_only",
+      hosted: false,
+      effort: "high",
+    },
+  });
+  await expect
+    .element(screen.getByRole("button", { name: /Original Native Name · Codex/u }))
+    .toBeVisible();
+  const trigger = screen.getByRole("button", {
+    name: /Original Native Name · Codex/u,
+  });
+  await expect.element(trigger).toHaveTextContent("Original Native Name·High");
+  await expect.element(trigger).not.toHaveTextContent("Codex");
+  expect(codex.read).not.toHaveBeenCalled();
+  expect(codex.select).not.toHaveBeenCalled();
+});
+
+test("Codex uses the existing effort pill and slider with only original advertised stops", async () => {
+  native.read.mockResolvedValue(view("openai/gpt-6-sol"));
+  const catalog = codexView(PROFILE, {
+    state: "connected",
+    page_selected: true,
+    selection: { model: "original", effort: { kind: "explicit", effort: "high" } },
+    models: [
+      {
+        id: "original",
+        name: "Original Native Name",
+        efforts: ["minimal", "high"],
+        default_effort: "high",
+      },
+    ],
+  });
+  codex.read.mockResolvedValue(catalog);
+  codex.select.mockImplementation(async (_profile: string, selection) => ({
+    ...catalog,
+    selection,
+  }));
+  const screen = await render(ModelPicker, {
+    profile: PROFILE,
+    role: "page",
+    nativeModel: {
+      id: "original",
+      name: "Original Native Name",
+      source: "codex",
+      capabilities: "text_only",
+      hosted: false,
+      effort: "high",
+    },
+  });
+  await screen.getByRole("button", { name: /Original Native Name · Codex/u }).click();
+  await page.getByRole("button", { name: "Effort: High" }).click();
+  const slider = page.getByRole("slider", { name: "Effort" });
+  await expect.element(slider).toHaveAttribute("aria-valuemax", "1");
+  await expect.element(slider).toHaveAttribute("aria-valuetext", "High");
+  await expect.element(slider).toHaveFocus();
+  // No input or page-focus transfer: normal reading time must not dismiss the
+  // existing effort surface or commit a choice by itself.
+  await new Promise((resolve) => setTimeout(resolve, 8_000));
+  await expect.element(slider).toBeVisible();
+  await expect.element(slider).toHaveFocus();
+  expect(codex.select).not.toHaveBeenCalled();
+  await userEvent.keyboard("{Home}");
+  expect(codex.select).toHaveBeenLastCalledWith(PROFILE, {
+    model: "original",
+    effort: { kind: "explicit", effort: "minimal" },
+  });
+  await expect.element(slider).toHaveAttribute("aria-valuetext", "Minimal");
+  expect(page.getByRole("combobox").query()).toBeNull();
+  expect(codex.connect).not.toHaveBeenCalled();
+}, 20_000);
+
+test("Page offers exactly Codex and API key without converting a retained legacy choice", async () => {
+  await page.viewport(640, 600);
+  native.ready.mockImplementation(ready(true));
+  const state = bothConnections();
+  state.effective.page = "chatgpt/gpt-6-luna";
+  state.chosen.page = "chatgpt/gpt-6-luna";
+  native.read.mockResolvedValue(state);
+  const screen = await render(ModelPicker, { profile: PROFILE, role: "page" });
+  await screen.getByRole("button", { name: "Model: GPT-6 Luna", exact: true }).click();
+  const group = page
+    .getByRole("group", { name: "OpenAI connection method", exact: true })
+    .element();
+  const buttons = Array.from(group.querySelectorAll<HTMLButtonElement>("button"));
+  expect(
+    buttons.map((button) => button.getAttribute("aria-label") ?? button.textContent?.trim()),
+  ).toEqual(["API key", "Codex"]);
+  for (const button of buttons) {
+    expect(button.scrollWidth).toBeLessThanOrEqual(button.clientWidth);
+    expect(button.getBoundingClientRect().right).toBeLessThanOrEqual(
+      group.getBoundingClientRect().right,
+    );
+  }
+  await page.getByRole("button", { name: "Codex", exact: true }).click();
+  await page.getByRole("button", { name: "API key", exact: true }).click();
+  expect(codex.select).not.toHaveBeenCalled();
+  expect(codex.connect).not.toHaveBeenCalled();
+  expect(chatgpt.signIn).not.toHaveBeenCalled();
+  expect(chatgpt.signOut).not.toHaveBeenCalled();
+  expect(native.choose).not.toHaveBeenCalled();
+});
+
+test("Codex default-only row selects original omission without inventing an effort slider", async () => {
+  native.read.mockResolvedValue(view("openai/gpt-6-sol"));
+  const catalog = codexView(PROFILE, {
+    state: "connected",
+    models: [{ id: "default-only", name: "Original Default", efforts: [], default_effort: "none" }],
+  });
+  codex.read.mockResolvedValue(catalog);
+  codex.select.mockImplementation(async (_profile: string, selection) => ({
+    ...catalog,
+    selection,
+    page_selected: true,
+  }));
+  const screen = await render(ModelPicker, { profile: PROFILE, role: "page" });
+  await screen.getByRole("button", { name: /Model/u }).click();
+  await page.getByRole("tab", { name: "OpenAI", exact: true }).click();
+  await page.getByRole("button", { name: "Codex", exact: true }).click();
+  await page.getByRole("option", { name: "Original Default", exact: true }).click();
+  expect(codex.select).toHaveBeenCalledExactlyOnceWith(PROFILE, {
+    model: "default-only",
+    effort: { kind: "default" },
+  });
+  expect(native.effort).not.toHaveBeenCalled();
+});
+
+test("Codex model default is separate from ranked explicit effort and can be restored unchanged", async () => {
+  native.read.mockResolvedValue(view("openai/gpt-6-sol"));
+  const catalog = codexView(PROFILE, {
+    state: "connected",
+    page_selected: true,
+    selection: { model: "original", effort: { kind: "default" } },
+    models: [
+      {
+        id: "original",
+        name: "Original Native Name",
+        efforts: ["none", "high"],
+        default_effort: "high",
+      },
+    ],
+  });
+  codex.read.mockResolvedValue(catalog);
+  codex.select.mockImplementation(async (_profile: string, selection) => ({
+    ...catalog,
+    selection,
+  }));
+  const screen = await render(ModelPicker, {
+    profile: PROFILE,
+    role: "page",
+    nativeModel: {
+      id: "original",
+      name: "Original Native Name",
+      source: "codex",
+      capabilities: "text_only",
+      hosted: false,
+      effort: null,
+    },
+  });
+  await screen.getByRole("button", { name: /Original Native Name · Codex · Default/u }).click();
+  await page.getByRole("button", { name: "Effort: Default", exact: true }).click();
+  const choices = page.getByRole("group", { name: "Choose a supported effort", exact: true });
+  await expect.element(choices.getByRole("button", { name: "None", exact: true })).toHaveFocus();
+  await choices.getByRole("button", { name: "None", exact: true }).click();
+  expect(codex.select).toHaveBeenLastCalledWith(PROFILE, {
+    model: "original",
+    effort: { kind: "explicit", effort: "none" },
+  });
+  await page.getByRole("button", { name: "Use model default", exact: true }).click();
+  expect(codex.select).toHaveBeenLastCalledWith(PROFILE, {
+    model: "original",
+    effort: { kind: "default" },
+  });
+  expect(native.effort).not.toHaveBeenCalled();
+  expect(codex.connect).not.toHaveBeenCalled();
+});
+
+test("Work keeps its configured model and clearly separates sidebar Codex scope", async () => {
+  native.read.mockResolvedValue(view("openai/gpt-6-sol"));
+  const screen = await render(ModelPicker, {
+    profile: PROFILE,
+    role: "lead",
+    nativeModel: {
+      id: "native-only",
+      name: "Original Sidebar Model",
+      source: "codex",
+      capabilities: "text_only",
+      hosted: false,
+      effort: "high",
+    },
+  });
+  await screen.getByRole("button", { name: /Work · Model: GPT-6 Sol/u }).click();
+  await expect
+    .element(page.getByText("Work and sidebar chat use separate model settings."))
+    .toBeVisible();
+  await page.getByRole("tab", { name: "OpenAI", exact: true }).click();
+  await expect
+    .element(page.getByRole("button", { name: "Codex", exact: true }))
+    .not.toBeInTheDocument();
+  await expect
+    .element(screen.getByRole("button", { name: /Work · Model: GPT-6 Sol/u }))
+    .toBeVisible();
+  expect(codex.read).not.toHaveBeenCalled();
+  expect(codex.select).not.toHaveBeenCalled();
+  expect(native.choose).not.toHaveBeenCalled();
+});
+
+test("native Codex search and source-prefixed favourites never become Work choices", async () => {
+  native.read.mockResolvedValue(view("openai/gpt-6-sol"));
+  await preferences.init();
+  const catalog = codexView(PROFILE, {
+    state: "connected",
+    models: [
+      { id: "native/sol", name: "Native Sol", efforts: ["low"], default_effort: "low" },
+      { id: "native-astra", name: "Native Astra", efforts: ["max"], default_effort: "max" },
+    ],
+  });
+  codex.read.mockResolvedValue(catalog);
+  codex.select.mockImplementation(async (_profile: string, selection) => ({
+    ...catalog,
+    selection,
+    page_selected: true,
+  }));
+  const screen = await render(ModelPicker, { profile: PROFILE, role: "page" });
+  await screen.getByRole("button", { name: /Model/u }).click();
+  await page.getByRole("tab", { name: "OpenAI", exact: true }).click();
+  await page.getByRole("button", { name: "Codex", exact: true }).click();
+  await expect.element(page.getByRole("option", { name: "Native Sol", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Add Native Sol to favourites", exact: true }).click();
+  await expect.poll(() => native.settings["work.favourite-models"]).toContain("codex/native%2Fsol");
+  expect(codex.select).not.toHaveBeenCalled();
+  await page.getByRole("button", { name: "Favourites", exact: true }).click();
+  await expect.element(page.getByRole("option", { name: "Native Sol", exact: true })).toBeVisible();
+  await expect
+    .element(page.getByRole("option", { name: "Native Astra", exact: true }))
+    .not.toBeInTheDocument();
+  await page.getByRole("button", { name: "Search models", exact: true }).click();
+  const search = page.getByRole("combobox", { name: "Search models", exact: true });
+  await search.fill("astra");
+  await expect
+    .element(page.getByRole("option", { name: "Native Sol", exact: true }))
+    .not.toBeInTheDocument();
+  expect(codex.select).not.toHaveBeenCalled();
+  await search.fill("sol");
+  await userEvent.keyboard("{ArrowDown}{Enter}");
+  expect(codex.select).toHaveBeenCalledExactlyOnceWith(PROFILE, {
+    model: "native/sol",
+    effort: { kind: "default" },
+  });
+  expect(native.choose).not.toHaveBeenCalledWith(PROFILE, "page", "codex/native%2Fsol");
+  await screen.unmount();
 });

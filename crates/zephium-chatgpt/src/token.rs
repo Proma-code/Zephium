@@ -23,7 +23,7 @@ pub struct Identity {
 /// One registration's protected, indivisible token set.
 ///
 /// There is no public token constructor or Deserialize implementation. Only the
-/// OAuth client creates records; `from_bytes` restores protected vault records.
+/// `from_bytes` restores protected vault records; new authorization is retired.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Record {
@@ -52,23 +52,9 @@ impl Tokens {
         &self.0.identity
     }
 
-    /// Bearer credential for the fixed official inference endpoint only.
-    pub fn access_token(&self) -> &str {
-        &self.0.access_token
-    }
-
-    /// Unix-second access-token expiry used to refresh before inference.
-    pub fn expires_at(&self) -> u64 {
-        self.0.expires_at
-    }
-
-    /// Granted scopes, not scopes inferred from the authorization URL.
-    pub fn scopes(&self) -> &[String] {
-        &self.0.scopes
-    }
-
     /// Encode only for an atomic protected-vault write, never browser storage.
-    pub fn to_bytes(&self) -> Result<Zeroizing<Vec<u8>>, AuthError> {
+    #[cfg(test)]
+    pub(crate) fn to_bytes(&self) -> Result<Zeroizing<Vec<u8>>, AuthError> {
         serde_json::to_vec(&self.0)
             .map(Zeroizing::new)
             .map_err(|_| AuthError::Protocol)

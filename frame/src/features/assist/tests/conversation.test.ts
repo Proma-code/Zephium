@@ -114,3 +114,29 @@ test("the words the latest deltas brought are split off the end to ink in", () =
     { kind: "fresh", text: "three", key: 8 },
   ]);
 });
+
+test("native snapshots replace authoritative text, clear it, and reject late or oversized writes", () => {
+  let view = run(
+    started,
+    event(3, 2, { type: "text_snapshot", block: 0, text: "provisional" }),
+    event(4, 2, { type: "text_snapshot", block: 0, text: "corrected" }),
+  );
+  expect(latestReply(view)!.blocks).toEqual([{ kind: "text", text: "corrected", cites: [] }]);
+  expect(
+    fold(view, event(5, 2, { type: "text_snapshot", block: 0, text: "ع".repeat(12 * 1024 + 1) })),
+  ).toBe("reload");
+  expect(fold(view, event(5, 99, { type: "text_snapshot", block: 0, text: "wrong reply" }))).toBe(
+    "reload",
+  );
+  expect(fold(view, event(5, 2, { type: "text_snapshot", block: 2, text: "gap" }))).toBe("reload");
+  view = run(
+    view,
+    event(5, 2, { type: "text_snapshot", block: 0, text: "" }),
+    event(6, 2, { type: "done", cost: null }),
+  );
+  expect(latestReply(view)!.blocks).toEqual([{ kind: "text", text: "", cites: [] }]);
+  expect(fold(view, event(7, 2, { type: "text_snapshot", block: 0, text: "late" }))).toBe("reload");
+  expect(
+    fold(view, event(5, 2, { type: "text_snapshot", block: 0, text: "old sequence" })),
+  ).toBeNull();
+});

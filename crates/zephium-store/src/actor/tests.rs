@@ -2,6 +2,7 @@ use super::*;
 mod activity_writes;
 mod chats;
 mod codex_store;
+mod page_choice;
 use rusqlite::{params, Connection};
 use zephium_core::blocker::{BlockerConfig, BlockerConfigRevision, ProfileBlockerConfig};
 use zephium_core::ids::{ItemId, PagePermissionGrantId, SpaceId, UserscriptId};

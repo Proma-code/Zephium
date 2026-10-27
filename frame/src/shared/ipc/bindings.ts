@@ -372,10 +372,24 @@ export const commands = {
 	blockerRetry: (failedGeneration: string) => __TAURI_INVOKE<OperationAdmission>("blocker_retry", { failedGeneration }),
 	blockerRefreshSources: () => __TAURI_INVOKE<OperationAdmission>("blocker_refresh_sources"),
 	profilesDelete: (profile: string) => __TAURI_INVOKE<OperationAdmission>("profiles_delete", { profile }),
+	/**  Reconcile only an already-confirmed removal. This never begins a new delete. */
+	profilesRetryRemoval: (profile: string) => typedError<ProfileRemovalRetryV1, null>(__TAURI_INVOKE("profiles_retry_removal", { profile })),
+	/**  Recheck the protected removal inventory without beginning or driving deletion. */
+	profilesRecheckRemovalInventory: () => typedError<ProfileRemovalRetryV1, null>(__TAURI_INVOKE("profiles_recheck_removal_inventory")),
 	profilesGet: () => typedError<{
 	current: string | null,
 	private: boolean,
 	profiles: ProfileEntryView[],
+	/**
+	 *  Canonical removal progress, including profiles no longer in the roster.
+	 *  This is observation only, never authority to erase or resume an account.
+	 */
+	removals: ProfileRemovalViewV1[],
+	/**
+	 *  Availability of the native protected-removal inventory. None is not a
+	 *  proof of absence; it means this composition has no installed participant.
+	 */
+	removal_recovery: ProfileRemovalRecoveryV1 | null,
 } | null, null>(__TAURI_INVOKE("profiles_get")),
 	profilesCreate: (name: string, avatar: ProfileAvatarInputV1, andSwitch: boolean) => __TAURI_INVOKE<OperationAdmission>("profiles_create", { name, avatar, andSwitch }),
 	profilesSwitch: (profile: string) => __TAURI_INVOKE<OperationAdmission>("profiles_switch", { profile }),
@@ -1155,23 +1169,28 @@ export type ChangedNote = {
 export type ChatGptFailureField = "model" | "reasoning" | "tools" | "input" | "store" | "stream" | "unknown";
 
 /**  Closed failure categories used for actionable UI, never provider strings. */
-export type ChatGptFailureIssue = "invalid_request" | "signed_out" | "not_eligible" | "usage_limit" | "unavailable" | "unsupported" | "timeout" | "protocol" | "incomplete" | "usage_unavailable" | "cancelled";
+export type ChatGptFailureIssue = "retired" | "invalid_request" | "signed_out" | "not_eligible" | "usage_limit" | "unavailable" | "unsupported" | "timeout" | "protocol" | "incomplete" | "usage_unavailable" | "cancelled";
 
 /**  The last locally observed stage, without any request or credential content. */
 export type ChatGptFailureStage = "request" | "credential" | "send" | "http" | "stream" | "complete";
 
 /**  Closed direct ChatGPT errors. No provider-authored text or account data. */
-export type ChatGptModelFault =
+export type ChatGptModelFault = 
+/**
+ *  The removed direct subscription source remains stored only for recovery.
+ *  No model request was admitted and no other source may stand in for it.
+ */
+"retired" | 
 /**  The selected local grant is missing, expired, or was refused. */
-"signed_out" |
+"signed_out" | 
 /**  A ChatGPT plan-sharing limit was reached; its scope/reset are unknown. */
-"usage_limit" |
+"usage_limit" | 
 /**  Account or usage admission is temporarily unavailable. */
-"unavailable" |
+"unavailable" | 
 /**  The account, workspace, region or grant policy does not permit this call. */
-"not_eligible" |
+"not_eligible" | 
 /**  This route does not support the requested capability or body. */
-"unsupported" |
+"unsupported" | 
 /**  Bounded native evidence, not a provider message or request identifier. */
 { diagnostic: {
 	stage: ChatGptFailureStage,
@@ -1874,6 +1893,18 @@ export type OperationReason = "mutation_applied" | "state_unchanged" | "invalid_
 export type OperationStatus = { state: "unknown" } | { state: "pending" } | { state: "processed"; disposition: OperationDisposition };
 
 /**  Admission only: the reply arrives as events. */
+export type PageAssistModelSourceV1 = "model" | "codex";
+
+export type PageAssistCapabilitiesV1 = "page" | "text_only";
+
+export type PageAssistNativeFaultV1 = "unavailable" | "unsupported_input" | "scope_changed" | "protocol" | "limit" | "outcome_unknown" | 
+/**  Original terminal received, but the local history settlement was not confirmed. */
+"history_uncertain" | 
+/**  Visible Page history differs from this original-client conversation. */
+"history_diverged" | 
+/**  Native non-dispatch proof and exact durable skipped-attempt acknowledgement. */
+"not_sent" | "upstream" | "timeout" | "cancelled";
+
 export type PageAssistAskResponseV1 = {
 	reply: number | null,
 	fault: PageAssistFaultV1 | null,
@@ -2019,55 +2050,57 @@ export type PageAssistDecisionV1 = "approve" | "decline";
  *  One change to a conversation, in `seq` order. On `invalidated`, read
  *  `page_assist_status` again.
  */
-export type PageAssistEventV1 =
+export type PageAssistEventV1 = 
 /**
  *  A message joined the conversation: the person's, then the reply's
  *  starting snapshot.
  */
-{ type: "message"; message: PageAssistMessageV1 } | { type: "phase"; phase: PageAssistPhaseV1 | null } |
+{ type: "message"; message: PageAssistMessageV1 } | { type: "phase"; phase: PageAssistPhaseV1 | null } | 
 /**  Appends to the text block at `block`, creating it when it is next. */
-{ type: "text"; block: number; delta: string } |
+{ type: "text"; block: number; delta: string } | 
+/**  Replaces native conversation text, including a corrected or empty final. */
+{ type: "text_snapshot"; block: number; text: string } | 
 /**  The text block's cites so far. */
-{ type: "cites"; block: number; cites: PageAssistCiteV1[] } |
+{ type: "cites"; block: number; cites: PageAssistCiteV1[] } | 
 /**  Sets the block at `block`: replaces it, or appends it when it is next. */
-{ type: "block"; block: number; value: PageAssistBlockV1 } | { type: "state"; state: PageAssistReplyStateV1 } |
+{ type: "block"; block: number; value: PageAssistBlockV1 } | { type: "state"; state: PageAssistReplyStateV1 } | 
 /**
  *  The reply finished. `cost` may still be confirming; a later `cost`
  *  event replaces it.
  */
-{ type: "done"; cost: PageAssistCostV1 | null } | { type: "cost"; cost: PageAssistCostV1 } | { type: "failed"; fault: PageAssistFaultV1 } | { type: "cancelled" } |
+{ type: "done"; cost: PageAssistCostV1 | null } | { type: "cost"; cost: PageAssistCostV1 } | { type: "failed"; fault: PageAssistFaultV1 } | { type: "cancelled" } | 
 /**  Replies up to and including `reply` no longer jump to their pages. */
-{ type: "inert" } |
+{ type: "inert" } | 
 /**  The conversation was titled from its first message. */
-{ type: "titled"; title: string } |
+{ type: "titled"; title: string } | 
 /**  The conversation changed shape (new, opened, deleted, AI off). */
 { type: "invalidated" };
 
 /**  Why a message could not start or finish. Closed; never provider or page text. */
-export type PageAssistFaultV1 = { reason: "ai_off" } | { reason: "private" } | { reason: "not_web" } | { reason: "sensitive" } | { reason: "no_model" } | { reason: "loading" } | { reason: "unsupported" } |
+export type PageAssistFaultV1 = { reason: "ai_off" } | { reason: "private" } | { reason: "not_web" } | { reason: "sensitive" } | { reason: "no_model" } | { reason: "loading" } | { reason: "unsupported" } | 
 /**  The conversation is still answering. */
-{ reason: "busy" } |
+{ reason: "busy" } | 
 /**  The message is empty, too long, or names something that is gone. */
-{ reason: "invalid" } |
+{ reason: "invalid" } | 
 /**  Nothing is selected on the page. */
-{ reason: "no_selection" } |
+{ reason: "no_selection" } | 
 /**  The page could not be read. */
-{ reason: "unreadable" } |
+{ reason: "unreadable" } | 
 /**  The page navigated or closed while the reply needed it. */
-{ reason: "page_changed" } |
+{ reason: "page_changed" } | 
 /**  The model answered with nothing usable. */
-{ reason: "no_answer" } |
+{ reason: "no_answer" } | 
 /**  A page step did not take effect as expected. */
-{ reason: "step_failed" } |
+{ reason: "step_failed" } | 
 /**  The reply reached its limit of steps or time. */
-{ reason: "too_long" } |
+{ reason: "too_long" } | 
 /**
  *  The model call failed. `retry_after_ms` is set for `rate_limited`
  *  (and hosted limits) when the provider or server said when to retry.
  */
-{ reason: "model"; fault: WorkModelFaultV1; retry_after_ms: number | null } |
+{ reason: "model"; fault: WorkModelFaultV1; retry_after_ms: number | null } | 
 /**  The selected ChatGPT connection failed; only closed native diagnostics cross. */
-{ reason: "chat_gpt"; fault: ChatGptModelFault } | { reason: "unavailable" };
+{ reason: "chat_gpt"; fault: ChatGptModelFault } | { reason: "native_conversation"; fault: PageAssistNativeFaultV1 } | { reason: "unavailable" };
 
 export type PageAssistHandoffStateV1 =
 /**  Waits for Continue in Work. */
@@ -2122,6 +2155,10 @@ export type PageAssistModelV1 = {
 	name: string,
 	/**  Zephium AI (credits) rather than the person's own key. */
 	hosted: boolean,
+	/**  Actual backend, not inferred from the display name. */
+	source: PageAssistModelSourceV1,
+	/**  Capabilities are known before reading any page context. */
+	capabilities: PageAssistCapabilitiesV1,
 	/**  The effort it runs at, such as "high"; null when it has none. */
 	effort: string | null,
 };
@@ -2450,6 +2487,25 @@ export type ProfileId = string;
 
 export type ProfileKindView = "default" | "named" | "incognito";
 
+export type ProfileRemovalCleanupV1 = "not_started" | "unconfirmed" | "verified";
+
+export type ProfileRemovalNativeV1 = "unconfirmed" | "not_configured" | "signed_out_settled";
+
+export type ProfileRemovalPhaseV1 = "awaiting_explicit_retry" | "preparing_native" | "authorizing" | "cleanup" | "erasing_browser" | "finalizing" | "acknowledging_native" | "failed_closed";
+
+export type ProfileRemovalRecoveryV1 = "verified" | "unavailable";
+
+/**  Admission of reconciliation for an existing removal, not a deletion result. */
+export type ProfileRemovalRetryV1 = "scheduled" | "not_pending" | "blocked";
+
+export type ProfileRemovalViewV1 = {
+	profile: string,
+	phase: ProfileRemovalPhaseV1,
+	native: ProfileRemovalNativeV1,
+	cleanup: ProfileRemovalCleanupV1,
+	blocked: boolean,
+};
+
 /**
  *  Focused profile metadata. Profile isolation and lifecycle remain native
  *  authority; this view is display-only.
@@ -2468,6 +2524,16 @@ export type ProfilesView = {
 	current: string | null,
 	private: boolean,
 	profiles: ProfileEntryView[],
+	/**
+	 *  Canonical removal progress, including profiles no longer in the roster.
+	 *  This is observation only, never authority to erase or resume an account.
+	 */
+	removals: ProfileRemovalViewV1[],
+	/**
+	 *  Availability of the native protected-removal inventory. None is not a
+	 *  proof of absence; it means this composition has no installed participant.
+	 */
+	removal_recovery: ProfileRemovalRecoveryV1 | null,
 };
 
 /**  Why a recorded shortcut was not taken. */

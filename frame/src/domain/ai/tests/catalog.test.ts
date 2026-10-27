@@ -5,7 +5,6 @@ import {
   dollars,
   effortLevels,
   modelEffort,
-  hasChatGptModels,
   hasGatewayModels,
   hasGoModels,
   keyedProviders,
@@ -122,55 +121,42 @@ describe("the picker's details", () => {
   });
 });
 
-describe("ChatGPT account models", () => {
-  const chatgpt = () =>
+describe("retired direct-account catalog", () => {
+  const retained = () =>
     entry("open_ai", "gpt-example", "GPT Example", false, ["lead", "page"], {
       id: "chatgpt/gpt-example",
       price: null,
     });
-
-  test("native account models work without granting access to OpenAI API models", () => {
-    const view = models({});
-    view.entries.push(chatgpt());
-    expect(usable(view, "open_ai")).toBe(false);
-    expect(hasChatGptModels(view)).toBe(true);
-    const groups = pickerGroups(view, "lead");
-    expect(groups.ready.find((group) => group.provider === "open_ai")?.entries).toEqual([
-      chatgpt(),
-    ]);
-    expect(groups.needsKey).not.toContain("open_ai");
-  });
-
-  test("API key access and account models remain independent, and disconnect removes only the latter", () => {
-    const view = models({ keys: { open_ai: "valid" } });
-    view.entries.push(chatgpt());
-    expect(
-      pickerGroups(view, "lead").ready.find((group) => group.provider === "open_ai")?.entries,
-    ).toContainEqual(chatgpt());
-    view.entries = view.entries.filter((entry) => !entry.id.startsWith("chatgpt/"));
-    expect(hasChatGptModels(view)).toBe(false);
-    expect(usable(view, "open_ai")).toBe(true);
-    expect(
-      pickerGroups(view, "lead").ready.find((group) => group.provider === "open_ai")?.entries,
-    ).toHaveLength(3);
-  });
-
-  test("endpoint and more-model results cannot invent subscription eligibility", () => {
+  test("stale direct entries cannot offer a second subscription route or effort", () => {
     for (const keys of [{}, { open_ai: "valid" as const }]) {
       const view = models({ keys });
-      expect(hasChatGptModels(view)).toBe(false);
-      expect(
-        pickerGroups(view, "lead", [chatgpt()]).ready.flatMap((group) => group.entries),
-      ).not.toContainEqual(chatgpt());
+      const old = retained();
+      view.entries.push(old);
+      view.efforts.push({ id: old.id, levels: ["high"] });
+      view.chosen.page = old.id;
+      const before = structuredClone(view);
+      for (const role of ["lead", "page", "decision"] as const) {
+        const groups = pickerGroups(view, role, [old]);
+        expect(groups.ready.flatMap((group) => group.entries)).not.toContainEqual(old);
+        expect(searchEntries(groups.ready, "chatgpt")).toEqual([]);
+      }
+      expect(effortLevels(view, old.id)).toEqual([]);
+      expect(view).toEqual(before);
+      expect(modelConnection(old)).toBe("chatgpt");
+      expect(modelName(old)).toBe("GPT Example");
     }
   });
-
-  test("account models respect role admission and keep their billing identity in search", () => {
-    const view = models({});
-    view.entries.push(chatgpt());
-    const groups = pickerGroups(view, "page");
-    expect(searchEntries(groups.ready, "chatgpt")).toEqual([chatgpt()]);
-    expect(pickerGroups(view, "decision").ready).toEqual([]);
+  test("retirement neither grants API access nor removes configured API models", () => {
+    for (const configured of [false, true]) {
+      const view = models({ keys: configured ? { open_ai: "valid" } : {} });
+      view.entries.push(retained());
+      const groups = pickerGroups(view, "lead");
+      expect(usable(view, "open_ai")).toBe(configured);
+      expect(
+        groups.ready.find((group) => group.provider === "open_ai")?.entries ?? [],
+      ).toHaveLength(configured ? 3 : 0);
+      expect(groups.needsKey.includes("open_ai")).toBe(!configured);
+    }
   });
 });
 
@@ -189,7 +175,7 @@ test("OpenAI names stay clean while connection metadata distinguishes identical 
   view.entries.push(api, subscription);
   const groups = pickerGroups(view, "lead");
   expect(searchEntries(groups.ready, "gpt example api")).toEqual([api]);
-  expect(searchEntries(groups.ready, "gpt example chatgpt")).toEqual([subscription]);
+  expect(searchEntries(groups.ready, "gpt example chatgpt")).toEqual([]);
 });
 
 describe("local gateway catalog sources", () => {

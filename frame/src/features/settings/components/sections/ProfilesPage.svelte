@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { Add01Icon } from "@hugeicons/core-free-icons";
-  import type { ProfileEntryView } from "$shared/ipc/bindings";
-  import { drawn, profiles } from "$domain/profiles";
+  import type { ProfileEntryView, ProfileRemovalPhaseV1 } from "$shared/ipc/bindings";
+  import { drawn, profiles, removalPresentation } from "$domain/profiles";
   import { takeNewRequest } from "$session/profile-sheet.svelte";
   import * as m from "$shared/i18n/messages";
   import Button from "$shared/ui/Button";
@@ -17,11 +17,50 @@
   });
 
   const list = $derived(profiles.all());
+  const removals = $derived(profiles.removals());
+  const recoveryUnavailable = $derived(profiles.removalRecovery() === "unavailable");
+  const removalNeedsCheck = $derived(
+    removals.some((row) => row.blocked || row.phase === "awaiting_explicit_retry"),
+  );
   const currentId = $derived(profiles.current()?.id ?? null);
   let sheetOpen = $state(false);
   let editing = $state.raw<ProfileEntryView | null>(null);
   let switching = $state<string | null>(null);
   let failed = $state<string | null>(null);
+  let retrying = $state<string | null>(null);
+  let retryUnconfirmed = $state<string | null>(null);
+  let rechecking = $state(false);
+  let recheckUnconfirmed = $state(false);
+  const removalPhase: Record<ProfileRemovalPhaseV1, () => string> = {
+    preparing_native: m.profiles_removal_preparing,
+    awaiting_explicit_retry: m.profiles_removal_waiting,
+    authorizing: m.profiles_removal_authorizing,
+    cleanup: m.profiles_removal_cleanup,
+    erasing_browser: m.profiles_removal_browser,
+    finalizing: m.profiles_removal_finalizing,
+    acknowledging_native: m.profiles_removal_acknowledging_native,
+    failed_closed: m.profiles_removal_blocked,
+  };
+
+  async function retryRemoval(profile: string) {
+    if (retrying || rechecking) return;
+    retrying = profile;
+    retryUnconfirmed = null;
+    const admitted = await profiles.retryRemoval(profile);
+    // Even "scheduled" is not completion; only canonical progress can change
+    // the retained row or confirm which cleanup facts have actually happened.
+    if (admitted !== "scheduled") retryUnconfirmed = profile;
+    retrying = null;
+  }
+
+  async function recheckRemovalInventory() {
+    if (retrying || rechecking) return;
+    rechecking = true;
+    recheckUnconfirmed = false;
+    const observed = await profiles.recheckRemovalInventory();
+    recheckUnconfirmed = observed !== "scheduled";
+    rechecking = false;
+  }
   /** A new profile starts on the first colour no other profile wears. */
   const nextColor = $derived(
     Array.from({ length: AVATAR_COLORS }, (_, index) => (index + 1) % AVATAR_COLORS).find(
@@ -87,6 +126,33 @@
         </div>
       </li>
     {/each}
+    {#each removals as removal (removal.profile)}
+      {@const progress = removalPresentation(removal)}
+      <li class="row removal" data-profile={removal.profile}>
+        <div class="copy" role="status">
+          <strong>{m.profiles_removal_title()}</strong>
+          <small>{removalPhase[progress.phase]()}</small>
+          {#if progress.fact === "signed_out_cleanup_unconfirmed"}
+            <small>{m.profiles_removal_signed_out()}</small>
+          {:else if progress.fact === "managed_data_removed"}
+            <small>{m.profiles_removal_verified()}</small>
+          {:else if progress.fact === "not_configured"}
+            <small>{m.profiles_removal_not_configured()}</small>
+          {/if}
+          {#if retryUnconfirmed === removal.profile}
+            <small class="failed" role="alert">{m.profiles_removal_retry_unconfirmed()}</small>
+          {/if}
+        </div>
+        {#if progress.blocked || progress.phase === "awaiting_explicit_retry"}
+          <Button
+            size="compact"
+            pending={retrying === removal.profile}
+            disabled={retrying !== null || rechecking || recoveryUnavailable}
+            onclick={() => void retryRemoval(removal.profile)}>{m.profiles_removal_retry()}</Button
+          >
+        {/if}
+      </li>
+    {/each}
     <li>
       <button type="button" class="add" onclick={() => create()}>
         <span class="add-mark"><Icon icon={Add01Icon} size={16} strokeWidth={1.8} /></span>
@@ -94,6 +160,20 @@
       </button>
     </li>
   </ul>
+  {#if recoveryUnavailable || removalNeedsCheck}
+    <div class="recovery" role="status">
+      {#if recoveryUnavailable}<p>{m.profiles_removal_inventory_unavailable()}</p>{/if}
+      <Button
+        size="compact"
+        pending={rechecking}
+        disabled={rechecking || retrying !== null}
+        onclick={() => void recheckRemovalInventory()}>{m.profiles_removal_recheck()}</Button
+      >
+      {#if recheckUnconfirmed}<p class="failed" role="alert">
+          {m.profiles_removal_retry_unconfirmed()}
+        </p>{/if}
+    </div>
+  {/if}
   <p class="note">{m.profiles_list_note()}</p>
 </section>
 
@@ -171,6 +251,23 @@
 
   .failed {
     color: var(--color-danger);
+  }
+
+  .removal small {
+    white-space: normal;
+  }
+
+  .recovery {
+    display: grid;
+    justify-items: start;
+    gap: 8px;
+    margin: 12px 16px;
+    color: var(--color-muted);
+    font-size: var(--text-label);
+  }
+
+  .recovery p {
+    margin: 0;
   }
 
   .actions {

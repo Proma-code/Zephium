@@ -57,6 +57,9 @@ pub struct Association {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Call {
+    /// Read-only ownership observation. None requires no owner and no mappings;
+    /// it never creates a home, account grant, or deletion capability.
+    InspectOwner,
     /// Read-only saved-history metadata, including retired grant epochs. This
     /// is not a scope/receipt that permits native resume or dispatch.
     History {
@@ -123,6 +126,7 @@ impl Call {
     pub fn valid(&self) -> bool {
         let number = |n: u64| (1..=i64::MAX as u64).contains(&n);
         match self {
+            Self::InspectOwner => true,
             Self::History { conversation } => valid_conversation(conversation),
             Self::Open { incarnation } => *incarnation != [0; 16],
             Self::AdvanceGrant { expected } => expected.valid(),
@@ -187,7 +191,10 @@ impl Call {
         }
     }
     pub fn mutates(&self) -> bool {
-        !matches!(self, Self::Load { .. } | Self::History { .. })
+        !matches!(
+            self,
+            Self::InspectOwner | Self::Load { .. } | Self::History { .. }
+        )
     }
 }
 
@@ -207,6 +214,8 @@ pub enum Fault {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Reply {
+    /// Observed persisted identity only, never a newly admitted native scope.
+    Owner(Option<Scope>),
     Scope(Scope),
     Association(Option<Association>),
     Failed(Fault),
@@ -234,53 +243,43 @@ mod tests {
             incarnation: [1; 16],
             grant_epoch: 1,
         };
-        assert!(
-            Call::Bind {
-                scope,
-                conversation: "page-1".into(),
-                thread_id: "thread-1".into(),
-                expected_revision: None
+        assert!(Call::Bind {
+            scope,
+            conversation: "page-1".into(),
+            thread_id: "thread-1".into(),
+            expected_revision: None
+        }
+        .valid());
+        assert!(!Call::Open {
+            incarnation: [0; 16]
+        }
+        .valid());
+        assert!(!Call::AdvanceGrant {
+            expected: Scope {
+                grant_epoch: 0,
+                ..scope
             }
-            .valid()
-        );
-        assert!(
-            !Call::Open {
-                incarnation: [0; 16]
-            }
-            .valid()
-        );
-        assert!(
-            !Call::AdvanceGrant {
-                expected: Scope {
-                    grant_epoch: 0,
-                    ..scope
-                }
-            }
-            .valid()
-        );
-        assert!(
-            !Call::Begin {
-                scope,
-                conversation: "page-1".into(),
-                expected_revision: 1,
-                reply: 0
-            }
-            .valid()
-        );
+        }
+        .valid());
+        assert!(!Call::Begin {
+            scope,
+            conversation: "page-1".into(),
+            expected_revision: 1,
+            reply: 0
+        }
+        .valid());
         for id in ["", "../thread", "thread\n", "thread other"] {
             assert!(!valid_provider_id(id));
         }
         assert!(valid_provider_id("01234567-abcd_1234"));
         for revision in [None, Some(1)] {
-            assert!(
-                Call::Skip {
-                    scope,
-                    conversation: "page-1".into(),
-                    expected_revision: revision,
-                    reply: 2
-                }
-                .valid()
-            );
+            assert!(Call::Skip {
+                scope,
+                conversation: "page-1".into(),
+                expected_revision: revision,
+                reply: 2
+            }
+            .valid());
         }
         for (revision, reply) in [
             (Some(0), 2),
@@ -288,24 +287,20 @@ mod tests {
             (Some(u64::MAX), 2),
             (None, u64::MAX),
         ] {
-            assert!(
-                !Call::Skip {
-                    scope,
-                    conversation: "page-1".into(),
-                    expected_revision: revision,
-                    reply
-                }
-                .valid()
-            );
-        }
-        assert!(
-            !Call::Bind {
+            assert!(!Call::Skip {
                 scope,
                 conversation: "page-1".into(),
-                thread_id: "original".into(),
-                expected_revision: Some(0)
+                expected_revision: revision,
+                reply
             }
-            .valid()
-        );
+            .valid());
+        }
+        assert!(!Call::Bind {
+            scope,
+            conversation: "page-1".into(),
+            thread_id: "original".into(),
+            expected_revision: Some(0)
+        }
+        .valid());
     }
 }

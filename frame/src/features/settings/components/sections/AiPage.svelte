@@ -6,7 +6,6 @@
     ModelsSession,
     entryOf,
     keyedProviders,
-    hasChatGptModels,
     hasGatewayModels,
     hasGoModels,
     connectionName,
@@ -25,6 +24,7 @@
   import AiVoiceRow from "../AiVoiceRow.svelte";
   import AiZephiumRow from "../AiZephiumRow.svelte";
   import AiConnectionOptions from "../AiConnectionOptions.svelte";
+  import CodexAccount from "../CodexAccount.svelte";
   import WorkDecisions from "../WorkDecisions.svelte";
 
   let profile = $derived(tabs.profile());
@@ -59,8 +59,7 @@
   ];
   const anyUsable = $derived(
     !!models &&
-      (hasChatGptModels(models) ||
-        hasGatewayModels(models) ||
+      (hasGatewayModels(models) ||
         hasGoModels(models) ||
         usable(models, "cloud") ||
         keyedProviders.some((provider) => usable(models, provider))),
@@ -115,7 +114,9 @@
     const offered = pickerGroups(models, role, [
       ...(session?.endpoint ?? []),
       ...(expanded ? (session?.more ?? []) : []),
-    ]).ready.flatMap((group) => group.entries);
+    ])
+      .ready.flatMap((group) => group.entries)
+      .filter((entry) => !entry.id.startsWith("chatgpt/"));
     const chosen = models?.chosen[role];
     const missingAccountChoice =
       (chosen?.startsWith("chatgpt/") ||
@@ -157,13 +158,12 @@
   {#if !anyUsable}<p class="ai-note">{m.ai_byok_start()}</p>{/if}
 
   <AiZephiumRow />
-  {#await import("../ChatGptAccount.svelte")}
-    <p class="ai-note" role="status">{m.model_chatgpt_loading()}</p>
-  {:then account}
+  {#await import("../LegacyAccountRecovery.svelte") then account}
     <account.default profile={profile.id} />
   {:catch}
-    <p class="ai-note" role="alert">{m.model_chatgpt_load_failed()}</p>
+    <p class="ai-note" role="alert">{m.ai_legacy_recovery_unavailable()}</p>
   {/await}
+  <CodexAccount profile={profile.id} />
   <AiConnectionOptions kind="accounts" profile={profile.id} />
 
   <SettingsGroup title={m.ai_keys_group()} description={m.ai_keys_note()}>

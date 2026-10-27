@@ -345,16 +345,158 @@ pub struct ResolvedModel {
     pub client: Arc<dyn WorkModelClient>,
 }
 
-/// The person's Page model.
+/// Original-client identity without a fabricated Work model, wire or price.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeConversationChoice {
+    pub id: String,
+    pub name: String,
+    pub source: zephium_ipc::page_assist::PageAssistModelSourceV1,
+    pub effort: Option<String>,
+}
+
+#[derive(Clone)]
+pub enum PageBackendChoice {
+    Model(ModelChoice),
+    NativeConversation(NativeConversationChoice),
+}
+
+#[derive(Clone)]
+pub struct ResolvedNativeConversation {
+    pub choice: NativeConversationChoice,
+    pub client: Arc<dyn NativeConversationClient>,
+}
+
+#[derive(Clone)]
+pub enum ResolvedPageBackend {
+    Model(ResolvedModel),
+    NativeConversation(ResolvedNativeConversation),
+}
+
+pub enum PageBackendError {
+    /// Native capacity was not reserved; no visible Page turn may be appended.
+    Busy,
+    Model(WorkModelError),
+    NativeConversation(zephium_ipc::page_assist::PageAssistNativeFaultV1),
+}
+
+/// Native-owned Page observation before a visible turn exists. This is data,
+/// not a dispatch permission; no provider request may be sent while reserving.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeConversationDraft {
+    pub conversation: String,
+    pub new_conversation: bool,
+    pub previous_reply: Option<u32>,
+    pub text: String,
+}
+
+/// Only the current exact words and existing Page identities cross this port.
+/// Profile, connection, selected model and effort are captured by the resolver.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeConversationRequest {
+    pub conversation: String,
+    pub reply: u32,
+    /// Captured from the empty native Page transcript before admission, not UI input.
+    pub new_conversation: bool,
+    /// Actual latest displayed reply before admission, including other backends.
+    pub previous_reply: Option<u32>,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeConversationEvent {
+    /// Complete current display text, never an append inferred from final text.
+    TextSnapshot { text: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeConversationStatus {
+    Completed,
+    /// Exact original-writer no-send proof and durable Skip acknowledgement.
+    /// Not derived from cancellation, timeout, or an absent provider turn ID.
+    NeverStarted,
+    /// Genuine original terminal; local durable history settlement is unconfirmed.
+    HistoryUncertain,
+    Interrupted,
+    Failed,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeConversationOutcome {
+    pub status: NativeConversationStatus,
+    /// The original completed-item selection; None is a valid empty result.
+    pub final_response: Option<String>,
+}
+
+pub type NativeConversationEvents = Arc<
+    dyn Fn(NativeConversationEvent) -> Result<(), zephium_ipc::page_assist::PageAssistNativeFaultV1>
+        + Send
+        + Sync,
+>;
+
+/// An owned original-client conversation, not a WorkModelClient adapter.
+/// Dropping a reply future cancels that exact native request. Callbacks must
+/// cease after completion/drop; a rejected callback stops the native reply.
+pub trait NativeConversationClient: Send + Sync {
+    fn reply<'a>(
+        &'a self,
+        request: NativeConversationRequest,
+        events: NativeConversationEvents,
+    ) -> BoxFuture<
+        'a,
+        Result<NativeConversationOutcome, zephium_ipc::page_assist::PageAssistNativeFaultV1>,
+    >;
+}
+
+/// One scope/selection-bound native slot holding the exact admitted draft.
+/// Not cloneable. Dropping before `commit` releases only a provably unsent slot.
+/// After handoff, native ownership retains the slot through actual settlement,
+/// including when the waiting Page task is cancelled or dropped.
+pub trait NativeConversationReservation: Send {
+    /// Pure, nonblocking validation of captured scope/selection and slot ownership.
+    /// Called under Page's commit lock; no I/O, callbacks, or Page re-entry.
+    fn validate(&self) -> Result<(), zephium_ipc::page_assist::PageAssistNativeFaultV1>;
+    /// Binds the newly committed Page reply exactly once. The reserved draft
+    /// cannot be replaced here; no re-resolution or second slot acquisition.
+    /// The local actor handoff MUST finish synchronously before returning this
+    /// future. Dropping even an unpolled future only cancels the actor-owned turn.
+    /// `cancel` is Page-owned and shared unchanged with final writer admission;
+    /// Stop sets it synchronously even before the returned waiter is polled.
+    fn commit(
+        self: Box<Self>,
+        reply: u32,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        events: NativeConversationEvents,
+    ) -> BoxFuture<
+        'static,
+        Result<NativeConversationOutcome, zephium_ipc::page_assist::PageAssistNativeFaultV1>,
+    >;
+}
+
+/// The person's Page backend.
 pub trait ModelSource: Send + Sync {
-    /// The model a reply in `profile` would use, without a client.
-    fn entry<'a>(&'a self, profile: &'a ProfileId) -> BoxFuture<'a, Option<ModelChoice>>;
-    /// The model and a client for one reply's calls.
+    /// Resolve and reserve one exact native draft before Page mutates its transcript.
+    /// No provider send is permitted here. Dropping/timing out this future must
+    /// cancel queued reservation acquisition and release undelivered reservations.
+    /// Legacy adapters fail closed without invoking their model resolver.
+    fn reserve_native<'a>(
+        &'a self,
+        _profile: &'a ProfileId,
+        _expected: NativeConversationChoice,
+        _draft: NativeConversationDraft,
+    ) -> BoxFuture<'a, Result<Box<dyn NativeConversationReservation>, PageBackendError>> {
+        Box::pin(async {
+            Err(PageBackendError::NativeConversation(
+                zephium_ipc::page_assist::PageAssistNativeFaultV1::UnsupportedInput,
+            ))
+        })
+    }
+    fn entry<'a>(&'a self, profile: &'a ProfileId) -> BoxFuture<'a, Option<PageBackendChoice>>;
     fn resolve<'a>(
         &'a self,
         profile: &'a ProfileId,
         source: WorkCallSource,
-    ) -> BoxFuture<'a, Result<ResolvedModel, WorkModelError>>;
+    ) -> BoxFuture<'a, Result<ResolvedPageBackend, PageBackendError>>;
 }
 
 /// Where the panel's events go.

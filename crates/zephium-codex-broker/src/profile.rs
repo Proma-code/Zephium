@@ -19,6 +19,10 @@ impl ProfileId {
     pub fn from_native(bytes: [u8; 16]) -> Option<Self> {
         (bytes != [0; 16]).then_some(Self(bytes))
     }
+    /// Native correlation only; these bytes grant no account or filesystem authority.
+    pub fn bytes(self) -> [u8; 16] {
+        self.0
+    }
     pub(crate) fn leaf(self) -> String {
         self.0.iter().map(|b| format!("{b:02x}")).collect()
     }
@@ -341,3 +345,41 @@ mod tests {
         assert!(future.encode().is_none());
     }
 }
+
+pub mod removal;
+#[cfg(all(
+    windows,
+    any(feature = "native-fixtures", feature = "trial-integration")
+))]
+pub use native::removal::recovery::{
+    recheck_pending, recover_pending, AbsenceRetryFailure, InventoryStatus, RecoveredRemoval,
+    RecoveryInventory, RecoveryState,
+};
+#[cfg(all(
+    windows,
+    any(feature = "native-fixtures", feature = "trial-integration")
+))]
+pub use native::removal::{
+    HeldRemoval, PreparationFailure, PreparedRemoval, RemovalFault, RetryFailure,
+};
+
+#[cfg(all(
+    windows,
+    any(feature = "native-fixtures", feature = "trial-integration")
+))]
+pub use native::removal::{absence::NotConfiguredRemoval, authorization::RemovalJournal};
+
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
+pub(crate) mod absence_record;
+
+#[cfg(all(
+    windows,
+    any(feature = "native-fixtures", feature = "trial-integration")
+))]
+pub use native::removal::cleanup::{CleanupProgress, CleanupRemoval};

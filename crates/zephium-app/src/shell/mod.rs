@@ -1226,6 +1226,14 @@ impl Shell {
             Command::BlockerCatalogPoll { operation, attempt } => {
                 self.on_blocker_catalog_poll(operation, attempt)
             }
+            Command::RecheckProfileRemovalInventory { reply } => {
+                let outcome = self.recheck_profile_removal_inventory();
+                let _ = reply.try_send(outcome);
+            }
+            Command::RetryProfileRemoval { profile, reply } => {
+                let outcome = self.retry_profile_removal(profile);
+                let _ = reply.try_send(outcome);
+            }
             Command::ProfileDeletionRetry {
                 profile,
                 generation,

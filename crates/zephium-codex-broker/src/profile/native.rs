@@ -1,4 +1,6 @@
 //! Fixed Windows trial home authority. No external path/config/credential adoption.
+#[cfg(any(feature = "native-fixtures", feature = "trial-integration"))]
+pub(crate) mod removal;
 use super::{Migration, NodeId, ProfileId, Record, CLEAN, DIRTY, LENGTH, MIGRATION_LENGTH};
 use sha2::{Digest, Sha256};
 use std::{
@@ -143,6 +145,77 @@ impl ProfileLease {
         ancestors.push(hold_directory(&base, &owner)?);
         Self::under(&base, profile, &owner, ancestors)
     }
+    /// Removal of a canonically configured owner is observational here: never
+    /// provision a replacement home or migrate metadata to make logout work.
+    #[cfg(any(feature = "native-fixtures", feature = "trial-integration"))]
+    pub(crate) fn open_existing_for_removal(
+        profile: ProfileId,
+        incarnation: [u8; 16],
+    ) -> Result<Self, Error> {
+        let local = known_local()?;
+        let mut ancestors = Vec::new();
+        for path in local.ancestors().collect::<Vec<_>>().into_iter().rev() {
+            ancestors.push(crate::image::pin_directory(path).map_err(|_| Error::Invalid)?);
+        }
+        let owner = owner_sid()?;
+        Self::existing_for_removal_under(
+            &local.join(LEAF),
+            profile,
+            incarnation,
+            &owner,
+            &ancestors,
+        )
+    }
+    #[cfg(any(feature = "native-fixtures", feature = "trial-integration"))]
+    fn existing_for_removal_under(
+        base: &Path,
+        profile: ProfileId,
+        incarnation: [u8; 16],
+        owner: &str,
+        ancestors: &[File],
+    ) -> Result<Self, Error> {
+        if incarnation == [0; 16] {
+            return Err(Error::Scope);
+        }
+        let exists = |path: &Path| match std::fs::symlink_metadata(path) {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(Error::RecoveryRequired)
+            }
+            Err(error) => Err(io_failure(IoStage::RootMetadata, error)),
+        };
+        exists(base)?;
+        let parent = hold_directory(base, owner)?;
+        removal::require_no_intent(base, profile)?;
+        let root = base.join(profile.leaf());
+        exists(&root)?;
+        let root_hold = hold_metadata_directory(&root, owner)?;
+        exists(&root.join("lease"))?;
+        exists(&root.join("registration"))?;
+        let mut registration = open_read(&root.join("registration"))?;
+        verify_file(&registration, owner)?;
+        let owner_hash = Sha256::digest(owner.as_bytes()).into();
+        let record = Record::decode(
+            &read_bounded(&mut registration, LENGTH)?,
+            profile,
+            owner_hash,
+        )
+        .ok_or(Error::Scope)?;
+        if record.incarnation != incarnation || identity(&root_hold)? != record.nodes[0] {
+            return Err(Error::Scope);
+        }
+        if record.version != super::VERSION {
+            // A known historical registration is not permission to migrate in
+            // this existing-only removal admission. Ordinary Connect owns that.
+            return Err(Error::RecoveryRequired);
+        }
+        // Keep the original root/registration guarded while the exact exclusive
+        // CLEAN lease and every fixed identity/byte receipt are reconstructed.
+        let lease =
+            removal::recovery::recover_prepared_lease(base, owner, &record, &parent, ancestors)?;
+        removal::require_no_intent(base, profile)?;
+        Ok(lease)
+    }
     // Only the explicit native fixture may supply a disposable parent. Product
     // admission has exactly the KnownFolder route above, never a renderer path.
     #[cfg(all(debug_assertions, feature = "native-fixtures"))]
@@ -151,12 +224,20 @@ impl ProfileLease {
         let parent_hold = crate::image::pin_directory(parent).map_err(|_| Error::Invalid)?;
         Self::under(parent, profile, &owner, vec![parent_hold])
     }
+    #[cfg(all(debug_assertions, feature = "native-fixtures"))]
+    pub(crate) fn fixture_protected(parent: &Path, profile: ProfileId) -> Result<Self, Error> {
+        let base = parent.join("removal-owned-parent");
+        create_dir(&base, &owner_sid()?)?;
+        Self::fixture(&base, profile)
+    }
     fn under(
         base: &Path,
         profile: ProfileId,
         owner: &str,
         mut pins: Vec<File>,
     ) -> Result<Self, Error> {
+        #[cfg(any(feature = "native-fixtures", feature = "trial-integration"))]
+        removal::require_no_intent(base, profile)?;
         let root = base.join(profile.leaf());
         let fresh = match std::fs::symlink_metadata(&root) {
             Ok(_) => false,

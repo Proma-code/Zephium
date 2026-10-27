@@ -1,6 +1,11 @@
 //! Crash-resumable profile-deletion authorization and native erasure.
 
 use super::*;
+use crate::profile_removal::{
+    AuthorizedRemoval, CleanupProgress, ExplicitRemovalRetry, FinalizedRemoval, InventoryStatus,
+    Preparation, PreparedKind, PreparedRemoval, PreparedStatus, ProfileRemovalParticipant,
+    RecoverableRemoval, RecoveredRemovalStage, RemovalAttempt, RemovalStage,
+};
 
 pub(super) const PROFILE_DELETION_STORE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(2);
@@ -8,6 +13,17 @@ const PROFILE_DELETION_RETRY_BASE: std::time::Duration = std::time::Duration::fr
 const PROFILE_DELETION_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub(super) enum ProfileDeletionPhase {
+    /// Recovery or exact native interruption preserves intent/quarantine but
+    /// cannot authorize active-profile deletion without explicit reconciliation.
+    AwaitingExplicitRetry,
+    /// Original logout and physical settlement must precede removal from the
+    /// Store's active registry. No engine or profile data has been erased.
+    PreparingNative,
+    /// Durable deletion authorization exists. Promote the exact retained
+    /// native capability (or recover protected intent) before engine erasure.
+    CleanupReady {
+        engine_verified: bool,
+    },
     /// No Store deletion authority exists yet. The next action builds a
     /// fresh post-removal snapshot and authorizes it.
     AwaitingAuthorization,
@@ -27,10 +43,17 @@ pub(super) enum ProfileDeletionPhase {
         attempt: u64,
     },
     FinalizeReady,
+    NativeFinalizationReady,
     /// A Store/application invariant failed closed. The durable journal and
     /// native data remain untouched while the composition root terminates
     /// the process.
     FailedClosed,
+}
+
+#[derive(Clone, Copy)]
+enum PausedNativeContinuation {
+    Cleanup { engine_verified: bool },
+    Finalization,
 }
 
 pub(super) struct ProfileDeletionState {
@@ -44,6 +67,14 @@ pub(super) struct ProfileDeletionState {
     pub(super) attempt_generation: u64,
     pub(super) retry_generation: u64,
     pub(super) retry_exponent: u8,
+    pub(super) native_attempt: Option<RemovalAttempt>,
+    initial_preparation: Option<Preparation>,
+    recovery: Option<Box<dyn RecoverableRemoval>>,
+    paused_native: Option<PausedNativeContinuation>,
+    prepared: Option<Box<dyn PreparedRemoval>>,
+    prepared_kind: Option<PreparedKind>,
+    cleanup: zephium_ipc::ProfileRemovalCleanupV1,
+    pub(super) native_progress: Option<(RemovalStage, bool)>,
 }
 
 impl ProfileDeletionState {
@@ -52,6 +83,11 @@ impl ProfileDeletionState {
         operation_id: Option<String>,
         authorization_revision: u128,
     ) -> Self {
+        let cleanup = if matches!(phase, ProfileDeletionPhase::CleanupReady { .. }) {
+            zephium_ipc::ProfileRemovalCleanupV1::Unconfirmed
+        } else {
+            zephium_ipc::ProfileRemovalCleanupV1::NotStarted
+        };
         Self {
             phase,
             operation_id,
@@ -59,6 +95,14 @@ impl ProfileDeletionState {
             attempt_generation: 0,
             retry_generation: 0,
             retry_exponent: 0,
+            native_attempt: None,
+            initial_preparation: None,
+            recovery: None,
+            paused_native: None,
+            prepared: None,
+            prepared_kind: None,
+            cleanup,
+            native_progress: None,
         }
     }
 }
@@ -73,26 +117,227 @@ pub(super) struct ProfileDeletionCoordinator {
     /// A failed invariant permanently closes deletion and bootstrap progress
     /// for this process while the composition root converges on shutdown.
     pub(super) failed_closed: bool,
+    pub(super) native_participant: Option<Arc<dyn ProfileRemovalParticipant>>,
+    pub(super) native_inventory: Option<InventoryStatus>,
 }
 
 impl Default for ProfileDeletionCoordinator {
     fn default() -> Self {
+        let native_participant = crate::profile_removal::participant();
+        let native_inventory = native_participant
+            .as_ref()
+            .map(|_| InventoryStatus::Unavailable);
         Self {
             states: std::collections::HashMap::new(),
             inbox: Arc::new(Mutex::new(std::collections::HashMap::new())),
             batch_deadline: None,
             failed_closed: false,
+            native_participant,
+            native_inventory,
         }
     }
 }
 
 impl Shell {
+    pub(super) fn recover_native_profile_removals(&mut self, deadline: std::time::Instant) {
+        let Some(participant) = self.profile_deletion.native_participant.clone() else {
+            return;
+        };
+        let inventory = participant.recover_pending(deadline);
+        self.apply_native_removal_inventory(&participant, inventory);
+    }
+
+    fn apply_native_removal_inventory(
+        &mut self,
+        participant: &Arc<dyn ProfileRemovalParticipant>,
+        inventory: crate::profile_removal::RecoveryInventory,
+    ) {
+        let mut status = inventory.status;
+        let mut seen = std::collections::HashSet::new();
+        if inventory.records.len() > zephium_core::session::MAX_SESSION_PROFILES {
+            status = InventoryStatus::Unavailable;
+        }
+        let finalized_pending = if inventory
+            .records
+            .iter()
+            .any(|record| record.stage() == RecoveredRemovalStage::FinalizationPending)
+        {
+            match self.store.pending_profile_deletions() {
+                ProfileDeletionLoad::Loaded(rows) => Some(
+                    rows.into_iter()
+                        .map(|row| row.profile)
+                        .collect::<std::collections::HashSet<_>>(),
+                ),
+                ProfileDeletionLoad::Failed => None,
+            }
+        } else {
+            None
+        };
+        for record in inventory
+            .records
+            .into_iter()
+            .take(zephium_core::session::MAX_SESSION_PROFILES)
+        {
+            let profile = record.profile();
+            if !seen.insert(profile) {
+                status = InventoryStatus::Unavailable;
+                if let Some(state) = self.profile_deletion.states.get_mut(&profile) {
+                    state.recovery = None;
+                }
+                continue;
+            }
+            if let Some(state) = self.profile_deletion.states.get_mut(&profile) {
+                // Existing canonical journal supplies browser deletion authority;
+                // this opaque record supplies only its own native recovery facts.
+                if state.recovery.is_none() && state.prepared.is_none() {
+                    state.recovery = Some(record);
+                }
+                continue;
+            }
+            if record.stage() == RecoveredRemovalStage::FinalizationPending {
+                if self.profiles.get(profile).is_some()
+                    || finalized_pending
+                        .as_ref()
+                        .is_none_or(|pending| pending.contains(&profile))
+                {
+                    status = InventoryStatus::Unavailable;
+                    continue;
+                }
+                // The native participant already joined its own protected
+                // Completed record to both canonical absent cohorts. Retain a
+                // visible finalization-only obligation; no current action is
+                // minted merely because this process restarted.
+                let mut state = ProfileDeletionState::new(
+                    ProfileDeletionPhase::AwaitingExplicitRetry,
+                    None,
+                    self.persistence.session_revision,
+                );
+                state.native_attempt = Some(RemovalAttempt::new(profile));
+                state.recovery = Some(record);
+                state.paused_native = Some(PausedNativeContinuation::Finalization);
+                state.native_progress = Some((RemovalStage::RecoveryRequired, true));
+                self.profile_deletion.states.insert(profile, state);
+                continue;
+            }
+            if !self
+                .profiles
+                .get(profile)
+                .is_some_and(|row| row.kind == ProfileKind::Named)
+            {
+                // Do not invent a visible profile or deletion authority for an
+                // unjoinable native record. Seal the integration, not the browser.
+                status = InventoryStatus::Unavailable;
+                continue;
+            }
+            let mut state = ProfileDeletionState::new(
+                ProfileDeletionPhase::AwaitingExplicitRetry,
+                None,
+                self.persistence.session_revision,
+            );
+            state.native_attempt = Some(RemovalAttempt::new(profile));
+            state.recovery = Some(record);
+            state.native_progress = Some((RemovalStage::RecoveryRequired, true));
+            self.profile_deletion.states.insert(profile, state);
+            self.user_content_status.retire_profile(profile);
+            self.cancel_pending_blocker_mutation(
+                profile,
+                OperationReason::ProfileDeletionInProgress,
+            );
+            self.retire_blocker_statistics(profile);
+            self.blocker.retire_profile(profile);
+            self.finish_terminalized_blocker_native_operations();
+        }
+        if status == InventoryStatus::Unavailable {
+            participant.seal_inventory();
+        }
+        self.profile_deletion.native_inventory = Some(status);
+    }
+
+    pub(super) fn recheck_profile_removal_inventory(
+        &mut self,
+    ) -> zephium_ipc::ProfileRemovalRetryV1 {
+        let Some(participant) = self.profile_deletion.native_participant.clone() else {
+            return zephium_ipc::ProfileRemovalRetryV1::NotPending;
+        };
+        let attempts = self
+            .profile_deletion
+            .states
+            .values()
+            .filter_map(|state| state.native_attempt.clone())
+            .collect();
+        let request = crate::profile_removal::InventoryRecheck::new(attempts);
+        let inventory = participant.recheck_inventory(&request, self.profile_deletion_deadline());
+        self.apply_native_removal_inventory(&participant, inventory);
+        // Observation only: retain every operation, prepared token and phase.
+        // A newly discovered preauth record remains AwaitingExplicitRetry.
+        self.project_profiles();
+        if self.profile_deletion.native_inventory == Some(InventoryStatus::Verified) {
+            zephium_ipc::ProfileRemovalRetryV1::Scheduled
+        } else {
+            zephium_ipc::ProfileRemovalRetryV1::Blocked
+        }
+    }
+
+    pub(super) fn profile_removal_recovery_view(
+        &self,
+    ) -> Option<zephium_ipc::ProfileRemovalRecoveryV1> {
+        self.profile_deletion
+            .native_inventory
+            .map(|status| match status {
+                InventoryStatus::Verified => zephium_ipc::ProfileRemovalRecoveryV1::Verified,
+                InventoryStatus::Unavailable => zephium_ipc::ProfileRemovalRecoveryV1::Unavailable,
+            })
+    }
+
+    pub(super) fn profile_removals_view(&self) -> Vec<zephium_ipc::ProfileRemovalViewV1> {
+        use zephium_ipc::{
+            ProfileRemovalNativeV1 as Native, ProfileRemovalPhaseV1 as Phase, ProfileRemovalViewV1,
+        };
+        let mut rows: Vec<_> = self
+            .profile_deletion
+            .states
+            .iter()
+            .map(|(profile, state)| ProfileRemovalViewV1 {
+                profile: profile.to_string(),
+                phase: match state.phase {
+                    ProfileDeletionPhase::AwaitingExplicitRetry => Phase::AwaitingExplicitRetry,
+                    ProfileDeletionPhase::PreparingNative => Phase::PreparingNative,
+                    ProfileDeletionPhase::AwaitingAuthorization
+                    | ProfileDeletionPhase::Authorizing { .. }
+                    | ProfileDeletionPhase::ResolveAuthorizedJournal => Phase::Authorizing,
+                    ProfileDeletionPhase::CleanupReady { .. } => Phase::Cleanup,
+                    ProfileDeletionPhase::NativeReady
+                    | ProfileDeletionPhase::NativeInFlight { .. } => Phase::ErasingBrowser,
+                    ProfileDeletionPhase::FinalizeReady => Phase::Finalizing,
+                    ProfileDeletionPhase::NativeFinalizationReady => Phase::AcknowledgingNative,
+                    ProfileDeletionPhase::FailedClosed => Phase::FailedClosed,
+                },
+                native: match state.prepared_kind {
+                    Some(PreparedKind::SignedOutSettled) => Native::SignedOutSettled,
+                    Some(PreparedKind::NotConfigured) => Native::NotConfigured,
+                    None => Native::Unconfirmed,
+                },
+                cleanup: state.cleanup,
+                blocked: state.native_progress.is_some_and(|(_, blocked)| blocked)
+                    || matches!(state.phase, ProfileDeletionPhase::FailedClosed),
+            })
+            .collect();
+        rows.sort_by(|a, b| a.profile.cmp(&b.profile));
+        rows
+    }
+
     pub(super) fn begin_profile_deletion(
         &mut self,
         profile: ProfileId,
         operation_id: Option<String>,
     ) -> OperationDisposition {
         if self.profile_deletion.failed_closed {
+            return operation_result(
+                OperationOutcome::Rejected,
+                OperationReason::StoreAdmissionRejected,
+            );
+        }
+        if self.profile_deletion.native_inventory == Some(InventoryStatus::Unavailable) {
             return operation_result(
                 OperationOutcome::Rejected,
                 OperationReason::StoreAdmissionRejected,
@@ -134,14 +379,32 @@ impl Shell {
         // authority.
         drop(filtered);
         let authorization_revision = self.persistence.session_revision;
-        self.profile_deletion.states.insert(
-            profile,
-            ProfileDeletionState::new(
-                ProfileDeletionPhase::AwaitingAuthorization,
-                operation_id,
-                authorization_revision,
-            ),
+        let native = self.profile_deletion.native_participant.is_some();
+        let mut state = ProfileDeletionState::new(
+            if native {
+                ProfileDeletionPhase::PreparingNative
+            } else {
+                ProfileDeletionPhase::AwaitingAuthorization
+            },
+            operation_id,
+            authorization_revision,
         );
+        if let Some(participant) = self.profile_deletion.native_participant.clone() {
+            let attempt = RemovalAttempt::new(profile);
+            let result = participant.prepare(&attempt, self.profile_deletion_deadline());
+            if matches!(result, Preparation::Busy) {
+                return operation_result(
+                    OperationOutcome::Rejected,
+                    OperationReason::ProfileDeletionInProgress,
+                );
+            }
+            // Native acceptance precedes quarantine. From here to insertion
+            // there are no fallible checks/returns: retain this exact attempt
+            // and move-only initial result for one consumption by the driver.
+            state.native_attempt = Some(attempt);
+            state.initial_preparation = Some(result);
+        }
+        self.profile_deletion.states.insert(profile, state);
         if self.user_content_status.retire_profile(profile) {
             self.project_runtime_status();
         }
@@ -334,16 +597,63 @@ impl Shell {
         self.project_items();
     }
 
+    pub(super) fn retry_profile_removal(
+        &mut self,
+        profile: ProfileId,
+    ) -> zephium_ipc::ProfileRemovalRetryV1 {
+        use zephium_ipc::ProfileRemovalRetryV1;
+        let Some(state) = self.profile_deletion.states.get(&profile) else {
+            return ProfileRemovalRetryV1::NotPending;
+        };
+        if self.profile_deletion.native_inventory == Some(InventoryStatus::Unavailable)
+            || self.profile_deletion.failed_closed
+            || matches!(state.phase, ProfileDeletionPhase::FailedClosed)
+        {
+            return ProfileRemovalRetryV1::Blocked;
+        }
+        // Keep the exact existing attempt, native deadlines and original
+        // operation id. This never calls begin_profile_deletion or admits a
+        // replacement logout. The native owner only reconciles its held work.
+        if matches!(state.phase, ProfileDeletionPhase::AwaitingExplicitRetry) {
+            self.retry_native_profile_removal(profile);
+        } else {
+            self.drive_profile_deletion(profile);
+        }
+        if self
+            .profile_deletion
+            .states
+            .get(&profile)
+            .is_some_and(|state| {
+                state.native_progress.is_some_and(|(_, blocked)| blocked)
+                    || matches!(state.phase, ProfileDeletionPhase::FailedClosed)
+            })
+        {
+            ProfileRemovalRetryV1::Blocked
+        } else {
+            ProfileRemovalRetryV1::Scheduled
+        }
+    }
+
     pub(super) fn drive_profile_deletion(&mut self, profile: ProfileId) {
+        if self.profile_deletion.native_inventory == Some(InventoryStatus::Unavailable) {
+            if let Some(state) = self.profile_deletion.states.get_mut(&profile) {
+                state.native_progress = Some((RemovalStage::RecoveryRequired, true));
+            }
+            self.project_profiles();
+            return;
+        }
         if self.profile_deletion.failed_closed {
             return;
         }
         enum Action {
+            PrepareNative,
+            CleanupNative(bool),
             Authorize,
             ReconcileAuthorization(bool),
             ResolveAuthorizedJournal,
             EraseNative,
             Finalize,
+            AcknowledgeNative,
             None,
         }
 
@@ -352,6 +662,11 @@ impl Shell {
                 return;
             };
             match state.phase {
+                ProfileDeletionPhase::AwaitingExplicitRetry => Action::None,
+                ProfileDeletionPhase::PreparingNative => Action::PrepareNative,
+                ProfileDeletionPhase::CleanupReady { engine_verified } => {
+                    Action::CleanupNative(engine_verified)
+                }
                 ProfileDeletionPhase::AwaitingAuthorization => Action::Authorize,
                 ProfileDeletionPhase::Authorizing {
                     may_reauthorize, ..
@@ -360,6 +675,7 @@ impl Shell {
                 ProfileDeletionPhase::NativeReady => Action::EraseNative,
                 ProfileDeletionPhase::NativeInFlight { .. } => Action::None,
                 ProfileDeletionPhase::FinalizeReady => Action::Finalize,
+                ProfileDeletionPhase::NativeFinalizationReady => Action::AcknowledgeNative,
                 ProfileDeletionPhase::FailedClosed => Action::None,
             }
         };
@@ -367,6 +683,10 @@ impl Shell {
             queue.cancel_profile_deletion(profile);
         }
         match action {
+            Action::PrepareNative => self.prepare_native_profile_removal(profile),
+            Action::CleanupNative(engine_verified) => {
+                self.cleanup_native_profile_removal(profile, engine_verified)
+            }
             Action::Authorize => {
                 let deadline = self.profile_deletion_deadline();
                 self.authorize_profile_deletion(profile, deadline);
@@ -400,6 +720,7 @@ impl Shell {
                 let deadline = self.profile_deletion_deadline();
                 self.finalize_profile_deletion(profile, deadline);
             }
+            Action::AcknowledgeNative => self.acknowledge_native_finalization(profile, false),
             Action::None => {}
         }
     }
@@ -435,6 +756,7 @@ impl Shell {
             queue.cancel_profile_deletion(profile);
         }
         self.profile_deletion.failed_closed = true;
+        self.project_profiles();
         self.report_terminal_failure(ShellTerminalFailure::ProfileDeletionInvariant);
     }
 
@@ -449,6 +771,16 @@ impl Shell {
             self.fail_profile_deletion_invariant(profile);
             return;
         }
+        if self.profile_deletion.native_participant.is_some()
+            && self
+                .profile_deletion
+                .states
+                .get(&profile)
+                .is_none_or(|state| state.prepared.is_none())
+        {
+            self.fail_profile_deletion_invariant(profile);
+            return;
+        }
         let Some(filtered) = self.filtered_session_for_profile_deletion(profile) else {
             self.fail_profile_deletion_invariant(profile);
             return;
@@ -456,6 +788,41 @@ impl Shell {
         if let Some(state) = self.profile_deletion.states.get_mut(&profile) {
             state.authorization_revision = self.persistence.session_revision;
         }
+        if self.profile_deletion.native_participant.is_some() {
+            let status = self
+                .profile_deletion
+                .states
+                .get_mut(&profile)
+                .and_then(|state| {
+                    let attempt = state.native_attempt.as_ref()?;
+                    let prepared = state.prepared.as_mut()?;
+                    prepared
+                        .attempt()
+                        .same_attempt(attempt)
+                        .then(|| prepared.authorization_status(attempt, deadline))
+                });
+            match status {
+                Some(PreparedStatus::Current) => {}
+                Some(PreparedStatus::Pending(stage)) => {
+                    self.defer_native_profile_removal(profile, stage, false);
+                    return;
+                }
+                Some(PreparedStatus::Interrupted(stage)) => {
+                    self.pause_native_profile_removal(profile, stage);
+                    return;
+                }
+                Some(PreparedStatus::Blocked(stage)) => {
+                    self.defer_native_profile_removal(profile, stage, true);
+                    return;
+                }
+                None => {
+                    self.fail_profile_deletion_invariant(profile);
+                    return;
+                }
+            }
+        }
+        // Once handed to Store, cancellation cannot prove no authorization.
+        // Unknown acknowledgements always reconcile the canonical journal.
         let outcome = self
             .store
             .authorize_profile_deletion(profile, filtered, deadline);
@@ -586,7 +953,11 @@ impl Shell {
             .is_some_and(|state| state.authorization_revision != self.persistence.session_revision);
         self.apply_profile_tombstone(profile);
         if let Some(state) = self.profile_deletion.states.get_mut(&profile) {
-            state.phase = if deletion.native_erasure_verified {
+            state.phase = if self.profile_deletion.native_participant.is_some() {
+                ProfileDeletionPhase::CleanupReady {
+                    engine_verified: deletion.native_erasure_verified,
+                }
+            } else if deletion.native_erasure_verified {
                 ProfileDeletionPhase::FinalizeReady
             } else {
                 ProfileDeletionPhase::NativeReady
@@ -600,6 +971,384 @@ impl Shell {
             // debounce; establish a new post-barrier durability deadline
             // without pretending this scheduling pass is another mutation.
             self.schedule_current_session_persist();
+        }
+    }
+
+    fn prepare_native_profile_removal(&mut self, profile: ProfileId) {
+        let Some(participant) = self.profile_deletion.native_participant.clone() else {
+            self.fail_profile_deletion_invariant(profile);
+            return;
+        };
+        let Some(attempt) = self
+            .profile_deletion
+            .states
+            .get(&profile)
+            .and_then(|state| state.native_attempt.clone())
+        else {
+            self.fail_profile_deletion_invariant(profile);
+            return;
+        };
+        if let Some(result) = self
+            .profile_deletion
+            .states
+            .get_mut(&profile)
+            .and_then(|state| state.initial_preparation.take())
+        {
+            self.accept_native_preparation(profile, &attempt, result);
+            return;
+        }
+        let deadline = self.profile_deletion_deadline();
+        if std::time::Instant::now() >= deadline {
+            self.schedule_profile_deletion_retry(profile);
+            return;
+        }
+        let result = if let Some(recovery) = self
+            .profile_deletion
+            .states
+            .get_mut(&profile)
+            .and_then(|state| state.recovery.as_mut())
+        {
+            recovery.reconcile(&attempt, deadline)
+        } else {
+            participant.prepare(&attempt, deadline)
+        };
+        self.accept_native_preparation(profile, &attempt, result);
+    }
+
+    fn accept_native_preparation(
+        &mut self,
+        profile: ProfileId,
+        attempt: &RemovalAttempt,
+        result: Preparation,
+    ) {
+        match result {
+            Preparation::Busy => {
+                self.pause_native_profile_removal(profile, RemovalStage::NativeIdle)
+            }
+            Preparation::Prepared(prepared) if prepared.attempt().same_attempt(attempt) => {
+                if let Some(state) = self.profile_deletion.states.get_mut(&profile) {
+                    state.prepared_kind = Some(prepared.kind());
+                    state.prepared = Some(prepared);
+                    state.native_progress = None;
+                    state.phase = ProfileDeletionPhase::AwaitingAuthorization;
+                }
+                self.project_profiles();
+                self.drive_profile_deletion(profile);
+            }
+            Preparation::Prepared(_) => self.fail_profile_deletion_invariant(profile),
+            Preparation::Interrupted(stage) => self.pause_native_profile_removal(profile, stage),
+            Preparation::Pending(stage) => self.defer_native_profile_removal(profile, stage, false),
+            Preparation::Blocked(stage) => self.defer_native_profile_removal(profile, stage, true),
+        }
+    }
+
+    fn retry_native_profile_removal(&mut self, profile: ProfileId) {
+        let deadline = self.profile_deletion_deadline();
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        let Some(participant) = self.profile_deletion.native_participant.clone() else {
+            self.fail_profile_deletion_invariant(profile);
+            return;
+        };
+        let Some(attempt) = self
+            .profile_deletion
+            .states
+            .get(&profile)
+            .and_then(|state| state.native_attempt.clone())
+        else {
+            self.fail_profile_deletion_invariant(profile);
+            return;
+        };
+        let retry = ExplicitRemovalRetry::new(attempt.clone());
+        if self
+            .profile_deletion
+            .states
+            .get(&profile)
+            .is_some_and(|state| {
+                matches!(
+                    state.paused_native,
+                    Some(PausedNativeContinuation::Finalization)
+                )
+            })
+        {
+            self.acknowledge_native_finalization(profile, true);
+            return;
+        }
+        if let Some(PausedNativeContinuation::Cleanup { engine_verified }) = self
+            .profile_deletion
+            .states
+            .get(&profile)
+            .and_then(|state| state.paused_native)
+        {
+            let authorization = AuthorizedRemoval::new(attempt.clone());
+            if let Some(prepared) = self
+                .profile_deletion
+                .states
+                .get_mut(&profile)
+                .and_then(|state| state.prepared.as_mut())
+            {
+                if !prepared.attempt().same_attempt(&attempt) {
+                    self.fail_profile_deletion_invariant(profile);
+                    return;
+                }
+                let result =
+                    prepared.retry_cleanup_after_authorization(&authorization, &retry, deadline);
+                if let Some(state) = self.profile_deletion.states.get_mut(&profile) {
+                    state.phase = ProfileDeletionPhase::CleanupReady { engine_verified };
+                    state.paused_native = None;
+                }
+                self.accept_native_cleanup(profile, engine_verified, result);
+                return;
+            }
+            let result = if let Some(recovery) = self
+                .profile_deletion
+                .states
+                .get_mut(&profile)
+                .and_then(|state| state.recovery.as_mut())
+            {
+                recovery.retry_authorized(&authorization, &retry, deadline)
+            } else {
+                participant.retry_authorized(&authorization, &retry, deadline)
+            };
+            if let Some(state) = self.profile_deletion.states.get_mut(&profile) {
+                state.phase = ProfileDeletionPhase::CleanupReady { engine_verified };
+                state.paused_native = None;
+            }
+            match result {
+                Preparation::Busy => self.pause_authorized_native_profile_removal(
+                    profile,
+                    engine_verified,
+                    RemovalStage::NativeIdle,
+                ),
+                Preparation::Prepared(prepared) if prepared.attempt().same_attempt(&attempt) => {
+                    if let Some(state) = self.profile_deletion.states.get_mut(&profile) {
+                        state.prepared_kind = Some(prepared.kind());
+                        state.prepared = Some(prepared);
+                    }
+                    self.cleanup_native_profile_removal(profile, engine_verified);
+                }
+                Preparation::Prepared(_) => self.fail_profile_deletion_invariant(profile),
+                Preparation::Interrupted(stage) => {
+                    self.pause_authorized_native_profile_removal(profile, engine_verified, stage)
+                }
+                Preparation::Pending(stage) => {
+                    self.defer_native_profile_removal(profile, stage, false)
+                }
+                Preparation::Blocked(stage) => {
+                    self.defer_native_profile_removal(profile, stage, true)
+                }
+            }
+            return;
+        }
+        if let Some(prepared) = self
+            .profile_deletion
+            .states
+            .get_mut(&profile)
+            .and_then(|state| state.prepared.as_mut())
+        {
+            if !prepared.attempt().same_attempt(&attempt) {
+                self.fail_profile_deletion_invariant(profile);
+                return;
+            }
+            let result = prepared.retry_before_authorization(&retry, deadline);
+            match result {
+                PreparedStatus::Current => {
+                    if let Some(state) = self.profile_deletion.states.get_mut(&profile) {
+                        state.phase = ProfileDeletionPhase::AwaitingAuthorization;
+                        state.native_progress = None;
+                    }
+                    self.drive_profile_deletion(profile);
+                }
+                PreparedStatus::Pending(stage) => {
+                    if let Some(state) = self.profile_deletion.states.get_mut(&profile) {
+                        state.phase = ProfileDeletionPhase::AwaitingAuthorization;
+                    }
+                    self.defer_native_profile_removal(profile, stage, false);
+                }
+                PreparedStatus::Interrupted(stage) => {
+                    self.pause_native_profile_removal(profile, stage)
+                }
+                PreparedStatus::Blocked(stage) => {
+                    if let Some(state) = self.profile_deletion.states.get_mut(&profile) {
+                        state.phase = ProfileDeletionPhase::AwaitingAuthorization;
+                    }
+                    self.defer_native_profile_removal(profile, stage, true);
+                }
+            }
+            return;
+        }
+        let result = if let Some(recovery) = self
+            .profile_deletion
+            .states
+            .get_mut(&profile)
+            .and_then(|state| state.recovery.as_mut())
+        {
+            recovery.retry(&retry, deadline)
+        } else {
+            participant.retry(&retry, deadline)
+        };
+        if let Some(state) = self.profile_deletion.states.get_mut(&profile) {
+            state.phase = ProfileDeletionPhase::PreparingNative;
+        }
+        self.accept_native_preparation(profile, &attempt, result);
+    }
+
+    fn pause_authorized_native_profile_removal(
+        &mut self,
+        profile: ProfileId,
+        engine_verified: bool,
+        stage: RemovalStage,
+    ) {
+        self.pause_native_profile_removal(profile, stage);
+        if let Some(state) = self.profile_deletion.states.get_mut(&profile) {
+            state.paused_native = Some(PausedNativeContinuation::Cleanup { engine_verified });
+        }
+    }
+
+    fn pause_native_profile_removal(&mut self, profile: ProfileId, stage: RemovalStage) {
+        if let Some(state) = self.profile_deletion.states.get_mut(&profile) {
+            state.native_progress = Some((stage, true));
+            state.phase = ProfileDeletionPhase::AwaitingExplicitRetry;
+        }
+        if let Some(queue) = &self.self_queue {
+            queue.cancel_profile_deletion(profile);
+        }
+        self.project_profiles();
+    }
+
+    fn defer_native_profile_removal(
+        &mut self,
+        profile: ProfileId,
+        stage: RemovalStage,
+        blocked: bool,
+    ) {
+        if let Some(state) = self.profile_deletion.states.get_mut(&profile) {
+            state.native_progress = Some((stage, blocked));
+        }
+        self.project_profiles();
+        // The native owner retains its first deadline and uncertain send
+        // evidence. This is reconciliation, not permission to resend logout.
+        self.schedule_profile_deletion_retry(profile);
+    }
+
+    fn cleanup_native_profile_removal(&mut self, profile: ProfileId, engine_verified: bool) {
+        let deadline = self.profile_deletion_deadline();
+        if std::time::Instant::now() >= deadline {
+            self.schedule_profile_deletion_retry(profile);
+            return;
+        }
+        let Some(participant) = self.profile_deletion.native_participant.clone() else {
+            self.fail_profile_deletion_invariant(profile);
+            return;
+        };
+        let attempt = {
+            let Some(state) = self.profile_deletion.states.get_mut(&profile) else {
+                return;
+            };
+            state
+                .native_attempt
+                .get_or_insert_with(|| RemovalAttempt::new(profile))
+                .clone()
+        };
+        let authorization = AuthorizedRemoval::new(attempt.clone());
+        if self
+            .profile_deletion
+            .states
+            .get(&profile)
+            .is_some_and(|state| state.prepared.is_none())
+        {
+            // Only a recovered, confirmed journal reaches this path without
+            // the pre-authorization capability. Native protected provenance is
+            // required; normal unregistered-profile grants are never used.
+            let recovered = if let Some(record) = self
+                .profile_deletion
+                .states
+                .get_mut(&profile)
+                .and_then(|state| state.recovery.as_mut())
+            {
+                record.resume_authorized(&authorization, deadline)
+            } else {
+                participant.resume_authorized(&authorization, deadline)
+            };
+            match recovered {
+                Preparation::Busy => {
+                    self.pause_authorized_native_profile_removal(
+                        profile,
+                        engine_verified,
+                        RemovalStage::NativeIdle,
+                    );
+                    return;
+                }
+                Preparation::Prepared(prepared) if prepared.attempt().same_attempt(&attempt) => {
+                    if let Some(state) = self.profile_deletion.states.get_mut(&profile) {
+                        state.prepared_kind = Some(prepared.kind());
+                        state.prepared = Some(prepared);
+                    }
+                }
+                Preparation::Prepared(_) => {
+                    self.fail_profile_deletion_invariant(profile);
+                    return;
+                }
+                Preparation::Interrupted(stage) => {
+                    self.pause_authorized_native_profile_removal(profile, engine_verified, stage);
+                    return;
+                }
+                Preparation::Pending(stage) => {
+                    self.defer_native_profile_removal(profile, stage, false);
+                    return;
+                }
+                Preparation::Blocked(stage) => {
+                    self.defer_native_profile_removal(profile, stage, true);
+                    return;
+                }
+            }
+        }
+        if let Some(state) = self.profile_deletion.states.get_mut(&profile) {
+            state.cleanup = zephium_ipc::ProfileRemovalCleanupV1::Unconfirmed;
+        }
+        let result = self
+            .profile_deletion
+            .states
+            .get_mut(&profile)
+            .and_then(|state| state.prepared.as_mut())
+            .map(|prepared| prepared.cleanup_after_authorization(&authorization, deadline));
+        if let Some(result) = result {
+            self.accept_native_cleanup(profile, engine_verified, result);
+        } else {
+            self.fail_profile_deletion_invariant(profile);
+        }
+    }
+
+    fn accept_native_cleanup(
+        &mut self,
+        profile: ProfileId,
+        engine_verified: bool,
+        result: CleanupProgress,
+    ) {
+        match result {
+            CleanupProgress::Verified => {
+                if let Some(state) = self.profile_deletion.states.get_mut(&profile) {
+                    state.native_progress = None;
+                    state.cleanup = zephium_ipc::ProfileRemovalCleanupV1::Verified;
+                    state.phase = if engine_verified {
+                        ProfileDeletionPhase::FinalizeReady
+                    } else {
+                        ProfileDeletionPhase::NativeReady
+                    };
+                }
+                self.project_profiles();
+                self.drive_profile_deletion(profile);
+            }
+            CleanupProgress::Interrupted(stage) => {
+                self.pause_authorized_native_profile_removal(profile, engine_verified, stage)
+            }
+            CleanupProgress::Pending(stage) => {
+                self.defer_native_profile_removal(profile, stage, false)
+            }
+            CleanupProgress::Blocked(stage) => {
+                self.defer_native_profile_removal(profile, stage, true)
+            }
         }
     }
 
@@ -628,6 +1377,7 @@ impl Shell {
             state.retry_exponent = 0;
             attempt
         };
+        self.project_profiles();
         // Close the profile's notes before its folder is erased; the notes
         // thread handles this long before native erasure reports back.
         if let Some(notes) = &self.notes {
@@ -735,11 +1485,7 @@ impl Shell {
         }
         let outcome = self.store.finalize_profile_deletion(profile, deadline);
         match outcome {
-            ProfileDeletionFinalizeOutcome::Completed => self.finish_profile_deletion_operation(
-                profile,
-                OperationOutcome::Applied,
-                OperationReason::ProfileDeletionCompleted,
-            ),
+            ProfileDeletionFinalizeOutcome::Completed => self.store_finalization_confirmed(profile),
             ProfileDeletionFinalizeOutcome::NotAuthorized => {
                 // FinalizeReady is created only from a durable journal row
                 // after native proof. Losing that authorization is a terminal
@@ -770,16 +1516,128 @@ impl Shell {
                     // Journal removal is the store's last ordered step, so an
                     // authoritative absence after native proof establishes
                     // both phases complete even if the RPC reply was lost.
-                    self.finish_profile_deletion_operation(
-                        profile,
-                        OperationOutcome::Applied,
-                        OperationReason::ProfileDeletionCompleted,
-                    );
+                    self.store_finalization_confirmed(profile);
                 }
             }
             ProfileDeletionLoad::Failed => {
                 self.schedule_profile_deletion_retry(profile);
             }
+        }
+    }
+
+    fn store_finalization_confirmed(&mut self, profile: ProfileId) {
+        if self.profile_deletion.native_participant.is_none() {
+            self.finish_profile_deletion_operation(
+                profile,
+                OperationOutcome::Applied,
+                OperationReason::ProfileDeletionCompleted,
+            );
+            return;
+        }
+        let Some(state) = self.profile_deletion.states.get_mut(&profile) else {
+            self.fail_profile_deletion_invariant(profile);
+            return;
+        };
+        state.phase = ProfileDeletionPhase::NativeFinalizationReady;
+        state.paused_native = None;
+        state.native_progress = None;
+        self.project_profiles();
+        self.acknowledge_native_finalization(profile, false);
+    }
+
+    fn acknowledge_native_finalization(&mut self, profile: ProfileId, explicit: bool) {
+        let deadline = self.profile_deletion_deadline();
+        if std::time::Instant::now() >= deadline {
+            self.schedule_profile_deletion_retry(profile);
+            return;
+        }
+        let Some(attempt) = self
+            .profile_deletion
+            .states
+            .get(&profile)
+            .and_then(|state| state.native_attempt.clone())
+        else {
+            self.fail_profile_deletion_invariant(profile);
+            return;
+        };
+        let finalized = FinalizedRemoval::new(attempt.clone());
+        let retry = ExplicitRemovalRetry::new(attempt.clone());
+        let state = self
+            .profile_deletion
+            .states
+            .get_mut(&profile)
+            .expect("checked removal state");
+        state.phase = ProfileDeletionPhase::NativeFinalizationReady;
+        state.paused_native = None;
+        let renew_held = explicit && state.prepared.is_some();
+        if state.prepared.is_none() {
+            let Some(recovery) = state.recovery.as_mut() else {
+                self.fail_profile_deletion_invariant(profile);
+                return;
+            };
+            let result = if explicit {
+                recovery.retry_finalization(&retry, deadline)
+            } else {
+                recovery.resume_finalization(&finalized, deadline)
+            };
+            match result {
+                Preparation::Busy => {
+                    self.pause_native_finalization(profile, RemovalStage::NativeIdle);
+                    return;
+                }
+                Preparation::Prepared(prepared) if prepared.attempt().same_attempt(&attempt) => {
+                    state.prepared_kind = Some(prepared.kind());
+                    state.prepared = Some(prepared);
+                    state.cleanup = zephium_ipc::ProfileRemovalCleanupV1::Verified;
+                }
+                Preparation::Prepared(_) => {
+                    self.fail_profile_deletion_invariant(profile);
+                    return;
+                }
+                Preparation::Interrupted(stage) => {
+                    self.pause_native_finalization(profile, stage);
+                    return;
+                }
+                Preparation::Pending(stage) => {
+                    self.defer_native_profile_removal(profile, stage, false);
+                    return;
+                }
+                Preparation::Blocked(stage) => {
+                    self.defer_native_profile_removal(profile, stage, true);
+                    return;
+                }
+            }
+        }
+        let prepared = state.prepared.as_mut().expect("checked prepared custody");
+        if !prepared.attempt().same_attempt(&attempt) {
+            self.fail_profile_deletion_invariant(profile);
+            return;
+        }
+        let result = if renew_held {
+            prepared.retry_after_finalization(&finalized, &retry, deadline)
+        } else {
+            prepared.acknowledge_finalization(&finalized, deadline)
+        };
+        match result {
+            CleanupProgress::Verified => self.finish_profile_deletion_operation(
+                profile,
+                OperationOutcome::Applied,
+                OperationReason::ProfileDeletionCompleted,
+            ),
+            CleanupProgress::Interrupted(stage) => self.pause_native_finalization(profile, stage),
+            CleanupProgress::Pending(stage) => {
+                self.defer_native_profile_removal(profile, stage, false)
+            }
+            CleanupProgress::Blocked(stage) => {
+                self.defer_native_profile_removal(profile, stage, true)
+            }
+        }
+    }
+
+    fn pause_native_finalization(&mut self, profile: ProfileId, stage: RemovalStage) {
+        self.pause_native_profile_removal(profile, stage);
+        if let Some(state) = self.profile_deletion.states.get_mut(&profile) {
+            state.paused_native = Some(PausedNativeContinuation::Finalization);
         }
     }
 
@@ -807,6 +1665,7 @@ impl Shell {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&profile);
+        self.project_profiles();
         if let Some(operation_id) = operation_id {
             (self.emit)(Projection::OperationProcessed(OperationDisposition {
                 operation_id,

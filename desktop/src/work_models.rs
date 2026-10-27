@@ -148,6 +148,19 @@ mod product {
                 .get()
                 .is_some_and(|store| store.set_app_setting(key, value))
         }
+        fn page_choice(
+            &self,
+            profile: ProfileId,
+            call: zephium_core::page_choice::Call,
+        ) -> zephium_core::page_choice::Reply {
+            use zephium_core::ports::store::Store;
+            APP_STORE
+                .get()
+                .map(|store| store.page_choice_call(profile, call))
+                .unwrap_or(zephium_core::page_choice::Reply::Failed(
+                    zephium_core::page_choice::Fault::Unavailable,
+                ))
+        }
     }
 
     pub(super) fn install(app: &tauri::AppHandle) {
@@ -259,7 +272,32 @@ mod product {
                 tauri::async_runtime::spawn(models::refresh_cloud_catalog());
                 Ok(())
             }
-            Action::Choose(role, id) => models::choose(profile, role, id.as_deref()),
+            Action::Choose(role, id) => {
+                if role == WorkModelRole::Page {
+                    match (
+                        models::prepare_page_choice(profile, id.as_deref()),
+                        models::page_selection(profile),
+                    ) {
+                        (Ok(prepared), Ok(expected)) => {
+                            let receipt = crate::codex::commit_page_selection(
+                                profile,
+                                expected.clone(),
+                                prepared.selection(),
+                            )
+                            .await;
+                            match receipt {
+                                Ok(receipt) => {
+                                    models::publish_page_choice(prepared, &expected, receipt)
+                                }
+                                Err(_) => Err(WorkModelError::Protocol),
+                            }
+                        }
+                        (Err(error), _) | (_, Err(error)) => Err(error),
+                    }
+                } else {
+                    models::choose(profile, role, id.as_deref())
+                }
+            }
             Action::Effort(effort) => models::set_effort(profile, effort),
             Action::SetKey(provider, secret) => match models::set_key(provider, secret).await {
                 Ok(status) => return checked(profile, provider, status),

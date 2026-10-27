@@ -1,30 +1,22 @@
-# Relevant repository overview
+# Repository overview
 
-Observed during workflow adoption on 2026-10-25; code is changing concurrently.
+- Rust workspace, pinned toolchain, Tauri desktop host.
+- `frame/`: Svelte 5, TypeScript and Vite; follow `frame/AGENTS.md` and
+  `docs/frontend.md`. Do not add another frontend framework.
+- Native code owns durable state, identity and secrets. Frame owns presentation
+  and document-local state. `docs/security-model.md` defines trust zones.
 
-- Rust workspace, pinned `rust-toolchain.toml` (1.95.0); Tauri 2 desktop host.
-- `frame/` is Svelte 5 + TypeScript + Vite, **not SvelteKit or React**.
-- Root package uses Node >=24.18.0 <25 and pnpm 11.17.0 at this checkpoint.
-- `frame/AGENTS.md` and `docs/frontend.md` govern frontend structure and checks.
-- Rust/native code owns durable state, caller identity and secrets. Frame owns
-  presentation/transient state. `docs/security-model.md` defines trust zones.
-- Existing API keys/model configuration remain separate from subscription accounts.
+## Current feature surfaces
 
-## Active implementation surfaces
+`zephium-codex-broker` owns original-runtime admission, process and protocol
+custody. Core/Store own durable account/thread/source/removal contracts. Desktop
+joins those capabilities to the existing Page/browser authority. The frame's
+`domain/codex` and lazy `features/codex` project state without granting authority.
 
-`crates/zephium-chatgpt/` contains in-progress direct OAuth/token/vault/service and
-inference work. `crates/zephium-provider-accounts/` contains prior pure policy and
-protocol foundations; their presence is not proof that Codex broker login is live.
-`crates/zephium-app/src/work_connections/cli.rs` owns the gated CLI discovery path.
-Native host integration belongs in `desktop/` and its typed commands/bindings.
-Settings changes live in `frame/src/features/settings/`, with account projections
-in `frame/src/domain/chatgpt/` and catalog integration in `frame/src/domain/ai/`.
+The old `zephium-chatgpt` production surface is retained-account recovery only;
+its offline protocol fixtures do not enable direct login or inference. Existing
+API/Work settings remain separate from the Codex sidebar selection.
 
-At adoption, these are dirty/untracked work-in-progress paths; the base HEAD is
-`aad9ca826a47b3ca3a90830f2e8e603b83713227`. Do not treat this paragraph as a frozen
-review receipt. Re-read status/diff and regenerate evidence for the final checkpoint.
-
-`docs/subscription-accounts.md` was observed to describe an earlier Codex-managed
-foundation while direct ChatGPT code was being written. The lead must reconcile
-that document with the final implemented product; no compatibility claim follows
-from this adoption snapshot.
+See the [active acceptance](current-feature.md) and
+[connection guide](../../docs/subscription-accounts.md). Read actual source and
+exact test receipts before making a compatibility or readiness claim.

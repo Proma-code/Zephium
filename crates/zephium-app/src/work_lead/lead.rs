@@ -2176,7 +2176,8 @@ const UNKNOWN_OUTCOME_NOTE: &str =
 
 fn chatgpt_note(fault: ChatGptModelFault) -> &'static str {
     match fault.issue() {
-        ChatGptFailureIssue::SignedOut => "The selected ChatGPT connection is unavailable; reconnect it in Settings → AI. Your API keys are unchanged.",
+        ChatGptFailureIssue::Retired => "The previous direct ChatGPT connection is retired. Choose a supported Work source explicitly in Settings → AI. Your saved account, history and API keys are unchanged.",
+        ChatGptFailureIssue::SignedOut => "The retained direct ChatGPT account is unavailable. Use advanced account recovery in Settings → AI; no replacement source was selected. Your API keys are unchanged.",
         ChatGptFailureIssue::UsageLimit => "ChatGPT plan usage is limited for this app or account. Check ChatGPT Settings → Usage before trying again; the reset time is not known.",
         ChatGptFailureIssue::Unavailable => "ChatGPT could not confirm account or usage availability. Your connection is kept; try again later.",
         ChatGptFailureIssue::NotEligible => "ChatGPT plan usage is not permitted for this account, workspace, region or grant. Check the connection and ChatGPT settings.",
@@ -2413,6 +2414,7 @@ mod compact_tests {
     #[test]
     fn chatgpt_refusals_do_not_offer_api_key_or_hosted_billing_actions() {
         for fault in [
+            ChatGptModelFault::Retired,
             ChatGptModelFault::SignedOut,
             ChatGptModelFault::UsageLimit,
             ChatGptModelFault::Unavailable,
@@ -2427,6 +2429,12 @@ mod compact_tests {
         assert!(chatgpt_note(ChatGptModelFault::UsageLimit).contains("reset time is not known"));
         assert!(chatgpt_note(ChatGptModelFault::Unavailable).contains("connection is kept"));
         assert!(chatgpt_note(ChatGptModelFault::SignedOut).contains("API keys are unchanged"));
+        assert!(chatgpt_note(ChatGptModelFault::Retired).contains("retired"));
+        assert!(!ChatGptModelFault::Retired.unknown_outcome());
+        assert_eq!(
+            ChatGptModelFault::Retired.issue(),
+            ChatGptFailureIssue::Retired
+        );
     }
 
     #[test]

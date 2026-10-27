@@ -40,6 +40,8 @@ pub const MAX_SITE_STYLES: usize = 8;
 pub const MAX_SITE_CSS_BYTES: usize = 48 * 1024;
 /// Conversations kept in memory at once.
 const MAX_LIVE: usize = 12;
+/// Native reservation admission is bounded separately from the running reply.
+const NATIVE_RESERVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 /// Addresses a conversation may open, from its reads and the person's words.
 const MAX_LINKS: usize = 4096;
 /// Conversations the history list shows.
@@ -80,12 +82,15 @@ enum CancelReason {
 
 #[derive(Default)]
 struct Cancel {
+    // Same cancellation-only bit observed by the original writer admission.
+    native: Arc<AtomicBool>,
     reason: Mutex<Option<CancelReason>>,
     notify: Notify,
 }
 
 impl Cancel {
     fn cancel(&self, reason: CancelReason) {
+        self.native.store(true, Ordering::Release);
         let mut slot = self.reason.lock().unwrap_or_else(|p| p.into_inner());
         if slot.is_none() {
             *slot = Some(reason);
@@ -157,6 +162,8 @@ struct ReplyData {
 struct Live {
     profile: ProfileId,
     conversation: Conversation,
+    /// Nonwrapping observation identity; renewed for every transcript mutation.
+    revision: Arc<()>,
     replies: HashMap<u32, ReplyData>,
     links: HashSet<String>,
     touched: u64,
@@ -172,6 +179,8 @@ struct State {
     live: HashMap<String, Live>,
     /// Each Space's conversation in the panel.
     current: HashMap<String, String>,
+    /// Changes when a Space leaves/reopens a conversation, including A→B→A.
+    current_epochs: HashMap<String, Arc<()>>,
     running: HashMap<String, Running>,
     /// The structure of each tab's latest read, for suggestions.
     traits: HashMap<String, (u64, PageTraits)>,
@@ -290,10 +299,13 @@ impl PageAssist {
     fn apply(&self, conversation: &str, reply: u32, kind: PageAssistEventV1) -> bool {
         let event = {
             let mut state = self.state();
-            state
-                .live
-                .get_mut(conversation)
-                .and_then(|live| live.conversation.apply(reply, kind))
+            state.live.get_mut(conversation).and_then(|live| {
+                let event = live.conversation.apply(reply, kind);
+                if event.is_some() {
+                    live.revision = Arc::new(());
+                }
+                event
+            })
         };
         let sent = event.is_some();
         self.emit_all(event);
@@ -396,12 +408,14 @@ impl PageAssist {
             Live {
                 profile,
                 conversation: Conversation::new(id.clone(), space.to_owned()),
+                revision: Arc::new(()),
                 replies: HashMap::new(),
                 links: HashSet::new(),
                 touched: now,
             },
         );
         state.current.insert(space.to_owned(), id.clone());
+        state.current_epochs.insert(space.to_owned(), Arc::new(()));
         Self::evict(&mut state);
         id
     }
@@ -457,16 +471,37 @@ impl PageAssist {
             .models
             .entry(&profile)
             .await
-            .map(|choice| PageAssistModelV1 {
-                id: choice.entry.id.clone(),
-                hosted: choice.entry.model.provider
-                    == zephium_core::work::model::WorkModelProvider::Cloud,
-                name: choice.entry.display_name,
-                effort: choice
-                    .effort
-                    .filter(|_| choice.entry.supports.reasoning)
-                    .map(|effort| effort_name(effort).to_owned()),
+            .map(|choice| match choice {
+                PageBackendChoice::Model(choice) => PageAssistModelV1 {
+                    id: choice.entry.id.clone(),
+                    hosted: choice.entry.model.provider
+                        == zephium_core::work::model::WorkModelProvider::Cloud,
+                    name: choice.entry.display_name,
+                    source: PageAssistModelSourceV1::Model,
+                    capabilities: PageAssistCapabilitiesV1::Page,
+                    effort: choice
+                        .effort
+                        .filter(|_| choice.entry.supports.reasoning)
+                        .map(|effort| effort_name(effort).to_owned()),
+                },
+                PageBackendChoice::NativeConversation(choice) => PageAssistModelV1 {
+                    id: choice.id,
+                    name: choice.name,
+                    hosted: false,
+                    source: choice.source,
+                    capabilities: PageAssistCapabilitiesV1::TextOnly,
+                    effort: choice.effort,
+                },
             });
+        if status
+            .model
+            .as_ref()
+            .is_some_and(|model| model.capabilities == PageAssistCapabilitiesV1::TextOnly)
+        {
+            // Plain original-client chat needs no page availability or reads.
+            status.availability = PageAssistAvailabilityV1::Ready;
+            return status;
+        }
         let (Some(tab), Some(facts), PageAssistAvailabilityV1::Ready) = (tab, facts, availability)
         else {
             return status;
@@ -616,30 +651,99 @@ impl PageAssist {
         &self,
         request: PageAssistAskV1,
     ) -> Result<(u32, TurnTask), PageAssistFaultV1> {
-        let words = text::clean(&request.text);
         if request.text.len() > PAGE_ASSIST_MAX_QUESTION_BYTES
-            || (words.is_empty() && request.suggestion.is_none())
             || request.attachments.len() > PAGE_ASSIST_MAX_ATTACHMENTS
         {
             return Err(PageAssistFaultV1::Invalid);
         }
         let space = request.space.clone();
-        let profile = {
+        let (profile, current_epoch, revision, previous_reply, new_conversation) = {
             let state = self.state();
-            state
+            let live = state
                 .current
                 .get(&space)
                 .filter(|id| **id == request.conversation)
                 .and_then(|id| state.live.get(id))
-                .map(|live| live.profile)
-                .ok_or(PageAssistFaultV1::Invalid)?
+                .ok_or(PageAssistFaultV1::Invalid)?;
+            (
+                live.profile,
+                state.current_epochs.get(&space).cloned(),
+                live.revision.clone(),
+                live.conversation.latest_reply(),
+                live.conversation.messages().is_empty(),
+            )
         };
         if !self.ports().settings.ai_enabled(&profile) {
             return Err(PageAssistFaultV1::AiOff);
         }
-        if self.ports().models.entry(&profile).await.is_none() {
-            return Err(PageAssistFaultV1::NoModel);
+        let backend = self
+            .ports()
+            .models
+            .entry(&profile)
+            .await
+            .ok_or(PageAssistFaultV1::NoModel)?;
+        let words = match &backend {
+            PageBackendChoice::NativeConversation(_) => {
+                if request.suggestion.is_some() || !request.attachments.is_empty() {
+                    return Err(PageAssistFaultV1::NativeConversation {
+                        fault: PageAssistNativeFaultV1::UnsupportedInput,
+                    });
+                }
+                request.text.clone()
+            }
+            PageBackendChoice::Model(_) => text::clean(&request.text),
+        };
+        if words.trim().is_empty() && request.suggestion.is_none() {
+            return Err(PageAssistFaultV1::Invalid);
         }
+        let reservation = if let PageBackendChoice::NativeConversation(expected) = &backend {
+            {
+                let state = self.state();
+                if state.current.get(&space) != Some(&request.conversation)
+                    || current_epoch
+                        .as_ref()
+                        .zip(state.current_epochs.get(&space))
+                        .is_none_or(|(a, b)| !Arc::ptr_eq(a, b))
+                    || state.live.get(&request.conversation).is_none_or(|live| {
+                        live.profile != profile || !Arc::ptr_eq(&live.revision, &revision)
+                    })
+                {
+                    return Err(PageAssistFaultV1::NativeConversation {
+                        fault: PageAssistNativeFaultV1::ScopeChanged,
+                    });
+                }
+                if state.running.contains_key(&request.conversation) {
+                    return Err(PageAssistFaultV1::Busy);
+                }
+            }
+            let draft = NativeConversationDraft {
+                conversation: request.conversation.clone(),
+                new_conversation,
+                previous_reply,
+                text: words.clone(),
+            };
+            let reserve = self
+                .ports()
+                .models
+                .reserve_native(&profile, expected.clone(), draft);
+            match tokio::time::timeout(NATIVE_RESERVE_TIMEOUT, reserve).await {
+                Ok(Ok(reservation)) => Some(reservation),
+                Ok(Err(PageBackendError::Busy)) => return Err(PageAssistFaultV1::Busy),
+                Ok(Err(PageBackendError::NativeConversation(fault))) => {
+                    return Err(PageAssistFaultV1::NativeConversation { fault })
+                }
+                Ok(Err(PageBackendError::Model(error))) => {
+                    return Err(fault::model_fault(error, false))
+                }
+                Err(_) => {
+                    return Err(PageAssistFaultV1::NativeConversation {
+                        fault: PageAssistNativeFaultV1::Timeout,
+                    })
+                }
+            }
+        } else {
+            None
+        };
         let mut admitted = Vec::new();
         let mut shown = Vec::new();
         for attach in &request.attachments {
@@ -657,6 +761,30 @@ impl PageAssist {
             .map(suggest::request_text);
         let (reply, events) = {
             let mut state = self.state();
+            if let Some(reservation) = &reservation {
+                if !self.ports().settings.ai_enabled(&profile) {
+                    return Err(PageAssistFaultV1::AiOff);
+                }
+                if state.current.get(&space) != Some(&conversation)
+                    || current_epoch
+                        .as_ref()
+                        .zip(state.current_epochs.get(&space))
+                        .is_none_or(|(a, b)| !Arc::ptr_eq(a, b))
+                    || state.live.get(&conversation).is_none_or(|live| {
+                        live.profile != profile
+                            || !Arc::ptr_eq(&live.revision, &revision)
+                            || live.conversation.latest_reply() != previous_reply
+                            || live.conversation.messages().is_empty() != new_conversation
+                    })
+                {
+                    return Err(PageAssistFaultV1::NativeConversation {
+                        fault: PageAssistNativeFaultV1::ScopeChanged,
+                    });
+                }
+                reservation
+                    .validate()
+                    .map_err(|fault| PageAssistFaultV1::NativeConversation { fault })?;
+            }
             if state.running.contains_key(&conversation) {
                 return Err(PageAssistFaultV1::Busy);
             }
@@ -672,6 +800,7 @@ impl PageAssist {
                 .conversation
                 .say(&words, request.suggestion, shown, title);
             let (reply, started) = live.conversation.begin_reply();
+            live.revision = Arc::new(());
             events.push(started);
             live.replies.insert(reply, ReplyData::default());
             state.running.insert(
@@ -702,6 +831,8 @@ impl PageAssist {
             profile,
             reply,
             words,
+            native: Mutex::new(None),
+            backend,
             suggestion: request.suggestion,
             attachments: admitted,
             cancel,
@@ -709,7 +840,10 @@ impl PageAssist {
             took_over,
             glowing: Mutex::new(Vec::new()),
         };
-        Ok((reply, Box::pin(agent::run(context))))
+        if let Some(reservation) = reservation {
+            agent::commit_native(&context, reservation);
+        }
+        Ok((reply, agent::task(context)))
     }
 
     fn running_reply<T>(
@@ -1043,7 +1177,11 @@ impl PageAssist {
     }
 
     fn leave(&self, space: &str) {
-        let current = self.state().current.remove(space);
+        let current = {
+            let mut state = self.state();
+            state.current_epochs.remove(space);
+            state.current.remove(space)
+        };
         if let Some(conversation) = current {
             if let Some(running) = self.state().running.remove(&conversation) {
                 running.cancel.cancel(CancelReason::Gone);
@@ -1123,6 +1261,7 @@ impl PageAssist {
                 Live {
                     profile,
                     conversation: Conversation::restore(view, space.to_owned()),
+                    revision: Arc::new(()),
                     replies: HashMap::new(),
                     links: HashSet::new(),
                     touched: 0,
@@ -1141,6 +1280,7 @@ impl PageAssist {
         state
             .current
             .insert(space.to_owned(), conversation.to_owned());
+        state.current_epochs.insert(space.to_owned(), Arc::new(()));
         if let Some(live) = state.live.get_mut(conversation) {
             live.touched = self.ports().clock.now_ms();
         }
@@ -1341,6 +1481,7 @@ impl PageAssist {
             let tabs: Vec<String> = state.marks.drain().map(|(tab, _)| tab).collect();
             state.picks.clear();
             state.current.clear();
+            state.current_epochs.clear();
             state.live.clear();
             state.traits.clear();
             (events, tabs)

@@ -1,6 +1,7 @@
 import { fileURLToPath } from "node:url";
 import type { UserConfig } from "vite";
 import { alias } from "./aliases.ts";
+import { chromeResidentHelpers } from "./chrome-chunks.ts";
 import { i18nLocales } from "./i18n-locales.ts";
 import { bootstrapReport, type Page } from "./bootstrap-report.ts";
 import { paraglideVitePlugin } from "@inlang/paraglide-js";
@@ -90,7 +91,13 @@ export function frameConfig(pages: readonly Page[]): UserConfig {
                 priority: 2,
                 // Preferences are read by lazy destinations too; kept here they
                 // never make a destination import the browser entry.
-                test: /[\\/]src[\\/](?:shared[\\/](ipc[\\/]|platform\.ts|lib[\\/]motion\.ts|i18n[\\/]runtime\.js)|domain[\\/]preferences[\\/])/u,
+                // These resident helpers otherwise fragment into tiny JS/CSS
+                // requests as new lazy consumers are added. No optional view is
+                // selected, and the initial tag still bounds this partition.
+                test: (id) =>
+                  /[\\/]src[\\/](?:shared[\\/](ipc[\\/]|platform\.ts|lib[\\/]motion\.ts|i18n[\\/]runtime\.js)|domain[\\/]preferences[\\/])/u.test(
+                    id,
+                  ) || chromeResidentHelpers.test(id),
                 tags: ["$initial"],
               },
             ],

@@ -138,6 +138,31 @@ impl RuntimePaths {
             active: AtomicBool::new(false),
         })
     }
+    pub(crate) fn reserve_removal(
+        &self,
+        attempt: crate::profile::removal::RemovalAttemptId,
+        grant_epoch: u64,
+    ) -> Result<crate::profile::native::removal::RemovalReservation, &'static str> {
+        match &self._custody {
+            Custody::Persistent(lease) => lease
+                .reserve_removal(attempt, grant_epoch)
+                .map_err(|_| "removal-reservation"),
+            Custody::Temporary(_) => Err("removal-not-persistent"),
+        }
+    }
+    pub(crate) fn into_removal(self) -> Result<ProfileLease, Box<Self>> {
+        if self.active.load(Ordering::Acquire) || !matches!(self._custody, Custody::Persistent(_)) {
+            return Err(Box::new(self));
+        }
+        let Self {
+            _pins, _custody, ..
+        } = self;
+        drop(_pins);
+        match _custody {
+            Custody::Persistent(lease) => Ok(*lease),
+            Custody::Temporary(_) => unreachable!("persistent custody checked"),
+        }
+    }
     pub(crate) fn begin_connection(&self) -> Result<(), &'static str> {
         // A failed DIRTY write deliberately leaves active=true: this exact runtime
         // cannot be retried after uncertain I/O, even if no child was created.

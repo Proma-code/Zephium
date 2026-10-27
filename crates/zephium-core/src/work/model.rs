@@ -348,6 +348,9 @@ pub enum GatewayModelFault {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatGptModelFault {
+    /// The removed direct subscription source remains stored only for recovery.
+    /// No model request was admitted and no other source may stand in for it.
+    Retired,
     /// The selected local grant is missing, expired, or was refused.
     SignedOut,
     /// A ChatGPT plan-sharing limit was reached; its scope/reset are unknown.
@@ -401,6 +404,7 @@ pub enum ChatGptFailureField {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatGptFailureIssue {
+    Retired,
     InvalidRequest,
     SignedOut,
     NotEligible,
@@ -418,6 +422,7 @@ impl ChatGptModelFault {
     /// Preserve admission/limit semantics for both legacy and diagnostic faults.
     pub const fn issue(self) -> ChatGptFailureIssue {
         match self {
+            Self::Retired => ChatGptFailureIssue::Retired,
             Self::SignedOut => ChatGptFailureIssue::SignedOut,
             Self::UsageLimit => ChatGptFailureIssue::UsageLimit,
             Self::Unavailable => ChatGptFailureIssue::Unavailable,

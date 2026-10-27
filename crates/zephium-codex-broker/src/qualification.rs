@@ -184,7 +184,10 @@ fn persistent_profile(image: Arc<PinnedImage>) -> Result<(), &'static str> {
             )
             .map_err(|_| "owner-compatibility")?,
             Box::new(associations.clone()),
-            Instant::now() + Duration::from_secs(120),
+            crate::preparation_budget::PreparationBudget::ordinary(
+                Instant::now() + Duration::from_secs(120),
+            )
+            .into(),
             &cancel,
         )
         .map_err(|_| "owner-bootstrap")?;

@@ -91,6 +91,8 @@ const profile = (
   avatar: { style: "initials", color: 1, symbol: 0, revision: 1, ...avatar },
 });
 const roster: ProfilesView = {
+  removal_recovery: null,
+  removals: [],
   current: ID(1),
   private: false,
   profiles: [

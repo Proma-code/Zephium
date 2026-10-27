@@ -1,16 +1,19 @@
-//! Direct, local Sign in with ChatGPT for this open-source desktop app.
+//! Recovery and source-bound compatibility for existing legacy ChatGPT grants.
 //!
-//! OAuth credentials belong to Zephium's own dynamic registration. They never
-//! come from Codex, browser cookies, another app, or Zephium's hosted service.
+//! No new authorization, token refresh, model catalog or inference route remains.
+//! Protected records are preserved for read-only inspection, explicit revocation
+//! and profile erasure. They are never imported into Codex or rewritten as another
+//! model source. The optional fixture module has no credentials or network client.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-/// Bounded direct Responses streaming and account-specific model catalog.
+/// Offline legacy wire fixtures retained for Work protocol regression tests.
+#[cfg(any(test, feature = "test-fixtures"))]
 pub mod inference;
-/// Official public-client PKCE and OIDC validation.
+/// Fixed-origin revocation of existing protected grants.
 pub mod oauth;
-/// Per-profile credential and login lifecycle.
+/// Per-profile stored credential lifecycle.
 pub mod service;
 /// Secret-bearing tokens with redacted diagnostics.
 pub mod token;

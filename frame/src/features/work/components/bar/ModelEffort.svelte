@@ -1,6 +1,9 @@
 <script module lang="ts">
   import type { WorkModelReasoning } from "$shared/ipc/bindings";
 
+  /** Display-only union; does not broaden Work/provider reasoning admission. */
+  export type DisplayEffort = WorkModelReasoning | "none" | "minimal";
+
   const EFFORTS: readonly WorkModelReasoning[] = ["low", "medium", "high", "xhigh", "max"];
 
   /** The level a model runs `wanted` at: the closest it takes, the stronger on a tie (as Rust). */
@@ -17,21 +20,22 @@
     return best;
   }
 
-  function stepEffort(
-    levels: readonly WorkModelReasoning[],
-    from: WorkModelReasoning,
+  function stepEffort<T extends DisplayEffort>(
+    levels: readonly T[],
+    from: T,
     step: number,
-  ): WorkModelReasoning | null {
+  ): T | null {
     const at = levels.indexOf(from);
     const next = levels[Math.max(0, Math.min(levels.length - 1, at + step))];
     return next && next !== from ? next : null;
   }
 </script>
 
-<script lang="ts">
+<script lang="ts" generics="T extends DisplayEffort">
   import { Orb } from "$shared/ui/presence";
   import { stillWhenUnseen } from "$shared/lib/still";
   import { effortName } from "$domain/ai";
+  import { codexEffort } from "$domain/codex";
   import * as m from "$shared/i18n/messages";
 
   let {
@@ -39,13 +43,15 @@
     value,
     onchange,
   }: {
-    levels: readonly WorkModelReasoning[];
+    levels: readonly T[];
     /** The level the hero's model runs at; null when it takes none. */
-    value: WorkModelReasoning | null;
-    onchange: (level: WorkModelReasoning) => void;
+    value: T | null;
+    onchange: (level: T) => void;
   } = $props();
 
-  const HINTS: Record<WorkModelReasoning, () => string> = {
+  const HINTS: Record<DisplayEffort, () => string> = {
+    none: m.codex_effort_none_hint,
+    minimal: m.codex_effort_minimal_hint,
     low: m.model_effort_low_hint,
     medium: m.model_effort_medium_hint,
     high: m.model_effort_high_hint,
@@ -53,7 +59,9 @@
     max: m.model_effort_max_hint,
   };
   /** How fast the orb turns at each level: it idles at Low and races at Max. */
-  const PACE: Record<WorkModelReasoning, number> = {
+  const PACE: Record<DisplayEffort, number> = {
+    none: 0.12,
+    minimal: 0.2,
     low: 0.28,
     medium: 0.5,
     high: 0.8,
@@ -61,9 +69,12 @@
     max: 1.75,
   };
 
+  const nameOf = (level: DisplayEffort) =>
+    level === "none" || level === "minimal" ? codexEffort(level) : effortName(level);
+
   const live = $derived(levels.length > 0 && value !== null);
   const index = $derived(value ? levels.indexOf(value) : -1);
-  const level = $derived<WorkModelReasoning>(value ?? "low");
+  const level = $derived<DisplayEffort>(value ?? "low");
   const reach = $derived(levels.length > 1 ? Math.max(0, index) / (levels.length - 1) : 0);
 
   let core = $state<HTMLElement>();
@@ -94,7 +105,7 @@
       PageUp: 1,
       PageDown: -1,
     };
-    let next: WorkModelReasoning | null;
+    let next: T | null;
     if (event.key === "Home") next = levels[0] ?? null;
     else if (event.key === "End") next = levels.at(-1) ?? null;
     else if (event.key in steps) next = stepEffort(levels, value, steps[event.key]!);
@@ -169,7 +180,7 @@
     <span class="core" bind:this={core}><Orb size={36} /></span>
   </span>
   <span class="words">
-    <span class="name">{live ? effortName(level) : m.model_effort_fixed()}</span>
+    <span class="name">{live ? nameOf(level) : m.model_effort_fixed()}</span>
     <span class="hint">{live ? HINTS[level]() : m.model_effort_fixed_hint()}</span>
   </span>
   {#if live && levels.length > 1}<div
@@ -181,7 +192,7 @@
       aria-valuemin={0}
       aria-valuemax={levels.length - 1}
       aria-valuenow={index}
-      aria-valuetext={effortName(level)}
+      aria-valuetext={nameOf(level)}
       data-drag={following ? "" : undefined}
       style:--reach={shown}
       onkeydown={key}
