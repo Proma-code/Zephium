@@ -686,8 +686,31 @@ test.each(["chatgpt", "gateway", "opencode-go"])(
     ).toBe(false);
     expect(native.choose).not.toHaveBeenCalled();
     expect(native.effort).not.toHaveBeenCalled();
-    await page.getByRole("option", { name: "GPT-6 Luna", exact: true }).click();
+    await expect
+      .element(page.getByRole("tab", { name: "OpenAI", exact: true }))
+      .toHaveAttribute("aria-selected", "true");
+    await expect
+      .element(page.getByRole("button", { name: "API key", exact: true }))
+      .toHaveAttribute("aria-pressed", "true");
+    // An unlocked option's accessible name also includes its Favourite button.
+    // Match its exact visible model text, then independently verify the wire ID.
+    const replacement = page.getByRole("option").filter({
+      has: page.getByText("GPT-6 Luna", { exact: true }),
+    });
+    await expect.element(replacement).toHaveAttribute("data-id", "openai/gpt-6-luna");
+    await expect.element(replacement).toHaveAttribute("aria-selected", "false");
+    native.choose.mockResolvedValue({
+      ...state,
+      chosen: { ...state.chosen, page: "openai/gpt-6-luna" },
+      effective: { ...state.effective, page: "openai/gpt-6-luna" },
+    });
+    await replacement.click();
     expect(native.choose).toHaveBeenCalledExactlyOnceWith(PROFILE, "page", "openai/gpt-6-luna");
+    await expect
+      .element(
+        screen.getByRole("button", { name: "Model: GPT-6 Luna, Medium effort", exact: true }),
+      )
+      .toBeVisible();
   },
 );
 

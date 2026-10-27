@@ -105,23 +105,17 @@ pub(super) fn confirm(
     account_revision: Option<u64>,
 ) -> Result<page_choice::Reply, CodexFaultV1> {
     match &receipt {
-        page_choice::Reply::Committed(value) if Some(value) == wanted => {
-            if observe_selection(service, value, account_revision) {
-                Ok(receipt)
-            } else {
-                selection_uncertain(service);
-                Err(CodexFaultV1::OutcomeUnknown)
-            }
+        page_choice::Reply::Committed(value)
+            if Some(value) == wanted && observe_selection(service, value, account_revision) =>
+        {
+            Ok(receipt)
         }
         page_choice::Reply::Conflict(value)
-            if value.profile == service.profile && value.valid() =>
+            if value.profile == service.profile
+                && value.valid()
+                && observe_selection(service, value, account_revision) =>
         {
-            if observe_selection(service, value, account_revision) {
-                Ok(receipt)
-            } else {
-                selection_uncertain(service);
-                Err(CodexFaultV1::OutcomeUnknown)
-            }
+            Ok(receipt)
         }
         _ => {
             selection_uncertain(service);
