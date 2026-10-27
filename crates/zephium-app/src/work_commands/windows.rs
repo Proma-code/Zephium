@@ -175,6 +175,35 @@ impl RootObservation {
         }
     }
 }
+// Test-only durations for the exact owned process, not a process inventory.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CpuObservation {
+    query_failed: bool,
+    kernel_100ns: Option<u64>,
+    user_100ns: Option<u64>,
+}
+#[cfg(test)]
+impl CpuObservation {
+    fn from_result(value: Result<(u64, u64), ()>) -> Self {
+        match value {
+            Ok((kernel, user)) => Self {
+                query_failed: false,
+                kernel_100ns: Some(kernel),
+                user_100ns: Some(user),
+            },
+            Err(()) => Self {
+                query_failed: true,
+                ..Default::default()
+            },
+        }
+    }
+}
+#[cfg(test)]
+fn filetime_ticks(high: u32, low: u32) -> u64 {
+    (u64::from(high) << 32) | u64::from(low)
+}
+
 #[cfg(test)]
 fn observed_ms(started: Instant, at: Option<Instant>) -> Option<u64> {
     at.and_then(|at| at.checked_duration_since(started))
@@ -187,6 +216,8 @@ pub(super) struct Process {
     pub(super) output: tokio::sync::mpsc::Receiver<Result<Vec<u8>, ()>>,
     #[cfg(test)]
     reader_timing: Arc<ReaderTiming>,
+    #[cfg(test)]
+    resume_previous_count: u32,
 }
 impl Drop for Process {
     fn drop(&mut self) {
@@ -199,6 +230,34 @@ impl Process {
     }
     pub(super) fn quitting(&self) -> bool {
         self.job.quitting.load(Ordering::Acquire)
+    }
+    #[cfg(test)]
+    fn cpu_observation(&self) -> CpuObservation {
+        use ::windows::Win32::Foundation::FILETIME;
+        let (mut created, mut exited, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        // SAFETY: queries only the original retained process handle. Creation
+        // and exit timestamps are neither inspected nor printed (a live
+        // process has no defined exit timestamp).
+        let queried = unsafe {
+            GetProcessTimes(
+                handle(&self.process),
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            )
+        };
+        CpuObservation::from_result(queried.map_err(|_| ()).map(|()| {
+            (
+                filetime_ticks(kernel.dwHighDateTime, kernel.dwLowDateTime),
+                filetime_ticks(user.dwHighDateTime, user.dwLowDateTime),
+            )
+        }))
     }
     pub(super) fn status(&self) -> Result<Option<i32>, &'static str> {
         // SAFETY: this process handle is live and never supplied by model input.
@@ -401,7 +460,8 @@ pub(super) fn spawn_program(
     if let Some(capabilities) = confinement {
         verify_confined_token(handle(&process_handle), capabilities)?;
     }
-    if unsafe { ResumeThread(handle(&thread)) } == u32::MAX {
+    let resume_previous_count = unsafe { ResumeThread(handle(&thread)) };
+    if resume_previous_count == u32::MAX {
         return Err("The command could not be resumed");
     }
     registry.retain(|entry| entry.strong_count() != 0);
@@ -446,6 +506,8 @@ pub(super) fn spawn_program(
         output,
         #[cfg(test)]
         reader_timing,
+        #[cfg(test)]
+        resume_previous_count,
     })
 }
 
@@ -573,6 +635,8 @@ where
     let spawn_ms = observed_ms(started, Some(Instant::now()));
     #[cfg(test)]
     let mut before_stop = RootObservation::default();
+    #[cfg(test)]
+    let mut before_stop_cpu = CpuObservation::default();
     let mut output = Output::new();
     progress(output.view()).await;
     let mut tick = tokio::time::interval(Duration::from_millis(50));
@@ -596,7 +660,10 @@ where
                         // Observe only: never substitute this test snapshot for
                         // the original post-stop status query or its ordering.
                         #[cfg(test)]
-                        { before_stop = RootObservation::sample(process.status()); }
+                        {
+                            before_stop = RootObservation::sample(process.status());
+                            before_stop_cpu = process.cpu_observation();
+                        }
                         process.job.stop(); stopping = Some((Instant::now(), note));
                     }
                 }
@@ -624,6 +691,9 @@ where
             observed_ms(started, process.reader_timing.started.get().copied()),
             observed_ms(started, process.reader_timing.first_byte.get().copied()),
             before_stop.state, before_stop.exit, closed);
+        eprintln!("work-command-cpu: resume_previous_count={} query_failed={} kernel_100ns={:?} user_100ns={:?}",
+            process.resume_previous_count, before_stop_cpu.query_failed,
+            before_stop_cpu.kernel_100ns, before_stop_cpu.user_100ns);
     }
     let succeeded = stopping.is_none() && status == Some(0);
     let note = stopping.map(|(_, note)| note).unwrap_or_else(|| {
@@ -721,6 +791,29 @@ mod tests {
             observed_ms(start, reader.first_byte.get().copied()),
             Some(9)
         );
+    }
+
+    #[test]
+    fn cpu_observation_keeps_query_failure_distinct_from_zero_and_full_width_ticks() {
+        let unqueried = CpuObservation::default();
+        let failed = CpuObservation::from_result(Err(()));
+        let zero = CpuObservation::from_result(Ok((0, 0)));
+        assert!(!unqueried.query_failed);
+        assert_eq!(unqueried.kernel_100ns, None);
+        assert_eq!(unqueried.user_100ns, None);
+        assert!(failed.query_failed);
+        assert_eq!(failed.kernel_100ns, None);
+        assert_eq!(failed.user_100ns, None);
+        assert!(!zero.query_failed);
+        assert_eq!(zero.kernel_100ns, Some(0));
+        assert_eq!(zero.user_100ns, Some(0));
+        assert_ne!(failed, zero);
+        let ticks = filetime_ticks(0x1234_5678, 0x90ab_cdef);
+        assert_eq!(ticks, 0x1234_5678_90ab_cdef);
+        assert_eq!(filetime_ticks(u32::MAX, u32::MAX), u64::MAX);
+        let observed = CpuObservation::from_result(Ok((ticks, 7)));
+        assert_eq!(observed.kernel_100ns, Some(ticks));
+        assert_eq!(observed.user_100ns, Some(7));
     }
 
     #[test]
