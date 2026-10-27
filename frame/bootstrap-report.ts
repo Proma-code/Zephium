@@ -43,6 +43,8 @@ export function bootstrapReport(pages: readonly Page[]): Plugin {
           staticCssBytes: number;
           /** What is budgeted: the whole graph of a page, the addition of a lazy destination. */
           budgeted: BundleSize;
+          /** Exact emitted files charged after the already-loaded graph is subtracted. */
+          charged: { js: string[]; css: string[] };
           css: string[];
           modules: string[];
         }
@@ -174,6 +176,7 @@ export function bootstrapReport(pages: readonly Page[]): Plugin {
           staticJsBytes: js,
           staticCssBytes: styles,
           budgeted: { js, css: styles },
+          charged: { js: [...visited], css: [...css] },
           css: [...css],
           modules: [...modules].sort(),
         };
@@ -205,11 +208,57 @@ export function bootstrapReport(pages: readonly Page[]): Plugin {
         const report = reports[root.name];
         if (root.surface || !graph || !report) continue;
         const loaded = before.get(root.name) ?? new Set();
+        report.charged = {
+          js: [...graph.visited].filter((file) => !loaded.has(file)),
+          css: [...graph.css].filter((file) => !loaded.has(file)),
+        };
         report.budgeted = {
-          js: bytes([...graph.visited].filter((file) => !loaded.has(file))),
-          css: bytes([...graph.css].filter((file) => !loaded.has(file))),
+          js: bytes(report.charged.js),
+          css: bytes(report.charged.css),
         };
       }
+      // Preserve attribution even when the unchanged budget checks below fail.
+      // These are diagnostics outside dist, never deliverable application assets.
+      const dir = new URL("./reports/", import.meta.url);
+      mkdirSync(dir, { recursive: true });
+      const suffix = pages.includes("browser") ? "" : `.${pages.join("-")}`;
+      writeFileSync(
+        new URL(`bootstrap-report${suffix}.json`, dir),
+        JSON.stringify(reports, null, 2),
+      );
+      writeFileSync(
+        new URL(`bootstrap-chunks${suffix}.json`, dir),
+        JSON.stringify(
+          {
+            chunks: Object.values(bundle)
+              .filter((item) => item.type === "chunk")
+              .map((item) => ({
+                file: item.fileName,
+                bytes: Buffer.byteLength(item.code),
+                isEntry: item.isEntry,
+                isDynamicEntry: item.isDynamicEntry,
+                facade: item.facadeModuleId,
+                imports: item.imports,
+                dynamicImports: item.dynamicImports,
+                css: [
+                  ...((item as typeof item & { viteMetadata?: { importedCss: Set<string> } })
+                    .viteMetadata?.importedCss ?? []),
+                ],
+                // Rendered module lengths are bundler metadata, not a claim that
+                // per-module values sum to the final minified chunk byte count.
+                modules: Object.entries(item.modules).map(([id, module]) => ({
+                  id,
+                  renderedLength: module.renderedLength,
+                })),
+              })),
+            assets: Object.values(bundle)
+              .filter((item) => item.type === "asset")
+              .map((item) => ({ file: item.fileName, bytes: Buffer.byteLength(item.source) })),
+          },
+          null,
+          2,
+        ),
+      );
       const build = pages.join("-");
       const recordedBuilds = JSON.parse(readFileSync(BUDGETS, "utf8")) as Record<
         string,
@@ -241,18 +290,6 @@ export function bootstrapReport(pages: readonly Page[]): Plugin {
             `${failures.join("\n")}\nShrink it, or if the growth is intended, run pnpm run budgets and say why in the commit.`,
           );
       }
-      // Kept out of dist: Tauri embeds all of dist into the shipped binary.
-      const dir = new URL("./reports/", import.meta.url);
-      mkdirSync(dir, { recursive: true });
-      writeFileSync(
-        new URL(
-          pages.includes("browser")
-            ? "bootstrap-report.json"
-            : `bootstrap-report.${pages.join("-")}.json`,
-          dir,
-        ),
-        JSON.stringify(reports, null, 2),
-      );
     },
     writeBundle(_options, bundle) {
       for (const [name, styles] of surfaceStyles) {

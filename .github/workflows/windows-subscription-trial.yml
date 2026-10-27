@@ -101,10 +101,21 @@ jobs:
           src/features/work/tests/ModelPicker.component.test.ts
           src/shared/ui/Select/tests/Select.component.test.ts
       - name: Build frame and verify emitted style contract
+        id: frame_build
         run: |
           pnpm --dir frame run build
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm --dir frame run check:styles
+      - name: Retain failed Frame graph attribution
+        if: ${{ failure() && steps.frame_build.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Frame-Graph-${{ github.job }}-${{ github.sha }}
+          path: |
+            frame/reports/bootstrap-report.json
+            frame/reports/bootstrap-chunks.json
+          if-no-files-found: warn
+          retention-days: 14
       - name: Native account protocol and trial Credential Manager tests
         run: cargo test -p zephium-chatgpt -p zephium-gateway -p zephium-opencode-go -p zephium-provider-accounts -p zephium-credentials --locked --features zephium-credentials/windows-subscription-trial,zephium-chatgpt/windows-subscription-trial
       - name: Synthetic native trial vault roundtrip (no account)
@@ -284,10 +295,21 @@ jobs:
       # Trial configuration intentionally has no devUrl. Compile against real
       # bundled frame assets, independently of the delivery job's UI test order.
       - name: Build real frame prerequisites and verify emitted styles
+        id: frame_build
         run: |
           pnpm --dir frame run build
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm --dir frame run check:styles
+      - name: Retain failed Frame graph attribution
+        if: ${{ failure() && steps.frame_build.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Frame-Graph-${{ github.job }}-${{ github.sha }}
+          path: |
+            frame/reports/bootstrap-report.json
+            frame/reports/bootstrap-chunks.json
+          if-no-files-found: warn
+          retention-days: 14
       - name: Compile and lint the Windows trial including test targets
         run: |
           $env:TAURI_CONFIG = Get-Content desktop/tauri.windows-subscription-trial.conf.json -Raw

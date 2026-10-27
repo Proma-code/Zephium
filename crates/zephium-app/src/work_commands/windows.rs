@@ -141,10 +141,52 @@ impl Drop for Attributes {
     }
 }
 
+// Test-only phase evidence; no payload, path, environment or process inventory.
+#[cfg(test)]
+#[derive(Default)]
+struct ReaderTiming {
+    started: OnceLock<Instant>,
+    first_byte: OnceLock<Instant>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RootObservation {
+    // 0 = not sampled; 1 = still running; 2 = exited; 3 = query failed.
+    state: u8,
+    exit: Option<i32>,
+}
+#[cfg(test)]
+impl RootObservation {
+    fn sample(value: Result<Option<i32>, &'static str>) -> Self {
+        match value {
+            Ok(None) => Self {
+                state: 1,
+                exit: None,
+            },
+            Ok(Some(exit)) => Self {
+                state: 2,
+                exit: Some(exit),
+            },
+            Err(_) => Self {
+                state: 3,
+                exit: None,
+            },
+        }
+    }
+}
+#[cfg(test)]
+fn observed_ms(started: Instant, at: Option<Instant>) -> Option<u64> {
+    at.and_then(|at| at.checked_duration_since(started))
+        .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
 pub(super) struct Process {
     process: OwnedHandle,
     job: Arc<Job>,
     pub(super) output: tokio::sync::mpsc::Receiver<Result<Vec<u8>, ()>>,
+    #[cfg(test)]
+    reader_timing: Arc<ReaderTiming>,
 }
 impl Drop for Process {
     fn drop(&mut self) {
@@ -369,15 +411,23 @@ pub(super) fn spawn_program(
     drop(write);
     drop(stdin);
     let (sender, output) = tokio::sync::mpsc::channel(8);
+    #[cfg(test)]
+    let reader_timing = Arc::new(ReaderTiming::default());
+    #[cfg(test)]
+    let reader_observation = reader_timing.clone();
     std::thread::Builder::new()
         .name("work-command-output".into())
         .spawn(move || {
+            #[cfg(test)]
+            let _ = reader_observation.started.set(Instant::now());
             let mut pipe = File::from(read);
             let mut bytes = [0u8; 8192];
             loop {
                 match pipe.read(&mut bytes) {
                     Ok(0) => break,
                     Ok(count) => {
+                        #[cfg(test)]
+                        reader_observation.first_byte.get_or_init(Instant::now);
                         if sender.blocking_send(Ok(bytes[..count].to_vec())).is_err() {
                             break;
                         }
@@ -394,6 +444,8 @@ pub(super) fn spawn_program(
         process: process_handle,
         job,
         output,
+        #[cfg(test)]
+        reader_timing,
     })
 }
 
@@ -517,6 +569,10 @@ where
 {
     let started = Instant::now();
     let mut process = spawn(cwd, command)?;
+    #[cfg(test)]
+    let spawn_ms = observed_ms(started, Some(Instant::now()));
+    #[cfg(test)]
+    let mut before_stop = RootObservation::default();
     let mut output = Output::new();
     progress(output.view()).await;
     let mut tick = tokio::time::interval(Duration::from_millis(50));
@@ -536,7 +592,13 @@ where
                     let note = if process.job.quitting.load(Ordering::Acquire) { Some("Stopped when the app quit".into()) }
                         else if started.elapsed() >= Duration::from_secs(u64::from(timeout_secs)) { Some(format!("Stopped after {timeout_secs} s")) }
                         else if cancelled().await { Some("Stopped".into()) } else { None };
-                    if let Some(note) = note { process.job.stop(); stopping = Some((Instant::now(), note)); }
+                    if let Some(note) = note {
+                        // Observe only: never substitute this test snapshot for
+                        // the original post-stop status query or its ordering.
+                        #[cfg(test)]
+                        { before_stop = RootObservation::sample(process.status()); }
+                        process.job.stop(); stopping = Some((Instant::now(), note));
+                    }
                 }
                 if status.is_none() {
                     status = process.status()?;
@@ -554,6 +616,14 @@ where
         if status.is_some() && closed {
             break;
         }
+    }
+    #[cfg(test)]
+    if stopping.is_some() {
+        eprintln!("work-command-timing: spawn_ms={:?} reader_start_ms={:?} reader_first_byte_ms={:?} pre_stop_state={} pre_stop_exit={:?} output_closed={}",
+            spawn_ms,
+            observed_ms(started, process.reader_timing.started.get().copied()),
+            observed_ms(started, process.reader_timing.first_byte.get().copied()),
+            before_stop.state, before_stop.exit, closed);
     }
     let succeeded = stopping.is_none() && status == Some(0);
     let note = stopping.map(|(_, note)| note).unwrap_or_else(|| {
@@ -589,6 +659,69 @@ mod tests {
         JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
     };
     use std::sync::atomic::AtomicU32;
+
+    #[test]
+    fn timing_observation_keeps_query_failure_distinct_from_running_and_exit() {
+        assert_eq!(
+            RootObservation::default(),
+            RootObservation {
+                state: 0,
+                exit: None
+            }
+        );
+        assert_eq!(
+            RootObservation::sample(Ok(None)),
+            RootObservation {
+                state: 1,
+                exit: None
+            }
+        );
+        assert_eq!(
+            RootObservation::sample(Ok(Some(7))),
+            RootObservation {
+                state: 2,
+                exit: Some(7)
+            }
+        );
+        assert_eq!(
+            RootObservation::sample(Err("fixed test error")),
+            RootObservation {
+                state: 3,
+                exit: None
+            }
+        );
+    }
+    #[test]
+    fn timing_observation_is_absent_until_recorded_and_never_invents_negative_elapsed() {
+        let start = Instant::now();
+        let reader = ReaderTiming::default();
+        assert_eq!(observed_ms(start, reader.started.get().copied()), None);
+        reader
+            .started
+            .set(start + Duration::from_millis(4))
+            .unwrap();
+        reader
+            .first_byte
+            .set(start + Duration::from_millis(9))
+            .unwrap();
+        assert_eq!(observed_ms(start, reader.started.get().copied()), Some(4));
+        assert_eq!(
+            observed_ms(start, reader.first_byte.get().copied()),
+            Some(9)
+        );
+        assert_eq!(
+            observed_ms(start + Duration::from_millis(1), Some(start)),
+            None
+        );
+        assert!(reader
+            .first_byte
+            .set(start + Duration::from_millis(12))
+            .is_err());
+        assert_eq!(
+            observed_ms(start, reader.first_byte.get().copied()),
+            Some(9)
+        );
+    }
 
     #[test]
     fn fixed_arguments_round_trip_through_windows_parser() {
