@@ -1,12 +1,9 @@
 use super::super::LeadModel;
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::Poll;
-use tokio::sync::{Notify, Semaphore};
 
 const A: &str = "gateway/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const GO: &str = "opencode-go/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const B: &str = "gateway/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 fn profile() -> ProfileId {
     ProfileId::parse("00000000000000000000000001").unwrap()
 }
@@ -117,596 +114,94 @@ fn ready(calls: &Arc<AtomicUsize>, error: Option<WorkModelError>) -> Arc<dyn Wor
         quiet: false,
     })
 }
-fn quota(prefix: &str) -> WorkModelError {
-    if prefix == "chatgpt" {
-        WorkModelError::ChatGpt {
-            fault: ChatGptModelFault::UsageLimit,
-        }
-    } else if prefix.starts_with("opencode-go/") {
-        WorkModelError::OpenCodeGo {
-            fault: OpenCodeGoModelFault::RateLimited,
-            usage_unknown: true,
-        }
-    } else {
-        WorkModelError::Gateway {
-            fault: GatewayModelFault::RateLimited,
-            usage_unknown: true,
-        }
-    }
-}
 #[tokio::test]
-async fn failed_page_blocks_light_and_lead_across_distinct_model_clients() {
-    for prefix in ["chatgpt", A, GO] {
+async fn retired_sources_reject_every_role_without_dispatch_or_events() {
+    for prefix in ["chatgpt", A, GO, "gateway/invalid", "opencode-go/invalid"] {
         let calls = Arc::new(AtomicUsize::new(0));
-        let error = quota(prefix);
         let models = guard_run_sources(
             profile(),
             group(
                 prefix,
                 [
                     ready(&calls, None),
-                    ready(&calls, Some(error)),
+                    ready(&calls, None),
                     ready(&calls, None),
                 ],
             ),
         );
-        let events = AtomicUsize::new(0);
-        let sink = |_| {
-            events.fetch_add(1, Ordering::SeqCst);
-        };
-        assert_eq!(
-            models
-                .page
-                .client
-                .call(request(&models.page), &sink)
-                .await
-                .err(),
-            Some(error)
-        );
-        assert_eq!(
-            models
-                .light
-                .client
-                .call(request(&models.light), &sink)
-                .await
-                .err(),
-            Some(error)
-        );
-        assert_eq!(
-            models
-                .lead
-                .client
-                .call(request(&models.lead), &sink)
-                .await
-                .err(),
-            Some(error)
-        );
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "role/model reassignment must not redispatch"
-        );
-        assert_eq!(
-            events.load(Ordering::SeqCst),
-            1,
-            "no sibling output after failure"
-        );
-    }
-}
-#[tokio::test]
-async fn different_explicit_connections_and_sources_remain_independent() {
-    for (first, second) in [(A, B), (GO, "opencode-go/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")] {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let mut raw = group(
-            first,
-            [
-                ready(&calls, None),
-                ready(&calls, Some(quota(first))),
-                ready(&calls, None),
-            ],
-        );
-        raw.light.entry = entry(second, "light");
-        raw.lead.entry = entry("chatgpt", "lead");
-        let models = guard_run_sources(profile(), raw);
-        assert!(models
-            .page
-            .client
-            .call(request(&models.page), &|_| {})
-            .await
-            .is_err());
-        assert!(models
-            .light
-            .client
-            .call(request(&models.light), &|_| {})
-            .await
-            .is_ok());
-        assert!(models
-            .lead
-            .client
-            .call(request(&models.lead), &|_| {})
-            .await
-            .is_ok());
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
-    }
-}
-#[tokio::test]
-async fn a_fresh_explicit_run_and_another_profile_get_fresh_admission() {
-    for prefix in ["chatgpt", A, GO] {
-        let calls = Arc::new(AtomicUsize::new(0));
-        for owner in [
-            profile(),
-            profile(),
-            ProfileId::parse("00000000000000000000000002").unwrap(),
-        ] {
-            let models = guard_run_sources(
-                owner,
-                group(
-                    prefix,
-                    [
-                        ready(&calls, None),
-                        ready(&calls, Some(quota(prefix))),
-                        ready(&calls, None),
-                    ],
-                ),
-            );
-            assert!(models
-                .page
-                .client
-                .call(request(&models.page), &|_| {})
-                .await
-                .is_err());
-            assert!(models
-                .light
-                .client
-                .call(request(&models.light), &|_| {})
-                .await
-                .is_err());
+        for model in [&models.lead, &models.page, &models.light] {
+            for _ in 0..2 {
+                assert_eq!(
+                    model
+                        .client
+                        .call(request(model), &|_| panic!("retired source event"))
+                        .await
+                        .err(),
+                    crate::work_models::retired_source_error(&model.entry)
+                );
+            }
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }
+
 #[tokio::test]
-async fn generic_api_clients_are_unwrapped_and_keep_existing_retry_semantics() {
+async fn tombstone_provider_cannot_hide_behind_an_api_identifier() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let client = ready(&calls, Some(WorkModelError::Network));
-    let raw = group("openai", [client.clone(), client.clone(), client.clone()]);
-    let models = guard_run_sources(profile(), raw);
-    assert!(Arc::ptr_eq(&models.page.client, &client));
-    for model in [&models.page, &models.light] {
-        assert_eq!(
-            model.client.call(request(model), &|_| {}).await.err(),
-            Some(WorkModelError::Network)
-        );
-    }
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
-}
-#[tokio::test]
-async fn malformed_protected_entry_cannot_bypass_the_source_guard() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let mut raw = group(
-        A,
+    let mut models = group(
+        "openai",
         [
             ready(&calls, None),
             ready(&calls, None),
             ready(&calls, None),
         ],
     );
-    raw.page.entry.model.provider = WorkModelProvider::OpenAi;
-    let models = guard_run_sources(profile(), raw);
-    let expected = WorkModelError::Gateway {
-        fault: GatewayModelFault::Unsupported,
-        usage_unknown: false,
-    };
-    assert_eq!(
-        models
-            .page
-            .client
-            .call(request(&models.page), &|_| {})
-            .await
-            .err(),
-        Some(expected)
-    );
-    assert_eq!(
-        models
-            .light
-            .client
-            .call(request(&models.light), &|_| {})
-            .await
-            .err(),
-        Some(expected)
-    );
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
-}
-struct Blocked {
-    calls: Arc<AtomicUsize>,
-    entered: Notify,
-    release: Semaphore,
-    abandoned: Arc<AtomicUsize>,
-    error: Option<WorkModelError>,
-}
-struct PendingCall {
-    abandoned: Arc<AtomicUsize>,
-    finished: bool,
-}
-impl Drop for PendingCall {
-    fn drop(&mut self) {
-        if !self.finished {
-            self.abandoned.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-}
-impl WorkModelClient for Blocked {
-    fn call<'a>(
-        &'a self,
-        _: WorkModelRequest,
-        events: &'a (dyn Fn(WorkModelEvent) + Send + Sync),
-    ) -> WorkModelFuture<'a> {
-        Box::pin(async move {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let mut pending = PendingCall {
-                abandoned: self.abandoned.clone(),
-                finished: false,
-            };
-            self.entered.notify_one();
-            let permit = self.release.acquire().await.unwrap();
-            permit.forget();
-            events(WorkModelEvent::Text("fixture".into()));
-            pending.finished = true;
-            match self.error {
-                Some(error) => Err(error),
-                None => Ok(outcome()),
-            }
-        })
-    }
-}
-fn blocked(error: Option<WorkModelError>) -> Arc<Blocked> {
-    Arc::new(Blocked {
-        calls: Arc::new(AtomicUsize::new(0)),
-        entered: Notify::new(),
-        release: Semaphore::new(0),
-        abandoned: Arc::new(AtomicUsize::new(0)),
-        error,
-    })
-}
-fn start(model: LeadModel) -> tokio::task::JoinHandle<Result<WorkModelOutcome, WorkModelError>> {
-    tokio::spawn(async move { model.client.call(request(&model), &|_| {}).await })
-}
-async fn observe_queued(future: &mut WorkModelFuture<'_>) {
-    std::future::poll_fn(|cx| {
-        assert!(
-            future.as_mut().poll(cx).is_pending(),
-            "same-source sibling must wait before dispatch"
-        );
-        Poll::Ready(())
-    })
-    .await;
-}
-#[tokio::test]
-async fn dropping_a_queued_waiter_does_not_poison_a_successful_owner() {
-    let owner = blocked(None);
-    let calls = owner.calls.clone();
-    let models = guard_run_sources(
-        profile(),
-        group(A, [ready(&calls, None), owner.clone(), ready(&calls, None)]),
-    );
-    let task = start(models.page.clone());
-    tokio::time::timeout(std::time::Duration::from_secs(5), owner.entered.notified())
-        .await
-        .unwrap();
-    let mut waiter = models.light.client.call(request(&models.light), &|_| {});
-    observe_queued(&mut waiter).await;
-    drop(waiter);
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    owner.release.add_permits(1);
-    assert!(task.await.unwrap().is_ok());
+    models.page.entry.model.provider = WorkModelProvider::OpenCodeGo;
+    let models = guard_run_sources(profile(), models);
     assert!(models
-        .light
+        .page
         .client
-        .call(request(&models.light), &|_| {})
+        .call(request(&models.page), &|_| panic!("event"))
+        .await
+        .is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(models
+        .lead
+        .client
+        .call(request(&models.lead), &|_| {})
         .await
         .is_ok());
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
-    assert_eq!(owner.abandoned.load(Ordering::SeqCst), 0);
-}
-#[tokio::test]
-async fn dropping_a_dispatched_owner_blocks_every_sibling_with_unknown_usage() {
-    for prefix in ["chatgpt", A, GO] {
-        let owner = blocked(None);
-        let calls = owner.calls.clone();
-        let models = guard_run_sources(
-            profile(),
-            group(
-                prefix,
-                [ready(&calls, None), owner.clone(), ready(&calls, None)],
-            ),
-        );
-        let task = start(models.page.clone());
-        tokio::time::timeout(std::time::Duration::from_secs(5), owner.entered.notified())
-            .await
-            .unwrap();
-        let mut waiter = models.light.client.call(request(&models.light), &|_| {});
-        observe_queued(&mut waiter).await;
-        task.abort();
-        let Err(cancelled) = task.await else {
-            panic!("dispatched fixture was not cancelled")
-        };
-        assert!(cancelled.is_cancelled());
-        let expected = if prefix == "chatgpt" {
-            Kind::ChatGpt.uncertain()
-        } else if prefix == GO {
-            Kind::Go.uncertain()
-        } else {
-            Kind::Gateway.uncertain()
-        };
-        assert_eq!(waiter.await.err(), Some(expected));
-        assert_eq!(
-            models
-                .lead
-                .client
-                .call(request(&models.lead), &|_| {})
-                .await
-                .err(),
-            Some(expected)
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(owner.abandoned.load(Ordering::SeqCst), 1);
-    }
-}
-#[tokio::test]
-async fn a_queued_role_cannot_overwrite_an_owner_failure_with_success() {
-    let error = quota(A);
-    let owner = blocked(Some(error));
-    let calls = owner.calls.clone();
-    let models = guard_run_sources(
-        profile(),
-        group(A, [ready(&calls, None), owner.clone(), ready(&calls, None)]),
-    );
-    let task = start(models.page.clone());
-    tokio::time::timeout(std::time::Duration::from_secs(5), owner.entered.notified())
-        .await
-        .unwrap();
-    let mut waiter = models.light.client.call(request(&models.light), &|_| {});
-    observe_queued(&mut waiter).await;
-    owner.release.add_permits(1);
-    assert_eq!(task.await.unwrap().err(), Some(error));
-    assert_eq!(waiter.await.err(), Some(error));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
+
 #[tokio::test]
-async fn a_different_connection_does_not_wait_on_the_active_source_lock() {
-    let owner = blocked(None);
-    let calls = owner.calls.clone();
-    let mut raw = group(A, [ready(&calls, None), owner.clone(), ready(&calls, None)]);
-    raw.light.entry = entry(B, "light");
-    let models = guard_run_sources(profile(), raw);
-    let task = start(models.page.clone());
-    tokio::time::timeout(std::time::Duration::from_secs(5), owner.entered.notified())
-        .await
-        .unwrap();
-    let mut other = models.light.client.call(request(&models.light), &|_| {});
-    std::future::poll_fn(|cx| {
-        assert!(
-            matches!(other.as_mut().poll(cx), Poll::Ready(Ok(_))),
-            "unrelated source must not queue behind the active source"
-        );
-        Poll::Ready(())
-    })
-    .await;
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
-    task.abort();
-    let _ = task.await;
-}
-#[tokio::test]
-async fn unexpected_retriable_errors_are_closed_source_faults() {
-    for prefix in ["chatgpt", A, GO] {
+async fn original_api_clients_preserve_identity_and_behavior() {
+    for provider in crate::work_models::KEYED_PROVIDERS
+        .into_iter()
+        .chain([WorkModelProvider::Cloud])
+    {
         let calls = Arc::new(AtomicUsize::new(0));
-        let models = guard_run_sources(
-            profile(),
-            group(
-                prefix,
-                [
-                    ready(&calls, None),
-                    ready(&calls, Some(WorkModelError::Network)),
-                    ready(&calls, None),
-                ],
-            ),
-        );
-        let expected = if prefix == "chatgpt" {
-            Kind::ChatGpt.uncertain()
-        } else if prefix == GO {
-            Kind::Go.uncertain()
-        } else {
-            Kind::Gateway.uncertain()
-        };
-        assert_eq!(
-            models
-                .page
-                .client
-                .call(request(&models.page), &|_| {})
-                .await
-                .err(),
-            Some(expected)
-        );
-        assert_eq!(
-            models
-                .light
-                .client
-                .call(request(&models.light), &|_| {})
-                .await
-                .err(),
-            Some(expected)
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let client = ready(&calls, None);
+        let mut models = group("original", [client.clone(), client.clone(), client.clone()]);
+        for model in [&mut models.lead, &mut models.page, &mut models.light] {
+            model.entry.model.provider = provider;
+        }
+        let models = guard_run_sources(profile(), models);
+        for model in [&models.lead, &models.page, &models.light] {
+            assert!(Arc::ptr_eq(&model.client, &client));
+            assert!(model.client.call(request(model), &|_| {}).await.is_ok());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 }
+
 #[test]
-fn desktop_wraps_once_before_adapter_clients_are_cloned() {
-    let native = std::fs::read_to_string("../../desktop/src/work_lead_run.rs").unwrap();
-    let guard = native
-        .find("let models = zephium_app::work_lead::guard_run_sources(profile, models);")
-        .unwrap();
-    assert_eq!(
-        native.matches("guard_run_sources(profile, models)").count(),
-        1
-    );
-    for clone in [
-        "let search = search_backend(profile, &models)",
-        "let page = page_model(&models)",
-        "models.light.client.clone()",
-    ] {
-        assert!(
-            native[guard..].contains(clone),
-            "source guard must precede every adapter"
-        );
-    }
-}
-
-#[tokio::test]
-async fn chatgpt_protocol_before_output_remains_unknown_not_an_uncharged_refusal() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let owner = Arc::new(Ready {
-        calls: calls.clone(),
-        error: Some(WorkModelError::Protocol),
-        quiet: true,
-    });
-    let models = guard_run_sources(
-        profile(),
-        group("chatgpt", [ready(&calls, None), owner, ready(&calls, None)]),
-    );
-    let events = AtomicUsize::new(0);
-    let sink = |_| {
-        events.fetch_add(1, Ordering::SeqCst);
-    };
-    assert_eq!(
-        models
-            .page
-            .client
-            .call(request(&models.page), &sink)
-            .await
-            .err(),
-        Some(WorkModelError::Protocol)
-    );
-    assert_eq!(
-        models
-            .light
-            .client
-            .call(request(&models.light), &sink)
-            .await
-            .err(),
-        Some(WorkModelError::Protocol)
-    );
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_eq!(events.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn malformed_go_identity_provider_and_wire_never_dispatch() {
-    for variant in 0..4 {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let mut raw = group(
-            GO,
-            [
-                ready(&calls, None),
-                ready(&calls, None),
-                ready(&calls, None),
-            ],
-        );
-        match variant {
-            0 => raw.page.entry.id = "opencode-go/invalid/page".into(),
-            1 => raw.page.entry.model.provider = WorkModelProvider::Compatible,
-            2 => raw.page.entry.model.wire = WorkModelWire::AnthropicMessages,
-            _ => raw.page.entry.id = "unscoped/page".into(),
-        }
-        let models = guard_run_sources(profile(), raw);
-        assert_eq!(
-            models
-                .page
-                .client
-                .call(request(&models.page), &|_| {})
-                .await
-                .err(),
-            Some(Kind::Go.unsupported())
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-    }
-}
-
-#[tokio::test]
-async fn completed_text_with_unknown_usage_blocks_work_reasks_and_other_roles() {
-    struct Unknown(Arc<AtomicUsize>);
-    impl WorkModelClient for Unknown {
-        fn call<'a>(
-            &'a self,
-            _: WorkModelRequest,
-            _: &'a (dyn Fn(WorkModelEvent) + Send + Sync),
-        ) -> WorkModelFuture<'a> {
-            Box::pin(async move {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                let mut response = outcome();
-                response.usage = WorkModelUsage::unavailable();
-                Ok(response)
-            })
-        }
-    }
-    let calls = Arc::new(AtomicUsize::new(0));
-    for expected_calls in [1, 2] {
-        let models = guard_run_sources(
-            profile(),
-            group(
-                "chatgpt",
-                [
-                    ready(&calls, None),
-                    Arc::new(Unknown(calls.clone())),
-                    ready(&calls, None),
-                ],
-            ),
-        );
-        for model in [&models.page, &models.light, &models.lead] {
-            let error = model
-                .client
-                .call(request(model), &|_| panic!("no tool side effect"))
-                .await
-                .err()
-                .unwrap();
-            let WorkModelError::ChatGpt { fault } = error else {
-                panic!("source-specific halt")
-            };
-            assert_eq!(fault.issue(), ChatGptFailureIssue::UsageUnavailable);
-            assert!(fault.unknown_outcome());
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
-    }
-}
-
-#[tokio::test]
-async fn exact_chatgpt_unknown_tool_usage_never_reaches_work_callbacks_or_another_role() {
-    struct WireFixture {
-        calls: Arc<AtomicUsize>,
-        response: Vec<u8>,
-    }
-    impl WorkModelClient for WireFixture {
-        fn call<'a>(
-            &'a self,
-            request: WorkModelRequest,
-            events: &'a (dyn Fn(WorkModelEvent) + Send + Sync),
-        ) -> WorkModelFuture<'a> {
-            Box::pin(async move {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                zephium_chatgpt::inference::fixture_call(&request, &self.response, events)
-                    .map(|(_, outcome)| outcome)
-            })
-        }
-    }
+fn offline_responses_fixture_preserves_unknown_usage_without_tool_callbacks() {
     for missing in [true, false] {
-        let mut response = serde_json::json!({
-            "type":"response.completed",
-            "response":{
-                "status":"completed",
-                "output":[{"type":"function_call","call_id":"call_1",
-                    "namespace":"zephium","name":"read_page","arguments":"{}"}],
-                "usage":null
-            }
-        });
+        let mut response = serde_json::json!({"type":"response.completed","response":{
+            "status":"completed", "output":[{"type":"function_call","call_id":"call_1",
+            "namespace":"zephium","name":"read_page","arguments":"{}"}], "usage":null
+        }});
         if missing {
             response["response"]
                 .as_object_mut()
@@ -714,45 +209,29 @@ async fn exact_chatgpt_unknown_tool_usage_never_reaches_work_callbacks_or_anothe
                 .remove("usage");
         }
         let calls = Arc::new(AtomicUsize::new(0));
-        let client = Arc::new(WireFixture {
-            calls: calls.clone(),
-            response: format!("data: {response}\n\n").into_bytes(),
+        let models = group(
+            "openai",
+            [
+                ready(&calls, None),
+                ready(&calls, None),
+                ready(&calls, None),
+            ],
+        );
+        let mut request = request(&models.page);
+        request.tools.push(WorkModelTool {
+            name:"read_page".into(), description:"Read fixture".into(),
+            schema:serde_json::json!({"type":"object","properties":{},"additionalProperties":false}), strict:true,
         });
-        let models = guard_run_sources(
-            profile(),
-            group(
-                "chatgpt",
-                [ready(&calls, None), client, ready(&calls, None)],
-            ),
+        let result = zephium_work_protocol_fixtures::responses::fixture_call(
+            &request,
+            format!("data: {response}\n\n").as_bytes(),
+            &|_| panic!("no early tool side effect"),
         );
-        let events = AtomicUsize::new(0);
-        for model in [&models.page, &models.light, &models.lead] {
-            let mut request = request(model);
-            request.tools.push(WorkModelTool {
-                name: "read_page".into(),
-                description: "Read the current page fixture".into(),
-                schema: serde_json::json!({"type":"object","properties":{},"additionalProperties":false}),
-                strict: true,
-            });
-            let error = model
-                .client
-                .call(request, &|_| {
-                    events.fetch_add(1, Ordering::SeqCst);
-                })
-                .await
-                .err()
-                .unwrap();
-            let WorkModelError::ChatGpt { fault } = error else {
-                panic!("source-specific accounting halt");
-            };
-            assert_eq!(fault.issue(), ChatGptFailureIssue::UsageUnavailable);
-            assert!(fault.unknown_outcome());
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "no role-based reask");
-        assert_eq!(
-            events.load(Ordering::SeqCst),
-            0,
-            "no early tool side effect"
-        );
+        let (_, outcome) = result.unwrap();
+        assert!(!outcome.usage.is_reported());
+        assert!(outcome
+            .assistant
+            .iter()
+            .any(|part| matches!(part, WorkModelPart::ToolCall(_))));
     }
 }

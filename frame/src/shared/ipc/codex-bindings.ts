@@ -95,6 +95,8 @@ export type CodexViewV1 = {
 	state: CodexStateV1,
 	runtime: CodexRuntimeV1,
 	models: CodexModelV1[],
+	/**  Opaque observation generation; fences preference edits, never grants execution. */
+	catalog_generation: string | null,
 	selection: CodexSelectionV1 | null,
 	/**  Persisted backend intent, independent from current runtime/account availability. */
 	page_selected: boolean,
@@ -117,5 +119,5 @@ export const commands = {
   codexLogout: (expectedProfile: string): Promise<CodexViewV1> => invoke("codex_logout", { expectedProfile }),
   codexRefreshModels: (expectedProfile: string): Promise<CodexViewV1> => invoke("codex_refresh_models", { expectedProfile }),
   codexRefreshQuota: (expectedProfile: string): Promise<CodexViewV1> => invoke("codex_refresh_quota", { expectedProfile }),
-  codexSelectModel: (expectedProfile: string, selection: CodexSelectionV1 | null): Promise<CodexViewV1> => invoke("codex_select_model", { expectedProfile, selection }),
+  codexSelectModel: (expectedProfile: string, selection: CodexSelectionV1 | null, expectedCatalogGeneration: string | null): Promise<CodexViewV1> => invoke("codex_select_model", { expectedProfile, selection, expectedCatalogGeneration }),
 };

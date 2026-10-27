@@ -65,7 +65,7 @@ windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalizati
 
 [dev-dependencies]
 # Exact in-memory subscription wire fixtures; never a production dependency.
-zephium-chatgpt = { workspace = true, features = ["test-fixtures"] }
+zephium-work-protocol-fixtures = { path = "../zephium-work-protocol-fixtures" }
 zephium-agent-model-catalog.workspace = true
 serde_json.workspace = true
 zephium-store = { workspace = true, features = ["work-execution"] }

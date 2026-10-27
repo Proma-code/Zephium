@@ -4211,7 +4211,6 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
- "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -4463,12 +4462,6 @@ dependencies = [
  "tempfile",
  "wait-timeout",
 ]
-
-[[package]]
-name = "ryu"
-version = "1.0.23"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "same-file"
@@ -4774,18 +4767,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
 dependencies = [
  "serde_core",
-]
-
-[[package]]
-name = "serde_urlencoded"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3491c14715ca2294c4d6a88f15e84739788c1d030eed8c110436aafdaa2f3fd"
-dependencies = [
- "form_urlencoded",
- "itoa",
- "ryu",
- "serde",
 ]
 
 [[package]]
@@ -7415,13 +7396,13 @@ dependencies = [
  "zephium-agent-provider-transport",
  "zephium-agent-runtime",
  "zephium-agentic",
- "zephium-chatgpt",
  "zephium-core",
  "zephium-ipc",
  "zephium-mcp",
  "zephium-private-fs",
  "zephium-provider-accounts",
  "zephium-store",
+ "zephium-work-protocol-fixtures",
 ]
 
 [[package]]
@@ -7479,35 +7460,6 @@ dependencies = [
  "zephium-blocker",
  "zephium-core",
  "zephium-update-transport",
-]
-
-[[package]]
-name = "zephium-chatgpt"
-version = "0.1.0"
-dependencies = [
- "getrandom 0.3.4",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "zephium-core",
- "zephium-credentials",
- "zeroize",
-]
-
-[[package]]
-name = "zephium-claude-broker"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "url",
- "windows",
- "zeroize",
 ]
 
 [[package]]
@@ -7617,16 +7569,13 @@ dependencies = [
  "zephium-app",
  "zephium-blocker",
  "zephium-blocker-service",
- "zephium-chatgpt",
  "zephium-codex-broker",
  "zephium-core",
  "zephium-credentials",
  "zephium-engine",
- "zephium-gateway",
  "zephium-import",
  "zephium-ipc",
  "zephium-notes",
- "zephium-opencode-go",
  "zephium-provider-accounts",
  "zephium-store",
  "zephium-voice",
@@ -7675,20 +7624,6 @@ dependencies = [
  "zephium-core",
  "zephium-webext",
  "zephium-webext-macos",
- "zeroize",
-]
-
-[[package]]
-name = "zephium-gateway"
-version = "0.1.0"
-dependencies = [
- "getrandom 0.3.4",
- "serde",
- "serde_json",
- "tokio",
- "zephium-agentic",
- "zephium-core",
- "zephium-credentials",
  "zeroize",
 ]
 
@@ -7750,20 +7685,6 @@ dependencies = [
  "tracing",
  "unicode-normalization",
  "zephium-core",
-]
-
-[[package]]
-name = "zephium-opencode-go"
-version = "0.1.0"
-dependencies = [
- "getrandom 0.3.4",
- "serde",
- "serde_json",
- "tokio",
- "zephium-agentic",
- "zephium-core",
- "zephium-credentials",
- "zeroize",
 ]
 
 [[package]]
@@ -7921,12 +7842,20 @@ dependencies = [
  "zephium-agent-runtime",
  "zephium-agentic",
  "zephium-app",
- "zephium-chatgpt",
  "zephium-core",
  "zephium-engine",
  "zephium-ipc",
  "zephium-page-assist",
  "zephium-store",
+ "zephium-work-protocol-fixtures",
+]
+
+[[package]]
+name = "zephium-work-protocol-fixtures"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "zephium-core",
 ]
 
 [[package]]
@@ -7975,9 +7904,6 @@ name = "zeroize"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "zerotrie"

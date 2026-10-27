@@ -344,3 +344,23 @@ pub fn qualify_dormant_original(
 #[cfg(all(test, not(windows)))]
 #[path = "windows/dormant_quota.rs"]
 mod dormant_quota;
+
+#[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
+pub fn fixture_dormant_preference(
+    helper: &std::path::Path,
+) -> Result<
+    (
+        tempfile::TempDir,
+        connection::DormantReceipt,
+        catalog::Catalog,
+    ),
+    &'static str,
+> {
+    connection::dormant::fixtures::preference_receipt(helper)
+}
+#[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
+mod fixture_activity;
+#[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
+pub fn native_fixture_activity() -> [u64; 4] {
+    fixture_activity::snapshot()
+}

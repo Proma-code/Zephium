@@ -42,11 +42,13 @@
     levels,
     value,
     onchange,
+    oncancel,
   }: {
     levels: readonly T[];
     /** The level the hero's model runs at; null when it takes none. */
     value: T | null;
     onchange: (level: T) => void;
+    oncancel?: () => void;
   } = $props();
 
   const HINTS: Record<DisplayEffort, () => string> = {
@@ -199,7 +201,10 @@
       onpointerdown={down}
       onpointermove={move}
       onpointerup={release}
-      onpointercancel={release}
+      onpointercancel={() => {
+        release();
+        oncancel?.();
+      }}
       onlostpointercapture={release}
     >
       <span class="groove">

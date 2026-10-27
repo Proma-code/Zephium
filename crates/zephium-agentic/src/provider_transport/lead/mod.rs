@@ -13,12 +13,8 @@ pub(super) mod image_fence;
 pub use image_fence::ModelImageGate;
 pub mod keys;
 mod listing;
-/// Explicit, bounded transport for a user-controlled loopback model gateway.
-pub mod local_gateway;
 pub mod models;
 mod openai;
-/// Fixed-origin OpenCode Go coding-agent transport.
-pub mod opencode_go;
 mod sse;
 mod transcribe;
 

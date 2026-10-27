@@ -45,6 +45,8 @@
     ontoggle,
     onEffort,
     onNativeEffort,
+    onNativeCancel,
+    pendingEffort = null,
     onstir,
     pill = $bindable(),
   }: {
@@ -56,6 +58,9 @@
     ontoggle: () => void;
     onEffort?: (level: WorkModelReasoning) => void;
     onNativeEffort?: (level: CodexEffortSelectionV1) => void;
+    onNativeCancel?: () => void;
+    /** Uncommitted gesture preview, never used for the committed pill or model choice. */
+    pendingEffort?: CodexEffortSelectionV1 | null;
     /** Something is happening in the effort control: the person is still using it. */
     onstir?: () => void;
     pill?: HTMLElement;
@@ -91,7 +96,6 @@
           source: connectionName(connection),
         }),
       );
-    if (entry.model.provider === "open_code_go") words.push(m.go_coding_only());
     if (tier) words.push(CHARACTERS[tier]());
     else if (entry.model.provider === "compatible") words.push(m.model_character_own());
     if (entry.context_window < 500_000) words.push(modelContext(entry));
@@ -222,6 +226,7 @@
     id={region}
     role="presentation"
     inert={!expanded}
+    aria-busy={pendingEffort !== null}
     bind:this={face}
     onpointerdown={(event) => {
       if (event.button === 0) heldPointer = event.pointerId;
@@ -243,7 +248,12 @@
               >{codexEffort(level)}</button
             >{/each}
         </div>
-      {:else}<ModelEffort levels={subject.levels} value={explicitEffort} onchange={changed} />{/if}
+      {:else}<ModelEffort
+          levels={subject.levels}
+          value={pendingEffort?.kind === "explicit" ? pendingEffort.effort : explicitEffort}
+          onchange={changed}
+          oncancel={nativeSubject ? onNativeCancel : undefined}
+        />{/if}
       {#if nativeSubject?.defaultAvailable}
         <button
           type="button"

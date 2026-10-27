@@ -145,7 +145,14 @@ impl FixtureImage {
     }
     fn copy_at(path: PathBuf, package: Option<File>) -> Result<Self, &'static str> {
         let source = std::env::current_exe().map_err(|_| "helper-source")?;
-        crate::image::require_absolute_local(&source)?;
+        Self::copy_from(&source, path, package)
+    }
+    fn copy_from(
+        source: &Path,
+        path: PathBuf,
+        package: Option<File>,
+    ) -> Result<Self, &'static str> {
+        crate::image::require_absolute_local(source)?;
         let mut source = OpenOptions::new()
             .read(true)
             .share_mode(1)
@@ -496,9 +503,20 @@ pub(crate) fn dormant_session(
     lease: crate::profile::native::ProfileLease,
     package: &Path,
 ) -> Result<(Session, Arc<RuntimePaths>), &'static str> {
+    let helper = std::env::current_exe().map_err(|_| "helper-source")?;
+    dormant_session_from(scenario, lease, package, &helper)
+}
+#[cfg(feature = "native-fixtures")]
+pub(crate) fn dormant_session_from(
+    scenario: crate::connection::dormant::fixtures::Scenario,
+    lease: crate::profile::native::ProfileLease,
+    package: &Path,
+    helper: &Path,
+) -> Result<(Session, Arc<RuntimePaths>), &'static str> {
     std::fs::create_dir(package).map_err(|_| "dormant-package-create")?;
     let package_pin = crate::image::pin_directory(package)?;
-    let image = Arc::new(FixtureImage::copy_at(
+    let image = Arc::new(FixtureImage::copy_from(
+        helper,
         package.join("codex-transport-helper.exe"),
         Some(package_pin),
     )?);

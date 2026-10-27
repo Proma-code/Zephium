@@ -8,7 +8,7 @@ license.workspace = true
 [features]
 default = ["work-product", "macos-page-permission-prompts"]
 # Optimized but explicitly isolated Windows trial, never a production update.
-windows-subscription-trial = ["dep:zephium-codex-broker", "dep:zephium-provider-accounts", "dep:zephium-credentials", "zephium-credentials/windows-subscription-trial", "zephium-chatgpt/windows-subscription-trial"]
+windows-subscription-trial = ["dep:zephium-codex-broker", "dep:zephium-provider-accounts", "zephium-credentials/windows-subscription-trial"]
 # Dormant until an explicit Work intent. Native adapters are target-specific;
 # durable contracts and orchestration also compile on Windows.
 work-product = [
@@ -159,17 +159,15 @@ xkeysym = "=0.2.1"
 zbus = { version = "=5.17.0", default-features = false, features = ["async-io"] }
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
+zephium-codex-broker = { path = "../crates/zephium-codex-broker", features = ["native-fixtures"] }
 # Exercise native parent paint without creating a WebView or user profile.
 tauri = { workspace = true, features = ["unstable"] }
 windows = { version = "0.61", features = ["Win32_Graphics_Gdi"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-zephium-credentials = { workspace = true, optional = true }
-zephium-chatgpt.workspace = true
+zephium-credentials.workspace = true
 zephium-provider-accounts = { workspace = true, optional = true }
 zephium-codex-broker = { path = "../crates/zephium-codex-broker", features = ["trial-integration"], optional = true }
-zephium-gateway.workspace = true
-zephium-opencode-go.workspace = true
 zeroize = "=1.9.0"
 zephium-work-composition = { workspace = true, optional = true }
 zephium-blocker = { workspace = true, features = ["runtime"] }

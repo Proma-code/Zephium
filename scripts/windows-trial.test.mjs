@@ -47,7 +47,7 @@ test('all native startup registry operations use the one trial-aware name withou
 test('native release build requires both isolated feature and config', () => {
   const manifest = readFileSync(resolve(root, 'desktop/Cargo.toml'), 'utf8');
   assert.match(manifest, /windows-subscription-trial = .*zephium-credentials\/windows-subscription-trial/);
-  assert.match(manifest, /windows-subscription-trial = .*zephium-chatgpt\/windows-subscription-trial/);
+  assert.doesNotMatch(manifest, /zephium-(chatgpt|gateway|opencode-go)/);
   const build = readFileSync(resolve(root, 'desktop/build.rs'), 'utf8');
   assert.match(build, /windows_trial_config::validate\(&config, "windows", windows_trial\)/);
   const updates = readFileSync(resolve(root, 'desktop/src/updates.rs'), 'utf8');

@@ -7,6 +7,7 @@ export function codexView(profile: string, patch: Partial<CodexViewV1> = {}): Co
     state: "signed_out",
     runtime: "active",
     models: [],
+    catalog_generation: "test-catalog-generation",
     selection: null,
     page_selected: false,
     login_attempt: null,

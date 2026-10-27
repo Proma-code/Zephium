@@ -8,11 +8,7 @@ import ModelPicker from "../components/bar/ModelPicker.svelte";
 import ModelCard from "../components/bar/ModelCard.svelte";
 import ModelBarStage from "./ModelBarStage.svelte";
 import { PROFILE, entry, models } from "$shared/testing/work-models";
-import { goView, goQuotaReading } from "$shared/testing/opencode-go";
-import { gatewayView } from "$shared/testing/gateway";
-import { chatgptView } from "$shared/testing/chatgpt";
 import { codexView } from "$shared/testing/codex";
-import { emitNativeEvent } from "$shared/testing/native-events";
 import { accountFixture } from "$shared/testing/account";
 
 const native = vi.hoisted(() => ({
@@ -71,61 +67,13 @@ vi.mock("$shared/ipc/codex-bindings", () => ({
     codexSelectModel: codex.select,
   },
 }));
-const chatgpt = vi.hoisted(() => ({
-  read: vi.fn(),
-  signIn: vi.fn(),
-  cancel: vi.fn(),
-  signOut: vi.fn(),
-  models: vi.fn(),
-}));
-vi.mock("$shared/ipc/chatgpt-bindings", async () => {
-  const { mockChatGptBindings } = await import("$shared/testing/chatgpt");
-  return mockChatGptBindings({
-    chatgptAccount: chatgpt.read,
-    chatgptSignOut: chatgpt.signOut,
-  });
-});
-const go = vi.hoisted(() => ({
-  read: vi.fn(),
-  check: vi.fn(),
-  quota: vi.fn(),
-  disconnect: vi.fn(),
-}));
-vi.mock("$shared/ipc/go-bindings", async () => {
-  const { mockGoBindings } = await import("$shared/testing/opencode-go");
-  return mockGoBindings({
-    goStatus: go.read,
-    goCheck: go.check,
-    goQuota: go.quota,
-    goDisconnect: go.disconnect,
-  });
-});
-const gateway = vi.hoisted(() => ({ read: vi.fn(), check: vi.fn(), disconnect: vi.fn() }));
-vi.mock("$shared/ipc/gateway-bindings", async () => {
-  const { mockGatewayBindings } = await import("$shared/testing/gateway");
-  return mockGatewayBindings({
-    gatewayStatus: gateway.read,
-    gatewayCheck: gateway.check,
-    gatewayDisconnect: gateway.disconnect,
-  });
-});
 beforeEach(() => {
   native.effort.mockReset();
   native.choose.mockReset();
   for (const command of Object.values(codex)) command.mockReset();
 
-  for (const command of Object.values(go)) command.mockReset();
-  go.read.mockResolvedValue(goView(PROFILE));
-  go.disconnect.mockResolvedValue(goView(PROFILE));
-  for (const command of Object.values(gateway)) command.mockReset();
-  gateway.read.mockResolvedValue(gatewayView(PROFILE));
-  gateway.disconnect.mockResolvedValue(gatewayView(PROFILE));
   native.openUrl.mockReset();
   native.openUrl.mockRejectedValue(new Error("mock browser unavailable"));
-  for (const command of Object.values(chatgpt)) command.mockReset();
-  chatgpt.read.mockResolvedValue(chatgptView(PROFILE));
-  chatgpt.cancel.mockResolvedValue(chatgptView(PROFILE));
-  chatgpt.signOut.mockResolvedValue(chatgptView(PROFILE));
 });
 
 const view = (lead: string, chosen: string | null = null, effort?: WorkModelReasoning) =>
@@ -198,7 +146,6 @@ test("the rail holds every provider, each with its own state", async () => {
     "Groq, needs a key",
     "Cerebras, needs a key",
     "Custom server, connect a server",
-    "OpenCode Go, choose a connection",
   ]);
 });
 
@@ -542,7 +489,6 @@ test("without any key the control opens provider connection choices, not an API-
     page.getByRole("button", { name: "Legacy direct account", exact: true }).query(),
   ).toBeNull();
   expect(onsettings).not.toHaveBeenCalled();
-  expect(chatgpt.signIn).not.toHaveBeenCalled();
 });
 
 test("signed out where hosted models exist, Zephium AI is one sign-in away", async () => {
@@ -712,273 +658,40 @@ function bothConnections() {
   return value;
 }
 
-test("legacy direct catalogue is not offered or silently replaced by an API choice", async () => {
-  native.ready.mockImplementation(ready(true));
-  const state = bothConnections();
-  state.effective.page = "chatgpt/gpt-6-luna";
-  state.chosen.page = "chatgpt/gpt-6-luna";
-  native.read.mockResolvedValue(state);
-  const screen = await render(ModelPicker, { profile: PROFILE, role: "page" });
-  await screen.getByRole("button", { name: "Model: GPT-6 Luna", exact: true }).click();
-  await expect
-    .element(screen.getByText("This saved direct connection is retired.", { exact: false }))
-    .toBeVisible();
-  expect(page.getByRole("button", { name: "Continue with ChatGPT" }).query()).toBeNull();
-  expect(
-    page.getByRole("button", { name: "Legacy direct account", exact: true }).query(),
-  ).toBeNull();
-  expect(
-    page
-      .getByRole("option")
-      .all()
-      .some((row) => row.element().getAttribute("data-id")?.startsWith("chatgpt/")),
-  ).toBe(false);
-  expect(native.choose).not.toHaveBeenCalled();
-  expect(chatgpt.signIn).not.toHaveBeenCalled();
-  expect(chatgpt.signOut).not.toHaveBeenCalled();
-  expect(chatgpt.read).not.toHaveBeenCalled();
-});
-
-test("a narrow non-reasoning account card keeps its fixed-effort label in flow and exposes connection context accessibly", async () => {
-  await page.viewport(640, 600);
-  native.ready.mockImplementation(ready(true));
-  const state = bothConnections();
-  state.effective.lead = "chatgpt/gpt-6-luna";
-  state.chosen.lead = "chatgpt/gpt-6-luna";
-  native.read.mockResolvedValue(state);
-  chatgpt.read.mockResolvedValue(chatgptView(PROFILE, { state: "connected", presence: "stored" }));
-  const screen = await render(ModelPicker, { profile: PROFILE });
-  await screen.getByRole("button", { name: "Work · Model: GPT-6 Luna", exact: true }).click();
-  const card = page.getByRole("region", { name: "GPT-6 Luna", exact: true });
-  await expect.element(card).toHaveAccessibleDescription(/Connection: Legacy direct account/u);
-  const fixed = page.getByText("Its own pace", { exact: true }).element() as HTMLElement;
-  const identity = card.element().querySelector<HTMLElement>(".identity")!;
-  expect(getComputedStyle(fixed).position).toBe("static");
-  await expect
-    .poll(() => fixed.getBoundingClientRect().left - identity.getBoundingClientRect().right)
-    .toBeGreaterThanOrEqual(8);
-  expect(fixed.getBoundingClientRect().right).toBeLessThanOrEqual(
-    card.element().getBoundingClientRect().right,
-  );
-  expect(page.getByRole("button", { name: /Effort:/u }).query()).toBeNull();
-});
-
-test("one custom provider seat offers independent endpoint and local gateway sources", async () => {
-  await page.viewport(1000, 800);
-  const id = `gateway/${"a".repeat(32)}/example`;
-  const catalog = models({ base: "http://localhost:11434/v1", lead: id, chosen: id });
-  catalog.entries.push(
-    entry("compatible", "example", "Example", false, ["lead"], {
-      id,
-      price: null,
-      supports: {
-        tools: true,
-        vision: false,
-        reasoning: false,
-        prompt_cache: false,
-        native_search: false,
-      },
-    }),
-  );
-  native.read.mockResolvedValue(catalog);
-  native.ready.mockImplementation(ready(true));
-  native.more.mockResolvedValue({
-    provider: "compatible",
-    entries: [entry("compatible", "endpoint-model", "Endpoint model", false)],
-    fault: null,
-  });
-  gateway.read.mockResolvedValue(
-    gatewayView(PROFILE, {
-      state: "checked",
-      connection_id: "a".repeat(32),
-      base: "http://127.0.0.1:8080/v1",
-      label: "Local",
-      models: 1,
-    }),
-  );
-  const screen = await render(ModelPicker, { profile: PROFILE });
-  await screen.getByRole("button", { name: "Work · Model: Example", exact: true }).click();
-  await expect
-    .element(screen.getByRole("button", { name: "Local gateway", exact: true }))
-    .toHaveAttribute("aria-pressed", "true");
-  await expect.element(screen.getByRole("option", { name: /^Example(?:\s|$)/u })).toBeVisible();
-  await expect
-    .element(screen.getByRole("option", { name: /^Example(?:\s|$)/u }))
-    .toHaveAttribute("data-id", id);
-  await expect
-    .element(screen.getByText("Gateway quota and pricing are not reported."))
-    .toBeVisible();
-  const calls = native.choose.mock.calls.length;
-  await screen.getByRole("button", { name: "Custom endpoint", exact: true }).click();
-  await expect
-    .element(screen.getByRole("option", { name: /^Example(?:\s|$)/u }))
-    .not.toBeInTheDocument();
-  expect(native.choose).toHaveBeenCalledTimes(calls);
-  expect(gateway.check).not.toHaveBeenCalled();
-  await screen.getByRole("button", { name: "Local gateway", exact: true }).click();
-  native.read.mockResolvedValue({
-    ...catalog,
-    entries: catalog.entries.filter((row) => row.id !== id),
-    effective: { ...catalog.effective, lead: null },
-  });
-  await screen.getByRole("button", { name: "Disconnect gateway" }).click();
-  emitNativeEvent("workModelsChanged", { version: 1 });
-  await expect
-    .element(screen.getByText("Saved gateway model unavailable", { exact: false }))
-    .toBeVisible();
-  expect(gateway.disconnect).toHaveBeenCalledExactlyOnceWith(PROFILE, "a".repeat(32));
-  expect(native.choose).toHaveBeenCalledTimes(calls);
-});
-
-test("gateway setup opens existing Settings, never inline secrets or automatic model checks", async () => {
-  await page.viewport(1000, 800);
-  native.read.mockResolvedValue(models({}));
-  native.ready.mockImplementation(ready(false));
-  const onsettings = vi.fn();
-  const screen = await render(ModelPicker, { profile: PROFILE, onsettings });
-  await screen.getByRole("button", { name: "Connect a model" }).click();
-  await screen.getByRole("tab", { name: /Custom/ }).click();
-  await screen.getByRole("button", { name: "Local gateway", exact: true }).click();
-  await expect.element(screen.getByText("No local gateway configured")).toBeVisible();
-  await screen.getByRole("button", { name: "Set up local gateway" }).click();
-  expect(onsettings).toHaveBeenCalledTimes(1);
-  expect(gateway.check).not.toHaveBeenCalled();
-});
-
-test("OpenCode Go has its own provider seat, clean models, and no automatic catalog request", async () => {
-  await page.viewport(1000, 800);
-  const id = `opencode-go/${"a".repeat(32)}/example`;
-  const catalog = models({ keys: { open_ai: "valid" }, lead: id, chosen: id });
-  catalog.entries.push(
-    entry("open_code_go", "example", "Example", false, ["lead"], {
-      id,
-      price: null,
-      supports: {
-        tools: true,
-        vision: false,
-        prompt_cache: false,
-        reasoning: false,
-        native_search: false,
-      },
-    }),
-  );
-  native.read.mockResolvedValue(catalog);
-  native.ready.mockImplementation(ready(true));
-  go.read.mockResolvedValue(
-    goView(PROFILE, {
-      state: "catalogued",
-      connection_id: "a".repeat(32),
-      models: 1,
-      last_billing: { source: "go_plus", observed_at_ms: "1700000000000" },
-    }),
-  );
-  const screen = await render(ModelPicker, { profile: PROFILE });
-  await screen.getByRole("button", { name: "Work · Model: Example", exact: true }).click();
-  await expect
-    .element(screen.getByRole("tab", { name: "OpenCode Go", exact: true }))
-    .toHaveAttribute("aria-selected", "true");
-  expect(screen.getByRole("tab", { name: /^OpenCode Go/u }).all()).toHaveLength(1);
-  await expect.element(screen.getByRole("option", { name: /^Example(?:\s|$)/u })).toBeVisible();
-  await expect
-    .element(screen.getByRole("option", { name: /^Example(?:\s|$)/u }))
-    .toHaveAttribute("data-id", id);
-  await expect
-    .element(screen.getByText("Public catalog; not key or plan verification."))
-    .toBeVisible();
-  await expect
-    .element(
-      screen.getByText("Last provider-reported billing: Go Plus allowance", { exact: false }),
-    )
-    .toBeVisible();
-  await expect.element(screen.getByText("Remaining quota has not been checked.")).toBeVisible();
-  expect(go.check).not.toHaveBeenCalled();
-  const choices = native.choose.mock.calls.length;
-  await screen.getByRole("tab", { name: "OpenAI", exact: true }).click();
-  expect(native.choose).toHaveBeenCalledTimes(choices);
-  await expect
-    .element(screen.getByRole("button", { name: "Work · Model: Example", exact: true }))
-    .toBeVisible();
-  await screen.getByRole("tab", { name: "OpenCode Go", exact: true }).click();
-  native.read.mockResolvedValue({
-    ...catalog,
-    entries: catalog.entries.filter((row) => row.id !== id),
-    effective: { ...catalog.effective, lead: null },
-  });
-  await screen.getByRole("button", { name: "Disconnect OpenCode Go" }).click();
-  emitNativeEvent("workModelsChanged", { version: 1 });
-  await expect
-    .element(screen.getByText("Saved OpenCode Go model unavailable", { exact: false }))
-    .toBeVisible();
-  expect(go.disconnect).toHaveBeenCalledExactlyOnceWith(PROFILE, "a".repeat(32));
-  expect(native.choose).toHaveBeenCalledTimes(choices);
-  await screen.getByRole("tab", { name: "OpenAI", exact: true }).click();
-  await expect.element(screen.getByRole("option", { name: /^GPT-6 Luna(?:\s|$)/u })).toBeVisible();
-});
-
-test("Go setup uses its own settings flow, not the generic API-key or Custom form", async () => {
-  await page.viewport(1000, 800);
-  native.read.mockResolvedValue(models({}));
-  native.ready.mockImplementation(ready(false));
-  const onsettings = vi.fn();
-  const screen = await render(ModelPicker, { profile: PROFILE, onsettings });
-  await screen.getByRole("button", { name: "Connect a model" }).click();
-  await screen.getByRole("tab", { name: "OpenCode Go, choose a connection", exact: true }).click();
-  await expect.element(screen.getByText("No OpenCode Go key saved")).toBeVisible();
-  await expect
-    .element(screen.getByRole("button", { name: "Add key", exact: true }))
-    .not.toBeInTheDocument();
-  await screen.getByRole("button", { name: "Set up OpenCode Go" }).click();
-  expect(onsettings).toHaveBeenCalledTimes(1);
-  expect(go.check).not.toHaveBeenCalled();
-});
-
-test("Go quota refresh leaves model choice untouched and stale quota remains distinct from billing", async () => {
-  await page.viewport(1000, 800);
-  native.read.mockResolvedValue(models({}));
-  native.ready.mockImplementation(ready(false));
-  const connection = "a".repeat(32);
-  go.read.mockResolvedValue(goView(PROFILE, { state: "configured", connection_id: connection }));
-  const reading = goQuotaReading();
-  go.quota.mockResolvedValue(
-    goView(PROFILE, { state: "configured", connection_id: connection, quota: reading }),
-  );
-  const screen = await render(ModelPicker, { profile: PROFILE, onsettings: vi.fn() });
-  await screen.getByRole("button", { name: "Connect a model" }).click();
-  await screen.getByRole("tab", { name: "OpenCode Go, choose a connection", exact: true }).click();
-  expect(go.quota).not.toHaveBeenCalled();
-  const choices = native.choose.mock.calls.length;
-  await screen.getByRole("button", { name: "Refresh Go quota" }).click();
-  await expect.element(screen.getByText("80% remaining", { exact: false })).toBeVisible();
-  await expect.element(screen.getByText("Provider-reported remaining quota")).toBeVisible();
-  expect(go.quota).toHaveBeenCalledExactlyOnceWith(PROFILE, connection);
-  expect(native.choose).toHaveBeenCalledTimes(choices);
-  expect(go.check).not.toHaveBeenCalled();
-  go.quota.mockResolvedValue(
-    goView(PROFILE, {
-      state: "configured",
-      connection_id: connection,
-      quota: { ...reading, state: "stale", error: "unavailable" },
-    }),
-  );
-  await screen.getByRole("button", { name: "Refresh Go quota" }).click();
-  await expect
-    .element(screen.getByText("Stale quota — refresh for a current reading."))
-    .toBeVisible();
-  await expect.element(screen.getByText("80% remaining", { exact: false })).toBeVisible();
-  expect(native.choose).toHaveBeenCalledTimes(choices);
-  const apiSeat = screen.getByRole("tab", { name: "OpenAI, choose a connection", exact: true });
-  await expect.element(apiSeat).toHaveAttribute("data-provider", "open_ai");
-  await expect.element(apiSeat).toHaveAttribute("data-standing", "key");
-  await apiSeat.click();
-  await expect.element(apiSeat).toHaveAttribute("aria-selected", "true");
-  await expect.element(screen.getByText("80% remaining", { exact: false })).not.toBeInTheDocument();
-  expect(native.choose).toHaveBeenCalledTimes(choices);
-});
+test.each(["chatgpt", "gateway", "opencode-go"])(
+  "retired %s catalogue is not offered or silently replaced by an API choice",
+  async (prefix) => {
+    native.ready.mockImplementation(ready(true));
+    const state = view("openai/gpt-6-luna");
+    const id = `${prefix}/retired-model`;
+    state.entries.push(entry("open_ai", "retired-model", "Saved model", false, ["page"], { id }));
+    state.effective.page = id;
+    state.chosen.page = id;
+    state.efforts.push({ id, levels: ["low", "high"], effort: "high" });
+    native.read.mockResolvedValue(state);
+    const screen = await render(ModelPicker, { profile: PROFILE, role: "page" });
+    await screen.getByRole("button", { name: "Model: Saved model", exact: true }).click();
+    await expect
+      .element(screen.getByText("This saved connection is retired.", { exact: false }))
+      .toBeVisible();
+    expect(page.getByRole("button", { name: "Continue with ChatGPT" }).query()).toBeNull();
+    expect(page.getByRole("button", { name: "Local gateway", exact: true }).query()).toBeNull();
+    expect(page.getByRole("tab", { name: /OpenCode Go/u }).query()).toBeNull();
+    expect(page.getByRole("button", { name: /^Effort:/u }).query()).toBeNull();
+    expect(
+      page
+        .getByRole("option")
+        .all()
+        .some((row) => row.element().getAttribute("data-id") === id),
+    ).toBe(false);
+    expect(native.choose).not.toHaveBeenCalled();
+    expect(native.effort).not.toHaveBeenCalled();
+    await page.getByRole("option", { name: "GPT-6 Luna", exact: true }).click();
+    expect(native.choose).toHaveBeenCalledExactlyOnceWith(PROFILE, "page", "openai/gpt-6-luna");
+  },
+);
 
 test.each([
-  ["open_ai", "chatgpt/example", "Legacy direct account", "32K context budget"],
-  ["open_code_go", `opencode-go/${"a".repeat(32)}/example`, "OpenCode Go", "32K context budget"],
-  ["compatible", `gateway/${"a".repeat(32)}/example`, "Local gateway", "32K context budget"],
   ["open_ai", "openai/example", "API key", "32K context"],
   ["compatible", "compatible/example", "Custom endpoint", "32K context"],
 ] as const)(
@@ -1031,13 +744,12 @@ test.each([true, false])(
     const screen = await render(ModelPicker, { profile: PROFILE, role: "page" });
     await screen.getByRole("button", { name: "Model: GPT-6.1 Sol", exact: true }).click();
     await expect
-      .element(screen.getByText("This saved direct connection is retired.", { exact: false }))
+      .element(screen.getByText("This saved connection is retired.", { exact: false }))
       .toBeVisible();
     expect(screen.getByRole("button", { name: /^Effort:/u }).query()).toBeNull();
     expect(screen.getByRole("slider", { name: "Effort", exact: true }).query()).toBeNull();
     expect(native.effort).not.toHaveBeenCalled();
     expect(native.choose).not.toHaveBeenCalled();
-    expect(chatgpt.read).not.toHaveBeenCalled();
   },
 );
 
@@ -1154,10 +866,14 @@ test("Page Codex uses original catalog and exact supported effort without a Work
   expect(page.getByRole("combobox", { name: "Codex model" }).query()).toBeNull();
   expect(page.getByRole("button", { name: "Use in sidebar", exact: true }).query()).toBeNull();
   await page.getByRole("option", { name: "Original Native Name", exact: true }).click();
-  expect(codex.select).toHaveBeenCalledExactlyOnceWith(PROFILE, {
-    model: "original-picker-id",
-    effort: { kind: "default" },
-  });
+  expect(codex.select).toHaveBeenCalledExactlyOnceWith(
+    PROFILE,
+    {
+      model: "original-picker-id",
+      effort: { kind: "default" },
+    },
+    "test-catalog-generation",
+  );
   expect(native.choose).not.toHaveBeenCalledWith(PROFILE, "page", "original-picker-id");
 });
 
@@ -1232,10 +948,14 @@ test("Codex uses the existing effort pill and slider with only original advertis
   await expect.element(slider).toHaveFocus();
   expect(codex.select).not.toHaveBeenCalled();
   await userEvent.keyboard("{Home}");
-  expect(codex.select).toHaveBeenLastCalledWith(PROFILE, {
-    model: "original",
-    effort: { kind: "explicit", effort: "minimal" },
-  });
+  expect(codex.select).toHaveBeenLastCalledWith(
+    PROFILE,
+    {
+      model: "original",
+      effort: { kind: "explicit", effort: "minimal" },
+    },
+    "test-catalog-generation",
+  );
   await expect.element(slider).toHaveAttribute("aria-valuetext", "Minimal");
   // Search remains a legitimate combobox; the effort surface must not add a
   // second selection form beside its existing slider.
@@ -1323,8 +1043,6 @@ test("Page offers exactly Codex and API key without converting a retained legacy
   await page.getByRole("button", { name: "API key", exact: true }).click();
   expect(codex.select).not.toHaveBeenCalled();
   expect(codex.connect).not.toHaveBeenCalled();
-  expect(chatgpt.signIn).not.toHaveBeenCalled();
-  expect(chatgpt.signOut).not.toHaveBeenCalled();
   expect(native.choose).not.toHaveBeenCalled();
 });
 
@@ -1345,10 +1063,14 @@ test("Codex default-only row selects original omission without inventing an effo
   await page.getByRole("tab", { name: "OpenAI", exact: true }).click();
   await page.getByRole("button", { name: "Codex", exact: true }).click();
   await page.getByRole("option", { name: "Original Default", exact: true }).click();
-  expect(codex.select).toHaveBeenCalledExactlyOnceWith(PROFILE, {
-    model: "default-only",
-    effort: { kind: "default" },
-  });
+  expect(codex.select).toHaveBeenCalledExactlyOnceWith(
+    PROFILE,
+    {
+      model: "default-only",
+      effort: { kind: "default" },
+    },
+    "test-catalog-generation",
+  );
   expect(native.effort).not.toHaveBeenCalled();
 });
 
@@ -1389,15 +1111,23 @@ test("Codex model default is separate from ranked explicit effort and can be res
   const choices = page.getByRole("group", { name: "Choose a supported effort", exact: true });
   await expect.element(choices.getByRole("button", { name: "None", exact: true })).toHaveFocus();
   await choices.getByRole("button", { name: "None", exact: true }).click();
-  expect(codex.select).toHaveBeenLastCalledWith(PROFILE, {
-    model: "original",
-    effort: { kind: "explicit", effort: "none" },
-  });
+  expect(codex.select).toHaveBeenLastCalledWith(
+    PROFILE,
+    {
+      model: "original",
+      effort: { kind: "explicit", effort: "none" },
+    },
+    "test-catalog-generation",
+  );
   await page.getByRole("button", { name: "Use model default", exact: true }).click();
-  expect(codex.select).toHaveBeenLastCalledWith(PROFILE, {
-    model: "original",
-    effort: { kind: "default" },
-  });
+  expect(codex.select).toHaveBeenLastCalledWith(
+    PROFILE,
+    {
+      model: "original",
+      effort: { kind: "default" },
+    },
+    "test-catalog-generation",
+  );
   expect(native.effort).not.toHaveBeenCalled();
   expect(codex.connect).not.toHaveBeenCalled();
 });
@@ -1470,10 +1200,14 @@ test("native Codex search and source-prefixed favourites never become Work choic
   expect(codex.select).not.toHaveBeenCalled();
   await search.fill("sol");
   await userEvent.keyboard("{ArrowDown}{Enter}");
-  expect(codex.select).toHaveBeenCalledExactlyOnceWith(PROFILE, {
-    model: "native/sol",
-    effort: { kind: "default" },
-  });
+  expect(codex.select).toHaveBeenCalledExactlyOnceWith(
+    PROFILE,
+    {
+      model: "native/sol",
+      effort: { kind: "default" },
+    },
+    "test-catalog-generation",
+  );
   expect(native.choose).not.toHaveBeenCalledWith(PROFILE, "page", "codex/native%2Fsol");
   await screen.unmount();
 });

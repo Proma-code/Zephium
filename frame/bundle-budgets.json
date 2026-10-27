@@ -96,18 +96,6 @@
       "js": 93954,
       "css": 8254
     },
-    "lazy:features/settings/components/AiSubscriptions.svelte": {
-      "js": 6638,
-      "css": 1280
-    },
-    "lazy:features/settings/components/LocalGateway.svelte": {
-      "js": 15479,
-      "css": 679
-    },
-    "lazy:features/settings/components/OpenCodeGo.svelte": {
-      "js": 23693,
-      "css": 2302
-    },
     "lazy:features/settings/components/Settings.svelte": {
       "js": 136678,
       "css": 9051
@@ -331,14 +319,6 @@
     "lazy:features/work/components/bar/ModelCodex.svelte": {
       "js": 6063,
       "css": 1801
-    },
-    "lazy:features/work/components/bar/ModelGateway.svelte": {
-      "js": 12090,
-      "css": 1102
-    },
-    "lazy:features/work/components/bar/ModelGo.svelte": {
-      "js": 14467,
-      "css": 1194
     },
     "lazy:features/work/components/bar/ModelPicker.svelte": {
       "js": 171673,

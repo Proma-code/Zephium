@@ -8,7 +8,6 @@ function Get-TrialStartupObservation {
   if ($Log.Contains('shutdown: process exit did not complete within the hard deadline; forcing unsuccessful termination')) { return 'shutdown-hard-deadline' }
   if ($Log.Contains('privacy: privileged WebView2 Environment5/PID/HANDLE exit was not proven;')) { return 'shutdown-webview-exit-unproven' }
   if ($Log.Contains('privacy: could not remove proven-exited privileged WebView2 runtime data at ')) { return 'shutdown-runtime-cleanup-failed' }
-  if ($Log -match 'shutdown: (ChatGPT account|OpenCode Go|local gateway) mutation cleanup was not proven') { return 'shutdown-account-cleanup-unproven' }
   if ($Log.Contains('shutdown: Work operation cleanup was not proven')) { return 'shutdown-work-cleanup-unproven' }
   if ($Log.Contains('shutdown: final session durability was not proven before the deadline;')) { return 'shutdown-durability-unproven' }
   if ($Log.Contains('shutdown: shell actor did not acknowledge the barrier:')) { return 'shutdown-barrier-unacknowledged' }

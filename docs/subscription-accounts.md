@@ -18,6 +18,11 @@ catalog. Selecting a sidebar model does not change the separately configured
 Work roles. A failed or unavailable Codex connection never selects an API key or
 another paid source automatically.
 
+While the runtime is healthily dormant, model and effort preference edits are saved
+locally. Observing Settings or the picker never wakes it. Sending a message first
+revalidates the original runtime, account, current catalog and tool policy; cached
+choices do not authorize a send.
+
 Only the original runtime performs account login. Canceling an unfinished login
 is not logout. Ordinary browser close preserves the managed account. Disconnect
 and profile removal are explicit operations; interrupted cleanup remains visible
@@ -75,16 +80,18 @@ connections or model selection. Existing source IDs, conversation history and
 stored grants are not silently converted or deleted. A saved selection of that
 retired source requires an explicit choice of Codex or another configured source.
 
-Settings shows advanced legacy recovery only when a record exists or its presence
-cannot be verified. Observation does not create an identity, refresh a token or
-contact the provider. Explicit disconnect retains a truthful indication when
-remote revocation could not be confirmed.
+No legacy account setup or recovery panel is shown. Retained credentials are not
+read, refreshed, revoked or removed by opening Settings. Existing profile cleanup
+remains responsible for retained records only when the user explicitly removes
+that profile.
 
-## Other configured sources
+## Original API providers
 
-OpenAI API keys and existing local gateway/OpenCode Go configurations keep their
-separate identities and Work settings. They are not Codex login or automatic
-fallback routes. This integration does not add another subscription provider.
+All original API-key providers and the custom OpenAI-compatible endpoint remain
+available. The experimental gateway, OpenCode Go and other subscription setup
+surfaces have been removed. Retired stored selections remain visible as unavailable
+until the user explicitly chooses a supported source; history and saved credentials
+are not silently converted or deleted.
 
 ## Qualification boundary
 

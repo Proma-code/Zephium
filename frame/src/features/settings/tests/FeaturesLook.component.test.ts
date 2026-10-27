@@ -14,10 +14,6 @@ vi.mock("$domain/tabs", () => ({
   tabs: { profile: () => ({ id: "00000000000000000000000001", kind: "regular" }) },
 }));
 // A look bench: what the shots depend on answers for real, the rest nothing.
-vi.mock("$shared/ipc/chatgpt-bindings", async () => {
-  const { chatgptView, mockChatGptBindings } = await import("$shared/testing/chatgpt");
-  return mockChatGptBindings({ chatgptAccount: async (profile) => chatgptView(profile) });
-});
 vi.mock("$shared/ipc/bindings", async () => {
   const { entry, models } = await import("$shared/testing/work-models");
   const known: Record<string, (...args: never[]) => Promise<unknown>> = {

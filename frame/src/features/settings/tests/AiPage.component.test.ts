@@ -24,30 +24,6 @@ const native = vi.hoisted(() => ({
     fault: null,
   })),
 }));
-const go = vi.hoisted(() => ({ read: vi.fn() }));
-vi.mock("$shared/ipc/go-bindings", async () => {
-  const { goView, mockGoBindings } = await import("$shared/testing/opencode-go");
-  return mockGoBindings({
-    goStatus: async (profile) => {
-      go.read(profile);
-      return goView(profile);
-    },
-  });
-});
-const gateway = vi.hoisted(() => ({ read: vi.fn() }));
-vi.mock("$shared/ipc/gateway-bindings", async () => {
-  const { gatewayView, mockGatewayBindings } = await import("$shared/testing/gateway");
-  return mockGatewayBindings({
-    gatewayStatus: async (profile) => {
-      gateway.read(profile);
-      return gatewayView(profile);
-    },
-  });
-});
-vi.mock("$shared/ipc/chatgpt-bindings", async () => {
-  const { chatgptView, mockChatGptBindings } = await import("$shared/testing/chatgpt");
-  return mockChatGptBindings({ chatgptAccount: async (profile) => chatgptView(profile) });
-});
 vi.mock("$shared/ipc/bindings", async () => {
   const { mockBindings } = await import("$shared/testing/bindings");
   return mockBindings({
@@ -275,109 +251,64 @@ test("a disconnected ChatGPT choice stays visible instead of silently resetting"
   await expect
     .element(
       screen.getByText(
-        "This saved direct connection is retired. Select Codex for sidebar chat or choose another configured source. Your saved account and history are unchanged.",
+        "This saved connection is retired. Select Codex for sidebar chat or choose another configured source. Your saved account and history are unchanged.",
       ),
     )
     .toBeVisible();
 });
 
-test("secondary account guidance loads on demand and remains keyboard-dismissible", async () => {
+test("only Codex subscription setup remains beside every original API-key provider", async () => {
   native.read.mockResolvedValue(models({}));
+  native.choose.mockClear();
   const screen = await render(AiPage);
-  const summary = screen.getByText("Claude, Antigravity, and OpenCode options", { exact: true });
-  await expect
-    .element(screen.getByRole("heading", { name: "Other subscription tools" }))
-    .not.toBeInTheDocument();
-  summary.element().focus();
-  await userEvent.keyboard("{Enter}");
-  await expect
-    .element(screen.getByRole("heading", { name: "Other subscription tools" }))
-    .toBeVisible();
-  await userEvent.keyboard("{Enter}");
-  await expect
-    .element(screen.getByRole("heading", { name: "Other subscription tools" }))
-    .not.toBeInTheDocument();
-  await userEvent.keyboard("{Enter}");
-  await expect.element(screen.getByRole("heading", { name: "Google Antigravity" })).toBeVisible();
+  await expect.element(screen.getByText("Codex", { exact: true })).toBeVisible();
+  expect(screen.getByText("Codex", { exact: true }).elements()).toHaveLength(1);
+  for (const name of [
+    "Anthropic",
+    "OpenAI",
+    "Google",
+    "xAI",
+    "Mistral",
+    "DeepSeek",
+    "Groq",
+    "Cerebras",
+    "OpenRouter",
+  ]) {
+    await expect.element(screen.getByText(name, { exact: true })).toBeVisible();
+  }
+  await expect.element(screen.getByText("Custom server", { exact: true })).toBeVisible();
+  for (const name of [
+    "Other subscription tools",
+    "Claude, Antigravity, and OpenCode options",
+    "Google Antigravity",
+    "Local gateway",
+    "OpenCode Go",
+    "Legacy ChatGPT account recovery",
+  ]) {
+    expect(screen.getByText(name, { exact: true }).query()).toBeNull();
+  }
+  expect(native.choose).not.toHaveBeenCalled();
 });
 
-test("gateway Settings loads on explicit disclosure and can close and reopen by keyboard", async () => {
-  native.read.mockResolvedValue(models({}));
-  gateway.read.mockClear();
-  const screen = await render(AiPage);
-  const summary = screen.getByText("Local gateway", { exact: true });
-  expect(gateway.read).not.toHaveBeenCalled();
-  summary.element().focus();
-  await userEvent.keyboard("{Enter}");
-  await expect.element(screen.getByRole("button", { name: "Set up local gateway" })).toBeVisible();
-  expect(gateway.read).toHaveBeenCalledExactlyOnceWith(PROFILE);
-  await userEvent.keyboard("{Enter}");
-  await expect
-    .element(screen.getByRole("button", { name: "Set up local gateway" }))
-    .not.toBeInTheDocument();
-  await userEvent.keyboard("{Enter}");
-  await expect.element(screen.getByRole("button", { name: "Set up local gateway" })).toBeVisible();
-  expect(gateway.read).toHaveBeenCalledTimes(2);
-});
-
-test("native gateway models are selectable without a custom endpoint and source stays outside the model name", async () => {
-  const view = models({});
-  view.entries.push(
-    entry("compatible", "example", "Example model", false, ["lead"], {
-      id: `gateway/${"a".repeat(32)}/example`,
-      price: null,
-      supports: {
-        tools: true,
-        vision: false,
-        native_search: false,
-        reasoning: false,
-        prompt_cache: false,
-      },
-    }),
-  );
-  native.read.mockResolvedValue(view);
-  const screen = await render(AiPage);
-  await screen.getByRole("button", { name: "Work", exact: true }).click();
-  await expect
-    .element(page.getByRole("option", { name: "Example model", exact: true }))
-    .toHaveAccessibleDescription("Local gateway");
-});
-
-test("OpenCode Go is a lazy independent section, not another generic API-key row", async () => {
-  native.read.mockResolvedValue(models({}));
-  go.read.mockClear();
-  const screen = await render(AiPage);
-  expect(go.read).not.toHaveBeenCalled();
-  const summary = screen.getByText("OpenCode Go", { exact: true });
-  summary.element().focus();
-  await userEvent.keyboard("{Enter}");
-  await expect.element(screen.getByRole("button", { name: "Set up OpenCode Go" })).toBeVisible();
-  expect(go.read).toHaveBeenCalledExactlyOnceWith(PROFILE);
-  await userEvent.keyboard("{Enter}");
-  await expect
-    .element(screen.getByRole("button", { name: "Set up OpenCode Go" }))
-    .not.toBeInTheDocument();
-});
-
-test("Go role choices use native catalog entries and keep provider/source outside the name", async () => {
-  const view = models({});
-  view.entries.push(
-    entry("open_code_go", "example", "Example", false, ["lead"], {
-      id: `opencode-go/${"a".repeat(32)}/example`,
-      price: null,
-      supports: {
-        tools: true,
-        vision: false,
-        native_search: false,
-        reasoning: false,
-        prompt_cache: false,
-      },
-    }),
-  );
-  native.read.mockResolvedValue(view);
-  const screen = await render(AiPage);
-  await screen.getByRole("button", { name: "Work", exact: true }).click();
-  await expect
-    .element(page.getByRole("option", { name: "Example", exact: true }))
-    .toHaveAccessibleDescription("OpenCode Go");
+test("retired source choices stay disabled without rewriting saved preferences", async () => {
+  for (const prefix of ["chatgpt", "gateway", "opencode-go"]) {
+    native.read.mockResolvedValue(
+      models({
+        keys: { open_ai: "valid" },
+        chosen: `${prefix}/saved/model`,
+        lead: "openai/gpt-6-sol",
+      }),
+    );
+    native.choose.mockClear();
+    const screen = await render(AiPage);
+    await expect
+      .element(
+        screen.getByText(
+          "This saved connection is retired. Select Codex for sidebar chat or choose another configured source. Your saved account and history are unchanged.",
+        ),
+      )
+      .toBeVisible();
+    expect(native.choose).not.toHaveBeenCalled();
+    screen.unmount();
+  }
 });

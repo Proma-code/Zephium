@@ -18,7 +18,6 @@ export default {
     ...migrationIssues,
     // Native-generated DTOs are transitively referenced protocol types; Rust
     // regeneration checks their complete shape. Keep value/export checks.
-    "src/shared/ipc/chatgpt-bindings.ts": ["types"],
     "src/shared/ipc/codex-bindings.ts": ["types"],
   },
   project: ["src/**/*.{ts,svelte,css}", "*.{js,ts}", "scripts/**/*.mjs"],

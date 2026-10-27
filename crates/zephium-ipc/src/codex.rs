@@ -70,6 +70,8 @@ pub struct CodexViewV1 {
     pub state: CodexStateV1,
     pub runtime: CodexRuntimeV1,
     pub models: Vec<CodexModelV1>,
+    /// Opaque observation generation; fences preference edits, never grants execution.
+    pub catalog_generation: Option<String>,
     pub selection: Option<CodexSelectionV1>,
     /// Persisted backend intent, independent from current runtime/account availability.
     pub page_selected: bool,
@@ -88,6 +90,7 @@ impl CodexViewV1 {
             state: CodexStateV1::Unavailable,
             runtime: CodexRuntimeV1::Unavailable,
             models: Vec::new(),
+            catalog_generation: None,
             selection: None,
             page_selected: false,
             login_attempt: None,
@@ -168,8 +171,8 @@ mod tests {
                     "expectedProfile, attempt",
                 ),
                 CodexCommand::SelectModel => (
-                    "expectedProfile: string, selection: CodexSelectionV1 | null",
-                    "expectedProfile, selection",
+                    "expectedProfile: string, selection: CodexSelectionV1 | null, expectedCatalogGeneration: string | null",
+                    "expectedProfile, selection, expectedCatalogGeneration",
                 ),
                 _ => ("expectedProfile: string", "expectedProfile"),
             };
@@ -204,12 +207,10 @@ mod tests {
         assert_ne!(default, none);
         assert!(serde_json::from_str::<CodexEffortSelectionV1>("null").is_err());
         assert!(serde_json::from_str::<CodexEffortSelectionV1>("\"none\"").is_err());
-        assert!(
-            serde_json::from_value::<CodexEffortSelectionV1>(
-                serde_json::json!({"kind":"explicit","effort":"ultra"})
-            )
-            .is_err()
-        );
+        assert!(serde_json::from_value::<CodexEffortSelectionV1>(
+            serde_json::json!({"kind":"explicit","effort":"ultra"})
+        )
+        .is_err());
     }
     #[test]
     fn dormant_runtime_is_not_signed_out_or_fresh_tool_authority() {

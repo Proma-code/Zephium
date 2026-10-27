@@ -83,12 +83,16 @@ pub(crate) async fn drained() -> bool {
         true
     }
 }
+struct SelectionIntent {
+    selection: Option<CodexSelectionV1>,
+    catalog_generation: Option<String>,
+}
 async fn dispatch(
     caller: WebviewWindow,
     expected: String,
     command: CodexCommand,
     attempt: Option<String>,
-    selection: Option<Option<CodexSelectionV1>>,
+    selection: Option<SelectionIntent>,
 ) -> CodexViewV1 {
     #[cfg(all(
         windows,
@@ -194,13 +198,17 @@ pub(crate) async fn codex_select_model(
     caller: WebviewWindow,
     expected_profile: String,
     selection: Option<CodexSelectionV1>,
+    expected_catalog_generation: Option<String>,
 ) -> CodexViewV1 {
     dispatch(
         caller,
         expected_profile,
         CodexCommand::SelectModel,
         None,
-        Some(selection),
+        Some(SelectionIntent {
+            selection,
+            catalog_generation: expected_catalog_generation,
+        }),
     )
     .await
 }

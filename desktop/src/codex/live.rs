@@ -9,6 +9,8 @@ mod browser_reservation;
 mod browser_worker;
 #[path = "dormant.rs"]
 mod dormant;
+#[path = "preference.rs"]
+mod preference;
 #[path = "removal.rs"]
 mod removal;
 use super::*;
@@ -34,6 +36,7 @@ use zephium_core::{ids::ProfileId, page_choice, ports::store::Store as _};
 use zephium_ipc::page_assist::{PageAssistModelSourceV1, PageAssistNativeFaultV1};
 use zephium_work_composition::page_assist::port::*;
 
+static CATALOG_GENERATION: AtomicU64 = AtomicU64::new(1);
 static STOPPED: AtomicBool = AtomicBool::new(false);
 static REGISTRY: OnceLock<Arc<Registry>> = OnceLock::new();
 struct Registry {
@@ -91,6 +94,8 @@ struct SelectionCall {
     expected: page_choice::Snapshot,
     selection: page_choice::Selection,
     deadline: Instant,
+    account_revision: u64,
+    catalog_generation: Option<String>,
     result: tokio::sync::oneshot::Sender<Result<page_choice::Reply, CodexFaultV1>>,
 }
 struct ReplyCall {
@@ -219,6 +224,7 @@ impl Registry {
             view.state = CodexStateV1::Preparing;
         }
         view.runtime = CodexRuntimeV1::Preparing;
+        view.catalog_generation = None;
         view.text_only = true;
         view.quota = Default::default();
         view.error = None;
@@ -422,6 +428,9 @@ impl Service {
                 view.quota = Default::default();
             }
             view.text_only = true;
+            if self.stop.load(Ordering::Acquire) || view.runtime != CodexRuntimeV1::Dormant {
+                view.catalog_generation = None;
+            }
             if view.runtime != CodexRuntimeV1::Dormant {
                 view.runtime = CodexRuntimeV1::Unavailable;
             }
@@ -466,6 +475,7 @@ fn set_fault(service: &Service, fault: CodexFaultV1) {
             CodexStateV1::Unavailable
         };
         view.models.clear();
+        view.catalog_generation = None;
         view.text_only = true;
         view.login_attempt = None;
         view.quota = Default::default();
@@ -621,7 +631,17 @@ pub(super) fn page_requested(profile: ProfileId) -> bool {
     !read_selection(profile).is_ok_and(|value| value.backend == page_choice::Backend::Model)
 }
 fn catalog(service: &Service, catalog: &Catalog) {
+    publish_catalog_metadata(service, catalog);
+    refresh_selection(service);
+}
+fn publish_catalog_metadata(service: &Service, catalog: &Catalog) {
     if let Ok(mut view) = service.view.lock() {
+        view.catalog_generation = CATALOG_GENERATION
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .ok()
+            .map(|value| value.to_string());
         view.models = catalog
             .models()
             .iter()
@@ -637,7 +657,6 @@ fn catalog(service: &Service, catalog: &Catalog) {
             })
             .collect();
     }
-    refresh_selection(service);
 }
 
 fn state(service: &Service, value: AccountState) {
@@ -665,6 +684,7 @@ fn state(service: &Service, value: AccountState) {
             view.login_attempt = None;
         }
         if value != AccountState::ChatGpt {
+            view.catalog_generation = None;
             view.models.clear();
             view.quota = Default::default();
             if value == AccountState::SignedOut {
@@ -911,6 +931,9 @@ fn worker(
                         result
                     }
                     Command::Select(call) => {
+                        // Serialize the durable preference with profile retirement,
+                        // removal and owner replacement, not just its initial check.
+                        let owners = registry.services.lock();
                         let valid = match &call.selection {
                             page_choice::Selection::Model(_) => true, // prepared by native app catalog
                             page_choice::Selection::Codex(choice) => {
@@ -921,8 +944,12 @@ fn worker(
                                 })
                             }
                         };
-                        let response = if Instant::now() >= call.deadline {
+                        let response = if owners.is_err() || !registry.current(service) {
+                            Err(CodexFaultV1::ScopeChanged)
+                        } else if Instant::now() >= call.deadline {
                             Err(CodexFaultV1::OutcomeUnknown)
+                        } else if !preference::active_current(service, &call) {
+                            Err(CodexFaultV1::ScopeChanged)
                         } else if !valid
                             || !call.expected.valid()
                             || call.expected.profile != service.profile
@@ -937,27 +964,12 @@ fn worker(
                                     selection: call.selection,
                                 },
                             );
-                            match &receipt {
-                                page_choice::Reply::Committed(value)
-                                    if Some(value) == wanted.as_ref() =>
-                                {
-                                    if observe_selection(service, value, None) {
-                                        Ok(receipt)
-                                    } else {
-                                        Err(CodexFaultV1::OutcomeUnknown)
-                                    }
-                                }
-                                page_choice::Reply::Conflict(value)
-                                    if value.profile == service.profile && value.valid() =>
-                                {
-                                    let _ = observe_selection(service, value, None);
-                                    Ok(receipt)
-                                }
-                                _ => {
-                                    selection_uncertain(service);
-                                    Err(CodexFaultV1::OutcomeUnknown)
-                                }
-                            }
+                            preference::confirm(
+                                service,
+                                wanted.as_ref(),
+                                receipt,
+                                Some(call.account_revision),
+                            )
                         } else {
                             Err(CodexFaultV1::ProfileStorage)
                         };
@@ -1120,6 +1132,13 @@ fn worker(
                     }
                 }
                 Event::Account(account) => {
+                    // Broker identity invalidation may report ChatGpt again.
+                    // Identical display rows must not preserve the old fence.
+                    if connection.catalog().is_none() {
+                        if let Ok(mut view) = service.view.lock() {
+                            view.catalog_generation = None;
+                        }
+                    }
                     state(service, account);
                     if account != AccountState::ChatGpt {
                         models_requested = false;
@@ -1656,13 +1675,13 @@ pub(super) async fn commit_page_selection(
     expected: page_choice::Snapshot,
     selection: page_choice::Selection,
 ) -> Result<page_choice::Reply, CodexFaultV1> {
-    commit_page_selection_held(profile, expected, selection, None).await
+    commit_selection(profile, expected, selection, None).await
 }
-async fn commit_page_selection_held(
+async fn commit_selection(
     profile: ProfileId,
     expected: page_choice::Snapshot,
     selection: page_choice::Selection,
-    demand: Option<dormant::Demand>,
+    catalog_generation: Option<String>,
 ) -> Result<page_choice::Reply, CodexFaultV1> {
     if expected.profile != profile || !expected.valid() || !selection.valid() {
         return Err(CodexFaultV1::Invalid);
@@ -1675,7 +1694,11 @@ async fn commit_page_selection_held(
         &registry.services,
         profile,
         epoch,
-        || registry.scope(&profile.to_string()),
+        || {
+            (registry.removals.admission_open() && !registry.removals.contains(profile))
+                .then(|| registry.scope(&profile.to_string()))
+                .flatten()
+        },
         |owner| {
             if owner.fully_settled() {
                 admission::OwnerState::Settled
@@ -1685,18 +1708,14 @@ async fn commit_page_selection_held(
                 admission::OwnerState::Active { epoch: owner.epoch }
             }
         },
-        || {
-            if matches!(selection, page_choice::Selection::Codex(_)) {
-                return Err(CodexFaultV1::Unavailable);
-            }
-            let store = APP_STORE.get().ok_or(CodexFaultV1::ProfileStorage)?;
-            Ok(store.page_choice_call(
-                profile,
-                page_choice::Call::CompareAndSwap {
-                    expected: Box::new(expected.clone()),
-                    selection: selection.clone(),
-                },
-            ))
+        |owner| {
+            preference::commit_settled(
+                owner,
+                epoch,
+                &expected,
+                &selection,
+                catalog_generation.as_deref(),
+            )
         },
     )
     .map_err(|error| match error {
@@ -1708,14 +1727,7 @@ async fn commit_page_selection_held(
             if !registry.current(&owner) {
                 return Err(CodexFaultV1::ScopeChanged);
             }
-            let deadline =
-                demand
-                    .as_ref()
-                    .map_or(Instant::now() + Duration::from_secs(8), |demand| {
-                        demand
-                            .deadline()
-                            .min(Instant::now() + Duration::from_secs(8))
-                    });
+            let deadline = Instant::now() + Duration::from_secs(8);
             if Instant::now() >= deadline {
                 return Err(CodexFaultV1::Timeout);
             }
@@ -1725,17 +1737,16 @@ async fn commit_page_selection_held(
                 let command = Command::Select(Box::new(SelectionCall {
                     expected,
                     selection,
+                    catalog_generation,
                     deadline,
+                    account_revision: owner
+                        .account_revision
+                        .load(Ordering::Acquire)
+                        .checked_add(1)
+                        .ok_or(CodexFaultV1::ScopeChanged)?,
                     result,
                 }));
-                if let Some(demand) = demand {
-                    if !Arc::ptr_eq(&owner, &demand.service()) {
-                        return Err(CodexFaultV1::ScopeChanged);
-                    }
-                    demand.command(command)?;
-                } else {
-                    owner.enqueue(command)?;
-                }
+                owner.enqueue(command)?;
                 // Only after actual local queue admission. A Busy rejection cannot
                 // retire a still-running choice or pretend a new one was stored.
                 if !owner.advance_revision() {
@@ -1757,8 +1768,11 @@ async fn commit_page_selection_held(
     Ok(receipt)
 }
 
-fn passive_command(command: CodexCommand) -> bool {
-    matches!(command, CodexCommand::Account | CodexCommand::CancelLogin)
+fn requires_runtime(command: CodexCommand) -> bool {
+    !matches!(
+        command,
+        CodexCommand::Account | CodexCommand::CancelLogin | CodexCommand::SelectModel
+    )
 }
 /// Read-only lookup: no factory, receipt consumption, or queue admission.
 fn observed_owner(
@@ -1778,7 +1792,7 @@ pub(super) async fn dispatch(
     expected: String,
     command: CodexCommand,
     attempt: Option<String>,
-    selection: Option<Option<CodexSelectionV1>>,
+    selection: Option<SelectionIntent>,
 ) -> CodexViewV1 {
     let Some(registry) = REGISTRY.get() else {
         return CodexViewV1::unavailable(expected);
@@ -1793,7 +1807,9 @@ pub(super) async fn dispatch(
         return CodexViewV1::unavailable(expected);
     }
     let mut wake_demand = None;
-    let candidate = if passive_command(command) {
+    // Preference editing observes an owner but is NOT passive: its separate
+    // transaction below still enforces queue occupancy, scope and exact CAS.
+    let candidate = if !requires_runtime(command) {
         registry.observed_service(profile, epoch)
     } else {
         match dormant::prepare(
@@ -1841,12 +1857,12 @@ pub(super) async fn dispatch(
                 return view;
             }
         };
-        let desired = match selection {
+        let desired = match selection.selection {
             Some(choice) => page_choice::Selection::Codex(core_choice(choice)),
             None => page_choice::Selection::Model(prior.model.clone()),
         };
         let wanted = prior.updated(desired.clone());
-        let receipt = commit_page_selection_held(profile, prior, desired, wake_demand.take()).await;
+        let receipt = commit_selection(profile, prior, desired, selection.catalog_generation).await;
         if registry.scope(&profile.to_string()) != Some(epoch) {
             return CodexViewV1::unavailable(expected);
         }
@@ -2390,7 +2406,7 @@ mod tests {
         );
     }
 
-    fn owned_service() -> (Service, admission::Receiver<Command>) {
+    pub(super) fn owned_service() -> (Service, admission::Receiver<Command>) {
         let profile = ProfileId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
         let (queue, receiver) = admission::channel(1);
         let mut view = CodexViewV1::unavailable(profile.to_string());
@@ -2458,8 +2474,12 @@ mod tests {
     fn passive_account_and_cancel_without_owner_do_not_create_a_service() {
         let profile = ProfileId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
         let owners = Mutex::new(HashMap::new());
-        for command in [CodexCommand::Account, CodexCommand::CancelLogin] {
-            assert!(passive_command(command));
+        for command in [
+            CodexCommand::Account,
+            CodexCommand::CancelLogin,
+            CodexCommand::SelectModel,
+        ] {
+            assert!(!requires_runtime(command));
             assert!(matches!(
                 observed_owner(&owners, profile),
                 Err(CodexFaultV1::Unavailable)
@@ -2467,7 +2487,7 @@ mod tests {
             assert!(owners.lock().unwrap().is_empty());
         }
         for command in [CodexCommand::CheckConnection, CodexCommand::RefreshQuota] {
-            assert!(!passive_command(command));
+            assert!(requires_runtime(command));
         }
     }
 
@@ -2511,7 +2531,7 @@ mod tests {
                     admission::OwnerState::Retiring
                 }
             },
-            || -> () { panic!("quarantined owner is not an absent-owner commit path") },
+            |_| -> () { panic!("quarantined owner is not an absent-owner commit path") },
         );
         assert!(matches!(route, Err(admission::Error::Busy)));
     }

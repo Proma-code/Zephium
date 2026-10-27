@@ -7,8 +7,6 @@ export {
   modelEffort,
   entryOf,
   keyState,
-  hasGatewayModels,
-  hasGoModels,
   type KeyedProvider,
   connectionName,
   keyedProviders,

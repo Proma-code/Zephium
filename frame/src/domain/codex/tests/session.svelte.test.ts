@@ -11,6 +11,8 @@ const native = vi.hoisted(() => ({
   models: vi.fn(),
   quota: vi.fn(),
   select: vi.fn(),
+  listen: vi.fn(),
+  stop: vi.fn(),
 }));
 vi.mock("$shared/ipc/codex-bindings", () => ({
   commands: {
@@ -25,7 +27,7 @@ vi.mock("$shared/ipc/codex-bindings", () => ({
   },
 }));
 vi.mock("$shared/ipc/native-events", () => ({
-  events: { workModelsChanged: { listen: async () => () => {} } },
+  events: { workModelsChanged: { listen: native.listen } },
 }));
 const profile = "native-profile";
 const model = {
@@ -45,6 +47,7 @@ function owner() {
 beforeEach(() => {
   vi.useFakeTimers();
   Object.values(native).forEach((mock) => mock.mockReset());
+  native.listen.mockResolvedValue(native.stop);
   native.read.mockResolvedValue(codexView(profile));
   native.check.mockResolvedValue(codexView(profile));
   native.connect.mockImplementation(async (_: string, attempt: string) =>
@@ -116,10 +119,14 @@ test("catalog never auto-selects, and only exact supported native efforts are ad
   expect(await s.select({ model: model.id, effort: { kind: "explicit", effort: "minimal" } })).toBe(
     true,
   );
-  expect(native.select).toHaveBeenCalledExactlyOnceWith(profile, {
-    model: model.id,
-    effort: { kind: "explicit", effort: "minimal" },
-  });
+  expect(native.select).toHaveBeenCalledExactlyOnceWith(
+    profile,
+    {
+      model: model.id,
+      effort: { kind: "explicit", effort: "minimal" },
+    },
+    "test-catalog-generation",
+  );
   expect(await s.select(null)).toBe(true);
   expect(s.view?.page_selected).toBe(false);
 });
@@ -171,7 +178,9 @@ test("mutation observation timeout is not a fabricated success or a resend", asy
   const choice = s.select({ model: model.id, effort: { kind: "explicit", effort: "high" } });
   await vi.advanceTimersByTimeAsync(20001);
   expect(await choice).toBe(false);
-  expect(s.observationFailed).toBe(true);
+  // Passive readback can succeed without confirming or replaying the timed-out write.
+  expect(native.read).toHaveBeenCalledTimes(2);
+  expect(s.observationFailed).toBe(false);
   expect(native.select).toHaveBeenCalledTimes(1);
   expect(s.view?.page_selected).toBe(false);
 });
@@ -207,10 +216,14 @@ test("default-only catalog stays usable and default readback is not explicit non
     page_selected: true,
   }));
   expect(await s.select({ model: "default-only", effort: { kind: "default" } })).toBe(true);
-  expect(native.select).toHaveBeenCalledExactlyOnceWith(profile, {
-    model: "default-only",
-    effort: { kind: "default" },
-  });
+  expect(native.select).toHaveBeenCalledExactlyOnceWith(
+    profile,
+    {
+      model: "default-only",
+      effort: { kind: "default" },
+    },
+    "test-catalog-generation",
+  );
   native.select.mockResolvedValue({
     ...catalog,
     page_selected: true,
@@ -333,4 +346,94 @@ test("wake timeout reconciliation cannot replace a newer action or disposed prof
   await vi.advanceTimersByTimeAsync(10000);
   expect(s.view).toBeNull();
   expect(native.read).toHaveBeenCalledTimes(2);
+});
+
+test("concurrent starts wait for one subscription before observing", async () => {
+  let subscribed!: (stop: () => void) => void;
+  native.listen.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        subscribed = resolve;
+      }),
+  );
+  const s = owner();
+  const first = s.start();
+  const second = s.start();
+  expect(native.listen).toHaveBeenCalledTimes(1);
+  expect(native.read).not.toHaveBeenCalled();
+  subscribed(native.stop);
+  await Promise.all([first, second]);
+  expect(native.read).toHaveBeenCalledTimes(1);
+  s.dispose();
+  expect(native.stop).toHaveBeenCalledTimes(1);
+});
+
+test("subscription failure can be retried and disposal closes a late subscription", async () => {
+  native.listen.mockRejectedValueOnce(new Error("not observing"));
+  const s = owner();
+  await expect(s.start()).rejects.toThrow("not observing");
+  await s.start();
+  expect(native.listen).toHaveBeenCalledTimes(2);
+  expect(native.read).toHaveBeenCalledTimes(1);
+  s.dispose();
+  let subscribed!: (stop: () => void) => void;
+  native.listen.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        subscribed = resolve;
+      }),
+  );
+  const late = s.start();
+  s.dispose();
+  subscribed(native.stop);
+  await late;
+  expect(native.stop).toHaveBeenCalledTimes(2);
+  expect(native.read).toHaveBeenCalledTimes(1);
+});
+
+test("a selection waiting for invalidation readback cannot complete after profile disposal", async () => {
+  native.read.mockResolvedValue(connected());
+  const s = owner();
+  await s.start();
+  let finishSelection!: (value: CodexViewV1) => void;
+  native.select.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        finishSelection = resolve;
+      }),
+  );
+  const selection = { model: model.id, effort: { kind: "explicit", effort: "high" } } as const;
+  const selected = s.select(selection);
+  await vi.advanceTimersByTimeAsync(0);
+  native.read.mockImplementation(() => new Promise(() => {}));
+  native.listen.mock.calls[0]![0]();
+  finishSelection({ ...connected(), selection, page_selected: true });
+  await vi.advanceTimersByTimeAsync(0);
+  expect(native.read).toHaveBeenCalledTimes(2);
+  s.dispose();
+  expect(await selected).toBe(false);
+  expect(s.view).toBeNull();
+});
+
+test("failed invalidation reconciliation does not confirm a selection for a queued gesture", async () => {
+  native.read.mockResolvedValue(connected());
+  const s = owner();
+  await s.start();
+  let finishSelection!: (value: CodexViewV1) => void;
+  native.select.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        finishSelection = resolve;
+      }),
+  );
+  const selection = { model: model.id, effort: { kind: "explicit", effort: "high" } } as const;
+  const selected = s.select(selection);
+  await vi.advanceTimersByTimeAsync(0);
+  native.read.mockImplementation(() => new Promise(() => {}));
+  native.listen.mock.calls[0]![0]();
+  finishSelection({ ...connected(), selection, page_selected: true });
+  await vi.advanceTimersByTimeAsync(5000);
+  expect(await selected).toBe(false);
+  expect(s.observationFailed).toBe(true);
+  expect(native.select).toHaveBeenCalledTimes(1);
 });

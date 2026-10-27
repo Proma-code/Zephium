@@ -80,6 +80,16 @@ fn boot(
         return Err("dormant-lease-record");
     }
     let (session, runtime) = windows::fixtures::dormant_session(scenario, lease, package)?;
+    boot_session(profile, (session, runtime), store, canonical, epoch, wake)
+}
+fn boot_session(
+    profile: ProfileId,
+    (session, runtime): (Session, Arc<RuntimePaths>),
+    store: MemoryAssociations,
+    canonical: durable::Scope,
+    epoch: u64,
+    wake: Option<&crate::profile::Record>,
+) -> Result<Connection, &'static str> {
     let capability = crate::browser_capability::BrowserCapability::fixture(&session)
         .map_err(|_| "dormant-fixture-capability")?;
     let scope = Scope::new(
@@ -714,4 +724,38 @@ fn drive_signed_out(owner: &mut Connection, deadline: Instant) -> Result<(), &'s
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// Desktop integration uses a fixed synthetic peer and receives only the real
+/// healthy-close receipt. No credential grant or arbitrary receipt constructor.
+pub(crate) fn preference_receipt(
+    helper: &Path,
+) -> Result<(tempfile::TempDir, DormantReceipt, Catalog), &'static str> {
+    let root = tempfile::Builder::new()
+        .prefix("Zephium.PreferenceFixture.")
+        .tempdir()
+        .map_err(|_| "preference-root")?;
+    let profile = ProfileId::from_native([83; 16]).ok_or("preference-profile")?;
+    let lease =
+        ProfileLease::fixture_protected(root.path(), profile).map_err(|_| "preference-lease")?;
+    let mut store = MemoryAssociations::default();
+    let canonical = match store.call(durable::Call::Open {
+        incarnation: lease.record.incarnation,
+    }) {
+        durable::Reply::Scope(scope) => scope,
+        _ => return Err("preference-store"),
+    };
+    let package = root.path().join("package");
+    let native = windows::fixtures::dormant_session_from(Scenario::First, lease, &package, helper)?;
+    let mut owner = boot_session(profile, native, store, canonical, 1, None)?;
+    drive(&mut owner, Scenario::First)?;
+    let catalog = owner.catalog().cloned().ok_or("preference-catalog")?;
+    let scope = owner.scope().clone();
+    let receipt = owner
+        .try_dormant(&scope, Instant::now() + Duration::from_secs(10))
+        .map_err(|_| "preference-healthy-close")?;
+    // The exact image/package pins must already be gone before UI editing.
+    std::fs::rename(package, root.path().join("retired-package"))
+        .map_err(|_| "preference-package-still-held")?;
+    Ok((root, receipt, catalog))
 }

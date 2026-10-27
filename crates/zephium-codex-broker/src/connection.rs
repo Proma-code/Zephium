@@ -270,6 +270,8 @@ impl CompatibleImage {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<Self, Fault> {
+        #[cfg(all(debug_assertions, feature = "native-fixtures"))]
+        crate::fixture_activity::IMAGE.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         check(deadline, cancel)?;
         if image.kind() != crate::pin::ImageKind::Cli {
             return Err(Fault::Policy);

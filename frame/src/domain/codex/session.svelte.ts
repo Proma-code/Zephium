@@ -31,6 +31,7 @@ export class CodexSession {
   private pendingLogin = $state(false);
   private ownedAttempt: string | null = null;
   private active = false;
+  private startFlight: Promise<void> | null = null;
   private generation = 0;
   private sequence = 0;
   private readFlight: number | null = null;
@@ -47,10 +48,31 @@ export class CodexSession {
   }
 
   async start() {
-    if (this.active) return;
+    if (this.active) {
+      if (!this.startFlight) return false;
+      await this.startFlight;
+      return true;
+    }
     this.active = true;
     const generation = ++this.generation;
     this.lifetime = new AbortController();
+    const flight = this.begin(generation);
+    this.startFlight = flight;
+    try {
+      await flight;
+      return true;
+    } catch (error) {
+      if (generation === this.generation) {
+        this.active = false;
+        this.observationFailed = true;
+      }
+      throw error;
+    } finally {
+      if (this.startFlight === flight) this.startFlight = null;
+    }
+  }
+
+  private async begin(generation: number) {
     const stop = await events.workModelsChanged.listen(() => {
       if (!this.busy) this.sequence++;
       void this.read();
@@ -143,6 +165,11 @@ export class CodexSession {
     } else this.schedulePoll();
   }
 
+  /** Passive readback; never wakes or replays an admitted native command. */
+  reconcile() {
+    void this.read();
+  }
+
   /** Explicit recovery intent may recheck/restart the native owner; polling never does. */
   refresh() {
     if (this.signingIn) this.pollDeadline = Date.now() + POLL_WINDOW;
@@ -168,14 +195,24 @@ export class CodexSession {
     this.busy = null;
     const adopted = result.state === "received" && this.adopt(result.value);
     if (!adopted) this.observationFailed = true;
+    const succeeded =
+      adopted && (!this.view?.error || (action === "cancel" && this.view.error === "cancelled"));
     // A slow explicit wake may outlive this renderer's observation. Reconcile
     // once even if its Preparing event was missed; Account never wakes/replays.
-    if (this.readAgain || (observingWake && result.state === "timeout")) {
+    if (
+      this.readAgain ||
+      (action === "selection" &&
+        (!adopted || this.view?.error === "outcome_unknown" || this.view?.error === "timeout")) ||
+      (observingWake && result.state === "timeout")
+    ) {
       this.readAgain = false;
-      void this.read();
+      if (action === "selection" && succeeded) await this.read();
+      else void this.read();
     } else this.schedulePoll();
     return (
-      adopted && (!this.view?.error || (action === "cancel" && this.view.error === "cancelled"))
+      succeeded &&
+      generation === this.generation &&
+      (action !== "selection" || (!this.observationFailed && this.readFlight === null))
     );
   }
 
@@ -218,28 +255,41 @@ export class CodexSession {
   }
 
   /** Explicit selection only; never infer a wire model or an unsupported effort. */
-  async select(selection: CodexSelectionV1 | null) {
+  async select(
+    selection: CodexSelectionV1 | null,
+    expectedCatalogGeneration = this.view?.catalog_generation ?? null,
+  ) {
     if (!this.view || this.signingIn) return false;
     if (
       selection &&
-      (this.view.state !== "connected" ||
+      (!expectedCatalogGeneration ||
+        this.view.catalog_generation !== expectedCatalogGeneration ||
+        this.view.state !== "connected" ||
         !this.view.models.some(
           (model) => model.id === selection.model && supportsCodexEffort(model, selection.effort),
         ))
     )
       return false;
-    if (!(await this.act("selection", () => commands.codexSelectModel(this.profile, selection))))
+    if (
+      !(await this.act("selection", () =>
+        commands.codexSelectModel(this.profile, selection, expectedCatalogGeneration),
+      ))
+    )
       return false;
+    const view = this.view;
+    if (!view) return false;
     return selection
-      ? this.view.page_selected &&
-          this.view.selection?.model === selection.model &&
-          sameCodexEffort(this.view.selection.effort, selection.effort)
-      : !this.view.page_selected;
+      ? view.catalog_generation === expectedCatalogGeneration &&
+          view.page_selected &&
+          view.selection?.model === selection.model &&
+          sameCodexEffort(view.selection.effort, selection.effort)
+      : !view.page_selected;
   }
 
   dispose() {
     const cancelOwned = this.signingIn ? this.ownedAttempt : null;
     this.active = false;
+    this.startFlight = null;
     this.generation++;
     this.sequence++;
     this.clearTimer();

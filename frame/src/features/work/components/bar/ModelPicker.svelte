@@ -1,5 +1,6 @@
 <script lang="ts">
   import { Popover } from "bits-ui";
+  import { CodexPickerObservation } from "../../lib/codex-picker";
   import { codexEffort } from "$domain/codex";
   import type { PageAssistModelV1 } from "$shared/ipc/bindings";
   import type { CodexEffortV1 } from "$shared/ipc/codex-bindings";
@@ -16,8 +17,6 @@
     favourites,
     keyState,
     keyedProviders,
-    hasGatewayModels,
-    hasGoModels,
     connectionName,
     locked,
     modelName,
@@ -68,6 +67,12 @@
   const uid = $props.id();
 
   let session = $state.raw<ModelsSession | null>(null);
+  let codexObservation = $state.raw<CodexPickerObservation | null>(null);
+  $effect(() => {
+    const owner = new CodexPickerObservation(profile);
+    codexObservation = owner;
+    return () => owner.dispose();
+  });
   let codexConnected = $state(false);
   let codexRows = $state(0);
   let nativePanel = $state<{ collapse: () => boolean; navigate: (event: KeyboardEvent) => void }>();
@@ -115,23 +120,10 @@
   const models = $derived(session?.models ?? null);
   const current = $derived(entryOf(models, models?.effective[role]));
   const chosen = $derived(models?.effective[role] ?? null);
-  const savedAccountChoice = $derived(models?.chosen[role]?.startsWith("chatgpt/") ?? false);
-  const savedGoChoice = $derived(models?.chosen[role]?.startsWith("opencode-go/") ?? false);
-  const savedGatewayChoice = $derived(models?.chosen[role]?.startsWith("gateway/") ?? false);
-  const groups = $derived.by(() => {
-    const offered = pickerGroups(models, role, session?.endpoint ?? []);
-    // Retained direct-sign-in choices remain readable, never offered as a new
-    // subscription method or silently converted to the managed Codex account.
-    return {
-      ...offered,
-      ready: offered.ready
-        .map((group) => ({
-          ...group,
-          entries: group.entries.filter((entry) => !entry.id.startsWith("chatgpt/")),
-        }))
-        .filter((group) => group.entries.length > 0),
-    };
-  });
+  const retiredChoice = $derived(
+    /^(?:chatgpt|gateway|opencode-go)\//u.test(models?.chosen[role] ?? current?.id ?? ""),
+  );
+  const groups = $derived(pickerGroups(models, role, session?.endpoint ?? []));
   const tierOf = $derived(tiers(groups.ready));
 
   type Item = { id: string; entry: WorkModelEntry };
@@ -149,7 +141,7 @@
     const own: Seat[] = [];
     const ready: Seat[] = [];
     const rest: Seat[] = [];
-    for (const provider of ["cloud", ...keyedProviders, "open_code_go"] as const) {
+    for (const provider of ["cloud", ...keyedProviders] as const) {
       if (provider === "cloud") {
         if (usable(models, provider) || account?.signed_in)
           own.push({ provider, standing: "ready" });
@@ -157,9 +149,7 @@
           own.push({ provider, standing: "sign_in" });
       } else if (
         usable(models, provider) ||
-        (provider === "open_ai" && (nativeSelected || codexConnected)) ||
-        (provider === "compatible" && hasGatewayModels(models)) ||
-        (provider === "open_code_go" && hasGoModels(models))
+        (provider === "open_ai" && (nativeSelected || codexConnected))
       )
         ready.push({ provider, standing: "ready" });
       else
@@ -195,20 +185,8 @@
     if (picked === "favourites" && hasStars) return "favourites";
     return (
       seats.find((row) => row.provider === picked)?.provider ??
-      seats.find(
-        (row) =>
-          row.provider ===
-          (nativeSelected
-            ? "open_ai"
-            : (current?.model.provider ??
-              (savedAccountChoice
-                ? "open_ai"
-                : savedGatewayChoice
-                  ? "compatible"
-                  : savedGoChoice
-                    ? "open_code_go"
-                    : null))),
-      )?.provider ??
+      seats.find((row) => row.provider === (nativeSelected ? "open_ai" : current?.model.provider))
+        ?.provider ??
       seats[0]?.provider ??
       null
     );
@@ -219,19 +197,6 @@
   const source = $derived(sourcePick ?? (nativeSelected ? "codex" : "api"));
 
   const nativePane = $derived(role === "page" && shown === "open_ai" && source === "codex");
-
-  let gatewaySourcePick = $state<"endpoint" | "gateway" | null>(null);
-  const gatewaySource = $derived(
-    gatewaySourcePick ??
-      (current?.id.startsWith("gateway/") ||
-      savedGatewayChoice ||
-      (!usable(models, "compatible") && hasGatewayModels(models))
-        ? "gateway"
-        : "endpoint"),
-  );
-  const shownSource = $derived(
-    shown === "open_ai" ? source : shown === "compatible" ? gatewaySource : null,
-  );
 
   let searchOpen = $state(false);
   let query = $state("");
@@ -245,12 +210,7 @@
     return groups.ready
       .filter((group) => spanning || group.provider === shown)
       .flatMap((group) => {
-        const sources =
-          spanning && group.provider === "open_ai"
-            ? (["api"] as const)
-            : spanning && group.provider === "compatible"
-              ? (["endpoint", "gateway"] as const)
-              : [null];
+        const sources = spanning && group.provider === "open_ai" ? (["api"] as const) : [null];
         return sources.map((connection) => ({
           key: connection ? `${group.provider}-${connection}` : group.provider,
           label: connection
@@ -264,9 +224,7 @@
             .filter((entry) =>
               connection
                 ? modelConnection(entry) === connection
-                : spanning ||
-                  (group.provider !== "open_ai" && group.provider !== "compatible") ||
-                  modelConnection(entry) === shownSource,
+                : spanning || group.provider !== "open_ai" || modelConnection(entry) === source,
             )
             .map((entry) => ({ id: entry.id, entry })),
         }));
@@ -286,14 +244,14 @@
 
   /** The effort the person last set while the menu is open, ahead of Rust's answer. */
   let intent = $state<WorkModelReasoning | null>(null);
-  const levels = $derived(chosen?.startsWith("chatgpt/") ? [] : effortLevels(models, chosen));
+  const levels = $derived(retiredChoice ? [] : effortLevels(models, chosen));
   const resolvedEffort = $derived(modelEffort(models, chosen));
   const effort = $derived<WorkModelReasoning | null>(
     levels.length ? (intent ? nearestEffort(levels, intent) : resolvedEffort) : null,
   );
 
   const card = $derived.by<CardSubject | null>(() => {
-    if (!current || nativeSelected || source === "codex") return null;
+    if (!current || retiredChoice || nativeSelected || source === "codex") return null;
     return { entry: current, tier: tierOf[current.id] ?? null, levels, effort };
   });
 
@@ -386,7 +344,6 @@
     intent = null;
     picked = null;
     sourcePick = null;
-    gatewaySourcePick = null;
     clearTimeout(fold);
     effortOpen = false;
     changed = false;
@@ -630,14 +587,7 @@
         const item = focus ?? items[0];
         event.preventDefault();
         if (item) void choose(item.entry);
-        else if (
-          !searching &&
-          seat &&
-          seat.standing !== "ready" &&
-          shownSource !== "gateway" &&
-          shown !== "open_code_go"
-        )
-          step(seat);
+        else if (!searching && seat && seat.standing !== "ready") step(seat);
         return;
       }
     }
@@ -864,29 +814,29 @@
             onstir={stirred}
           />
         {/if}
-        {#if (shown === "open_ai" || shown === "compatible") && !spanning}
+        {#if retiredChoice}
+          <p class="note" role="status">{m.ai_retired_connection_choice()}</p>
+        {/if}
+        {#if shown === "open_ai" && !spanning}
           <div
             class="sources"
             role="group"
-            aria-label={shown === "open_ai"
-              ? m.model_connection_sources()
-              : m.model_compatible_connection_sources()}
+            aria-label={m.model_connection_sources()}
             aria-describedby={`${uid}-sources-note`}
           >
             <button
               type="button"
-              aria-pressed={shownSource === "api" || shownSource === "endpoint"}
+              aria-pressed={source === "api"}
               onclick={() => {
-                if (shown === "open_ai") sourcePick = "api";
-                else gatewaySourcePick = "endpoint";
+                sourcePick = "api";
                 active = null;
-              }}>{shown === "open_ai" ? m.model_source_api() : m.model_source_endpoint()}</button
+              }}>{m.model_source_api()}</button
             >
-            {#if role === "page" && shown === "open_ai"}
+            {#if role === "page"}
               <button
                 type="button"
                 aria-label={m.codex_source()}
-                aria-pressed={shownSource === "codex"}
+                aria-pressed={source === "codex"}
                 onclick={() => {
                   sourcePick = "codex";
                   active = null;
@@ -895,55 +845,15 @@
                 }}>{m.codex_source()}</button
               >
             {/if}
-            {#if shown === "compatible"}
-              <button
-                type="button"
-                aria-label={m.model_source_gateway()}
-                aria-pressed={shownSource === "gateway"}
-                onclick={() => {
-                  gatewaySourcePick = "gateway";
-                  active = null;
-                }}>{m.model_source_gateway()}</button
-              >
-            {/if}
           </div>
           <span class="sr-only" id={`${uid}-sources-note`}>{m.model_sources_note()}</span>
-          {#if shown === "open_ai" && (savedAccountChoice || current?.id.startsWith("chatgpt/"))}
-            <p class="note" role="status">{m.ai_chatgpt_choice_unavailable()}</p>
-          {/if}
-          {#if shown === "compatible" && savedGatewayChoice && !hasGatewayModels(models)}
-            <p class="note" role="status">{m.gateway_choice_unavailable()}</p>
-          {/if}
-          {#if shownSource === "gateway" && open}
-            {#await import("./ModelGateway.svelte")}
-              <p class="note" role="status">{m.gateway_loading()}</p>
-            {:then connection}
-              <connection.default
-                {profile}
-                hasModels={hasGatewayModels(models)}
-                onsettings={settings}
-              />
-            {:catch}
-              <p class="note failure" role="alert">{m.gateway_load_failed()}</p>
-            {/await}
-          {/if}
         {/if}
-        {#if shown === "open_code_go" && !spanning && open}
-          {#if savedGoChoice && !hasGoModels(models)}<p class="note" role="status">
-              {m.go_choice_unavailable()}
-            </p>{/if}
-          {#await import("./ModelGo.svelte")}
-            <p class="note" role="status">{m.go_loading()}</p>
-          {:then connection}
-            <connection.default {profile} hasModels={hasGoModels(models)} onsettings={settings} />
-          {:catch}<p class="note failure" role="alert">{m.go_load_failed()}</p>{/await}
-        {/if}
-        {#if nativePane && open}
+        {#if nativePane && open && codexObservation}
           {#await import("./ModelCodex.svelte")}<p class="note" role="status">
               {m.codex_loading()}
             </p>
           {:then pane}<pane.default
-              {profile}
+              observation={codexObservation}
               {query}
               favouritesOnly={nativeFavourites}
               listId={`${uid}-native-list`}
@@ -954,8 +864,6 @@
               oncount={(count) => (codexRows = count)}
             />
           {:catch}<p class="note failure" role="alert">{m.codex_load_failed()}</p>{/await}
-        {:else if !spanning && ((shownSource === "gateway" && !hasGatewayModels(models)) || (shown === "open_code_go" && !hasGoModels(models)))}
-          <!-- The native connection view above explains the missing catalog. -->
         {:else if shown === "open_ai" && !spanning && source === "api" && !usable(models, "open_ai")}
           <ModelAsk
             provider="open_ai"
@@ -963,7 +871,7 @@
             standing={keyState(models, "open_ai") === "invalid" ? "refused" : "key"}
             onact={settings}
           />
-        {:else if shown === "compatible" && !spanning && gatewaySource === "endpoint" && !usable(models, "compatible")}
+        {:else if shown === "compatible" && !spanning && !usable(models, "compatible")}
           <ModelAsk
             provider="compatible"
             name={nameOf("compatible")}
@@ -981,8 +889,6 @@
           <!-- svelte-ignore a11y_click_events_have_key_events -->
           <div
             class="list"
-            class:account-list={!spanning &&
-              (shownSource === "gateway" || shown === "open_code_go")}
             id="{uid}-list"
             role="listbox"
             aria-label={searching ? m.model_search() : title}
@@ -1409,10 +1315,6 @@
     outline: none;
     scrollbar-width: thin;
     mask-image: linear-gradient(to bottom, black calc(100% - 14px), transparent);
-  }
-
-  .list.account-list {
-    min-block-size: min(102px, 30%);
   }
 
   .plate {

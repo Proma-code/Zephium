@@ -4,9 +4,6 @@ name: Windows subscription trial
 on:
   push:
     branches: [windows/subscription-accounts]
-    paths-ignore:
-      - 'crates/zephium-claude-broker/**'
-      - '.github/workflows/windows-claude-broker.yml'
 
 permissions:
   contents: read
@@ -75,10 +72,6 @@ jobs:
           ./scripts/test-windows-trial-install-checks.ps1
           ./scripts/test-windows-trial-upgrade.ps1
           ./scripts/test-windows-trial-runtime.ps1
-          rustc --edition 2021 --test desktop/src/subscription_registry.rs -o "$env:RUNNER_TEMP/subscription-registry-tests.exe"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & "$env:RUNNER_TEMP/subscription-registry-tests.exe"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node --test scripts/windows-trial.test.mjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked --manifest-path desktop/windows-trial-config-tests/Cargo.toml
@@ -91,14 +84,11 @@ jobs:
           pnpm --dir frame run test:component
           src/features/assist/tests/FaultNote.component.test.ts
           src/features/assist/tests/AssistInteraction.component.test.ts
-          src/features/settings/tests/AiSubscriptions.component.test.ts
-          src/features/settings/tests/LegacyAccountRecovery.component.test.ts
           src/features/settings/tests/ProfilesPage.component.test.ts
           src/features/codex/tests/CodexQuota.component.test.ts
-          src/features/settings/tests/LocalGateway.component.test.ts
-          src/features/settings/tests/OpenCodeGo.component.test.ts
           src/features/settings/tests/AiPage.component.test.ts
           src/features/work/tests/ModelPicker.component.test.ts
+          src/features/work/tests/ModelCodexResponsiveness.component.test.ts
           src/shared/ui/Select/tests/Select.component.test.ts
       - name: Build frame and verify emitted style contract
         id: frame_build
@@ -116,18 +106,8 @@ jobs:
             frame/reports/bootstrap-chunks.json
           if-no-files-found: warn
           retention-days: 14
-      - name: Native account protocol and trial Credential Manager tests
-        run: cargo test -p zephium-chatgpt -p zephium-gateway -p zephium-opencode-go -p zephium-provider-accounts -p zephium-credentials --locked --features zephium-credentials/windows-subscription-trial,zephium-chatgpt/windows-subscription-trial
-      - name: Synthetic native trial vault roundtrip (no account)
-        run: |
-          $filter = 'vault::native_tests::windows::native_trial_vault_roundtrip_preserves_other_fresh_profile_and_cleans_up'
-          $listed = & cargo test -p zephium-chatgpt --locked --features windows-subscription-trial,zephium-credentials/windows-subscription-trial --lib $filter -- --ignored --exact --list
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $listed | Write-Output
-          $fixtures = @($listed | Where-Object { $_ -ceq "${filter}: test" })
-          if ($fixtures.Count -ne 1) { throw 'Expected exactly one reviewed synthetic native vault fixture.' }
-          cargo test -p zephium-chatgpt --locked --features windows-subscription-trial,zephium-credentials/windows-subscription-trial --lib $filter -- --ignored --exact
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Offline protocol, Codex account and trial Credential Manager tests
+        run: cargo test -p zephium-work-protocol-fixtures -p zephium-provider-accounts -p zephium-credentials --locked --features zephium-credentials/windows-subscription-trial
       - name: Subscription routing, accounting and profile-erasure journal regressions
         run: |
           cargo test -p zephium-app --features work-runtime,work-execution --locked work_models::tests
@@ -140,15 +120,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p zephium-ipc --locked codex
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p zephium-ipc --locked chatgpt::tests
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p zephium-ipc --locked local_gateway::tests
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p zephium-ipc --locked opencode_go::tests
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p zephium-agentic --features provider-transport --locked opencode_go::
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p zephium-agentic --features provider-transport --locked local_gateway::tests
+          cargo test -p zephium-agentic --features provider-transport --locked --lib
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p zephium-work-composition --test page_assist_faults --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -167,19 +139,23 @@ jobs:
       - name: Native Codex desktop ownership and removal composition (synthetic only)
         run: |
           $env:TAURI_CONFIG = Get-Content desktop/tauri.windows-subscription-trial.conf.json -Raw
+          cargo build -p zephium-codex-broker --locked --features native-fixtures --bin codex-broker-fixture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:ZEPHIUM_CODEX_FIXTURE_EXE = (Resolve-Path target/debug/codex-broker-fixture.exe).Path
           $listed = @(cargo test -p zephium-desktop --locked --features windows-subscription-trial codex:: -- --list)
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (@($listed | Where-Object { $_ -cmatch '^codex::.+: test$' }).Count -eq 0) { throw 'Expected native Codex desktop composition tests.' }
-          cargo test -p zephium-desktop --locked --features windows-subscription-trial codex:: -- --test-threads=1
+          if ($listed -cnotcontains 'codex::live::preference::tests::healthy_dormant_preference_commits_real_store_without_runtime_io: test') { throw 'Expected real dormant preference/Store regression.' }
+          cargo test -p zephium-desktop --locked --features windows-subscription-trial codex:: -- --test-threads=1 --show-output
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Regenerate complete native IPC bindings and reject drift
         run: |
           $env:TAURI_CONFIG = Get-Content desktop/tauri.windows-subscription-trial.conf.json -Raw
-          cargo test -p zephium-desktop --locked --features windows-subscription-trial subscription_registry
+          cargo test -p zephium-desktop --locked --features windows-subscription-trial legacy_provider_cleanup
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p zephium-desktop --locked --features windows-subscription-trial export_typescript_bindings
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git diff --exit-code -- frame/src/shared/ipc/bindings.ts frame/src/shared/ipc/work-constants.ts frame/src/shared/ipc/codex-bindings.ts frame/src/shared/ipc/chatgpt-bindings.ts
+          git diff --exit-code -- frame/src/shared/ipc/bindings.ts frame/src/shared/ipc/work-constants.ts frame/src/shared/ipc/codex-bindings.ts
       - name: Build unsigned isolated Windows installer
         run: node scripts/windows-trial.mjs --build
       - name: Verify generated installer identity and stage checksums

@@ -45,7 +45,7 @@ zephium-core = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-zephium-chatgpt = { workspace = true, features = ["test-fixtures"] }
+zephium-work-protocol-fixtures = { path = "../zephium-work-protocol-fixtures" }
 serde_json.workspace = true
 zephium-core.workspace = true
 zephium-ipc.workspace = true

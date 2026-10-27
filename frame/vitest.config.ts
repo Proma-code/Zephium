@@ -6,6 +6,7 @@ import { svelte } from "@sveltejs/vite-plugin-svelte";
 import { alias } from "./aliases.ts";
 import { i18nLocales } from "./i18n-locales.ts";
 import { benchPhotos, webkitFootprint } from "./vitest.bench-commands.ts";
+import { dragCodexEffortToEnd } from "./vitest.interaction-commands.ts";
 
 // Icons are imported one module each, and Vite meets each only when a test
 // first reaches it. On a cold cache (every CI runner) that re-optimises the
@@ -140,7 +141,7 @@ export default defineConfig({
             enabled: true,
             headless: true,
             screenshotFailures: false,
-            commands: { benchPhotos, webkitFootprint },
+            commands: { benchPhotos, webkitFootprint, dragCodexEffortToEnd },
             // Retina is the display this chrome is drawn for, and the one
             // where a radius or a hairline can actually be judged.
             provider: playwright({ contextOptions: { deviceScaleFactor: 2 } }),

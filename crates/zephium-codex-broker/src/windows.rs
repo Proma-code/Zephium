@@ -355,6 +355,8 @@ impl Session {
     }
 
     fn spawn_image(image: Image, runtime: Arc<RuntimePaths>) -> Result<Self, Fault> {
+        #[cfg(all(debug_assertions, feature = "native-fixtures"))]
+        crate::fixture_activity::SPAWN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let application = wide(image.path().as_os_str())?;
         let mut command = OsString::from("\"");
         command.push(image.path());

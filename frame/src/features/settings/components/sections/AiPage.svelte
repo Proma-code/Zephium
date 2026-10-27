@@ -6,8 +6,6 @@
     ModelsSession,
     entryOf,
     keyedProviders,
-    hasGatewayModels,
-    hasGoModels,
     connectionName,
     locked,
     modelName,
@@ -23,7 +21,6 @@
   import AiProviderRow from "../AiProviderRow.svelte";
   import AiVoiceRow from "../AiVoiceRow.svelte";
   import AiZephiumRow from "../AiZephiumRow.svelte";
-  import AiConnectionOptions from "../AiConnectionOptions.svelte";
   import CodexAccount from "../CodexAccount.svelte";
   import WorkDecisions from "../WorkDecisions.svelte";
 
@@ -59,10 +56,7 @@
   ];
   const anyUsable = $derived(
     !!models &&
-      (hasGatewayModels(models) ||
-        hasGoModels(models) ||
-        usable(models, "cloud") ||
-        keyedProviders.some((provider) => usable(models, provider))),
+      (usable(models, "cloud") || keyedProviders.some((provider) => usable(models, provider))),
   );
 
   function label(entry: WorkModelEntry) {
@@ -93,13 +87,10 @@
 
   function roleDescription(row: (typeof roles)[number]) {
     const selected = models?.chosen[row.role];
-    const connection = selected?.startsWith("opencode-go/")
-      ? m.go_title()
-      : selected?.startsWith("chatgpt/")
-        ? m.model_source_chatgpt()
-        : selected?.startsWith("gateway/")
-          ? m.model_source_gateway()
-          : connectionLabel(entryOf(models, selected ?? models?.effective[row.role]));
+    const connection =
+      selected && /^(chatgpt|gateway|opencode-go)\//u.test(selected)
+        ? null
+        : connectionLabel(entryOf(models, selected ?? models?.effective[row.role]));
     return connection
       ? `${row.description()} ${m.model_connection_info({ source: connection })}`
       : row.description();
@@ -116,7 +107,7 @@
       ...(expanded ? (session?.more ?? []) : []),
     ])
       .ready.flatMap((group) => group.entries)
-      .filter((entry) => !entry.id.startsWith("chatgpt/"));
+      .filter((entry) => !/^(chatgpt|gateway|opencode-go)\//u.test(entry.id));
     const chosen = models?.chosen[role];
     const missingAccountChoice =
       (chosen?.startsWith("chatgpt/") ||
@@ -126,11 +117,7 @@
         ? [
             {
               value: chosen,
-              label: chosen.startsWith("opencode-go/")
-                ? m.go_choice_unavailable()
-                : chosen.startsWith("gateway/")
-                  ? m.gateway_choice_unavailable()
-                  : m.ai_chatgpt_choice_unavailable(),
+              label: m.ai_retired_connection_choice(),
               disabled: true,
             },
           ]
@@ -158,13 +145,7 @@
   {#if !anyUsable}<p class="ai-note">{m.ai_byok_start()}</p>{/if}
 
   <AiZephiumRow />
-  {#await import("../LegacyAccountRecovery.svelte") then account}
-    <account.default profile={profile.id} />
-  {:catch}
-    <p class="ai-note" role="alert">{m.ai_legacy_recovery_unavailable()}</p>
-  {/await}
   <CodexAccount profile={profile.id} />
-  <AiConnectionOptions kind="accounts" profile={profile.id} />
 
   <SettingsGroup title={m.ai_keys_group()} description={m.ai_keys_note()}>
     {#if session}{#each keyedProviders as provider (provider)}<AiProviderRow
@@ -172,9 +153,6 @@
           {provider}
         />{/each}{/if}
   </SettingsGroup>
-
-  <AiConnectionOptions kind="go" profile={profile.id} />
-  <AiConnectionOptions kind="gateway" profile={profile.id} />
 
   <SettingsGroup
     title={m.ai_roles_group()}

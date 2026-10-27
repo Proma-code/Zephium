@@ -70,7 +70,6 @@ mod account;
 mod blocker_service;
 mod browser_credentials;
 mod browser_import;
-mod chatgpt;
 mod codex;
 mod content_fullscreen;
 mod default_browser;
@@ -84,6 +83,7 @@ mod help;
 mod intro_sound;
 mod keymap;
 mod launcher_trigger;
+mod legacy_provider_cleanup;
 #[cfg(target_os = "linux")]
 mod linux_global_shortcuts;
 #[cfg(any(target_os = "linux", test))]
@@ -92,14 +92,12 @@ mod linux_shortcut;
 mod linux_shortcut_portal;
 #[cfg(any(target_os = "linux", test))]
 mod linux_x11_shortcut;
-mod local_gateway;
 mod login_item;
 mod material;
 mod media;
 mod memory_pressure;
 mod menu_text;
 mod notes;
-mod opencode_go;
 mod overlay;
 mod page_assist;
 #[cfg(target_os = "macos")]
@@ -117,8 +115,6 @@ mod spaces;
 mod startup_alert;
 #[cfg(feature = "work-development-traces")]
 mod startup_styles;
-#[cfg(windows)]
-mod subscription_registry;
 mod swipe;
 mod system_time;
 mod updates;
@@ -883,10 +879,7 @@ impl ShutdownCoordinator {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.terminal_started.store(true, Ordering::Release);
         drop(admission);
-        chatgpt::stop();
         codex::stop();
-        local_gateway::stop();
-        opencode_go::stop();
     }
 
     fn try_startup_admission(&self, admit: impl FnOnce() -> bool) -> bool {
@@ -948,18 +941,6 @@ impl ShutdownCoordinator {
                 if !codex::drained().await {
                     coordinator.terminal_failure.store(true, Ordering::Release);
                     diagnostic!("shutdown: Codex process cleanup was not proven");
-                }
-                if !chatgpt::drained().await {
-                    coordinator.terminal_failure.store(true, Ordering::Release);
-                    diagnostic!("shutdown: ChatGPT account mutation cleanup was not proven");
-                }
-                if !opencode_go::drained().await {
-                    coordinator.terminal_failure.store(true, Ordering::Release);
-                    diagnostic!("shutdown: OpenCode Go mutation cleanup was not proven");
-                }
-                if !local_gateway::drained().await {
-                    coordinator.terminal_failure.store(true, Ordering::Release);
-                    diagnostic!("shutdown: local gateway mutation cleanup was not proven");
                 }
                 if !operations.shutdown().await {
                     coordinator.terminal_failure.store(true, Ordering::Release);
@@ -5788,10 +5769,7 @@ fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
     if code == Some(tauri::RESTART_EXIT_CODE)
         && !coordinator.terminal_failure.load(Ordering::Acquire)
     {
-        chatgpt::stop();
         codex::stop();
-        local_gateway::stop();
-        opencode_go::stop();
         return;
     };
     if exit_request_is_authorized(
@@ -5914,17 +5892,6 @@ pub fn run() {
         codex::codex_refresh_models,
         codex::codex_refresh_quota,
         codex::codex_select_model,
-        chatgpt::chatgpt_account,
-        chatgpt::chatgpt_sign_out,
-        opencode_go::go_status,
-        opencode_go::go_save,
-        opencode_go::go_check,
-        opencode_go::go_quota,
-        opencode_go::go_disconnect,
-        local_gateway::gateway_status,
-        local_gateway::gateway_save,
-        local_gateway::gateway_check,
-        local_gateway::gateway_disconnect,
     ];
     #[cfg(target_os = "windows")]
     let attempted_privileged_environments = Arc::new(AtomicU8::new(0));
@@ -5953,11 +5920,7 @@ pub fn run() {
     let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
     let app = builder
         .invoke_handler(move |invoke| {
-            if zephium_ipc::codex::CodexCommand::owns(invoke.message.command())
-                || zephium_ipc::chatgpt::ChatGptCommand::owns(invoke.message.command())
-                || zephium_ipc::local_gateway::GatewayCommand::owns(invoke.message.command())
-                || zephium_ipc::opencode_go::GoCommand::owns(invoke.message.command())
-            {
+            if zephium_ipc::codex::CodexCommand::owns(invoke.message.command()) {
                 account_handler(invoke)
             } else {
                 existing_handler(invoke)
@@ -6086,10 +6049,8 @@ pub fn run() {
                 menu_text::set_language(store.app_setting("ui.language").as_deref());
                 updates::schedule_native_checks(app.handle());
                 work_models::install(app.handle());
-                chatgpt::install(app.handle());
                 codex::install(app.handle());
-                local_gateway::install();
-                opencode_go::install();
+                legacy_provider_cleanup::install();
                 account::install(app.handle());
 
                 #[cfg(target_os = "windows")]
@@ -6556,10 +6517,7 @@ pub fn run() {
                     }
                 }
                 Projection::Profiles(view) => {
-                    chatgpt::profiles_changed(&view);
                     codex::profiles_changed(&view);
-                    local_gateway::profiles_changed(&view);
-                    opencode_go::profiles_changed(&view);
                     emit_to_privileged(&emit_handle, MAIN_LABEL, "zephium:profiles", &view)
                 }
 

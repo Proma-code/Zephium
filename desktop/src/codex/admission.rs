@@ -501,7 +501,7 @@ pub(super) fn route_selection<T: Clone, R>(
     expected_epoch: u64,
     current_epoch: impl FnOnce() -> Option<u64>,
     state: impl FnOnce(&T) -> OwnerState,
-    commit: impl FnOnce() -> R,
+    commit: impl FnOnce(Option<&T>) -> R,
 ) -> Result<SelectionRoute<T, R>, Error> {
     let owners = owners.lock().map_err(|_| Error::Closed)?;
     if current_epoch() != Some(expected_epoch) {
@@ -516,7 +516,7 @@ pub(super) fn route_selection<T: Clone, R>(
             OwnerState::Settled => {}
         }
     }
-    Ok(SelectionRoute::Committed(commit()))
+    Ok(SelectionRoute::Committed(commit(owners.get(&profile))))
 }
 
 #[cfg(test)]
@@ -850,7 +850,7 @@ mod tests {
                 3,
                 || Some(3),
                 |state| *state,
-                || {
+                |_| {
                     commits += 1;
                 },
             );
@@ -869,7 +869,7 @@ mod tests {
             2,
             || Some(2),
             |state| *state,
-            || {
+            |_| {
                 std::thread::spawn(move || {
                     assert!(matches!(
                         captured.try_lock(),
@@ -893,11 +893,62 @@ mod tests {
                 2,
                 || Some(2),
                 |state| *state,
-                || panic!("live owner bypass")
+                |_| panic!("live owner bypass")
             ),
             Ok(SelectionRoute::Owner(_))
         ));
     }
+    #[test]
+    fn settled_preference_callback_retains_exact_owner_and_scope_lock() {
+        let profile = zephium_core::ids::ProfileId::from(1_u128);
+        let owners = Mutex::new(std::collections::HashMap::from([(profile, 17_u64)]));
+        let result = route_selection(
+            &owners,
+            profile,
+            2,
+            || Some(2),
+            |_| OwnerState::Settled,
+            |owner| {
+                assert!(owners.try_lock().is_err());
+                assert_eq!(owner, Some(&17));
+                23
+            },
+        );
+        assert!(matches!(result, Ok(SelectionRoute::Committed(23))));
+        let denied = route_selection(
+            &owners,
+            profile,
+            2,
+            || None,
+            |_| OwnerState::Settled,
+            |_| panic!("retired profile/removal must not commit"),
+        );
+        assert!(matches!(denied, Err(Error::Closed)));
+    }
+
+    #[test]
+    #[ignore = "Explicit local preference routing microbenchmark; no runtime or Store I/O"]
+    fn benchmark_settled_preference_routing() {
+        let profile = zephium_core::ids::ProfileId::from(1_u128);
+        let owners = Mutex::new(std::collections::HashMap::from([(profile, 17_u64)]));
+        let start = std::time::Instant::now();
+        for _ in 0..100_000 {
+            let result = route_selection(
+                &owners,
+                profile,
+                2,
+                || Some(2),
+                |_| OwnerState::Settled,
+                |owner| std::hint::black_box(owner.copied()),
+            );
+            assert!(matches!(result, Ok(SelectionRoute::Committed(Some(17)))));
+        }
+        eprintln!(
+            "100000 exact settled preference routes: {:?}; excludes local Store latency",
+            start.elapsed()
+        );
+    }
+
     #[test]
     fn selection_queue_admission_blocks_page_until_confirmed_readiness_even_after_receive() {
         let (queue, receiver) = channel::<&str>(2);

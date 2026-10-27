@@ -54,6 +54,7 @@ export function validCodexView(view: unknown): view is CodexViewV1 {
     !runtimes.includes(view.runtime) ||
     typeof view.text_only !== "boolean" ||
     typeof view.page_selected !== "boolean" ||
+    (view.catalog_generation !== null && !bounded(view.catalog_generation, 128)) ||
     !Array.isArray(view.models) ||
     view.models.length > 256 ||
     (view.login_attempt !== null && !bounded(view.login_attempt, 128)) ||

@@ -2,7 +2,6 @@
   import { onDestroy, tick } from "svelte";
   import {
     type CodexSession,
-    loadCodexSession,
     codexEffort,
     codexFault,
     codexStatus,
@@ -12,6 +11,8 @@
     codexFavouriteKey,
     filterCodexCatalog,
   } from "$domain/codex";
+  import { CodexEffortIntent } from "../../lib/codex-effort.svelte";
+  import type { CodexPickerObservation } from "../../lib/codex-picker";
   import type { CodexEffortSelectionV1, CodexModelV1 } from "$shared/ipc/codex-bindings";
   import { favourites, toggleFavourite } from "$domain/ai";
   import Icon from "$shared/ui/Icon";
@@ -20,7 +21,7 @@
   import ModelCard, { type NativeCardSubject } from "./ModelCard.svelte";
 
   let {
-    profile,
+    observation,
     onchosen,
     onstate,
     oncount,
@@ -29,7 +30,7 @@
     listId,
     onactive = () => {},
   }: {
-    profile: string;
+    observation: CodexPickerObservation;
     onchosen: () => void;
     onstate: (connected: boolean) => void;
     oncount: (count: number) => void;
@@ -40,28 +41,41 @@
   } = $props();
   const uid = $props.id();
   let session = $state.raw<CodexSession | null>(null);
+  let effortIntent = $state.raw<CodexEffortIntent | null>(null);
+  $effect(() => {
+    const owner = session;
+    if (!owner) return;
+    const intent = new CodexEffortIntent(owner, () => {
+      const wasPending = pending !== null;
+      pending = null;
+      rest(1600);
+      if (wasPending) onchosen();
+    });
+    effortIntent = intent;
+    return () => {
+      intent.cancel();
+      if (effortIntent === intent) effortIntent = null;
+    };
+  });
   let loadFailed = $state(false);
   $effect(() => {
-    const selectedProfile = profile;
+    const source = observation;
     let disposed = false;
-    let owner: CodexSession | null = null;
     loadFailed = false;
-    void loadCodexSession()
-      .then((loaded) => {
-        if (disposed) return;
-        owner = new loaded.CodexSession(selectedProfile);
+    void source
+      .acquire()
+      .then(async (owner) => {
+        if (disposed || !owner) return;
         session = owner;
-        void owner.start().catch(() => {
-          if (!disposed) loadFailed = true;
-        });
+        const started = await owner.start();
+        if (!disposed && !started) owner.reconcile();
       })
       .catch(() => {
         if (!disposed) loadFailed = true;
       });
     return () => {
       disposed = true;
-      owner?.dispose();
-      if (session === owner) session = null;
+      session = null;
     };
   });
   const view = $derived(session?.view ?? null);
@@ -110,6 +124,7 @@
     clearTimeout(fold);
     if (!expanded) return false;
     expanded = false;
+    effortIntent?.cancelPending();
     void tick().then(() => pill?.focus({ preventScroll: true }));
     return true;
   }
@@ -124,6 +139,7 @@
   }
   function toggle() {
     expanded = !expanded;
+    if (!expanded) effortIntent?.cancelPending();
     rest();
   }
   onDestroy(() => clearTimeout(fold));
@@ -135,18 +151,12 @@
       pending = row.id;
       return;
     }
-    if (await owner.select(selection)) onchosen();
+    if ((await owner.select(selection)) && session === owner) onchosen();
   }
-  async function effort(level: CodexEffortSelectionV1) {
-    const owner = session;
+  function effort(level: CodexEffortSelectionV1) {
     const row = current;
-    if (!owner || !row || owner.busy || !supportsCodexEffort(row, level)) return;
-    const wasPending = pending !== null;
-    if (await owner.select({ model: row.id, effort: level })) {
-      pending = null;
-      rest(1600);
-      if (wasPending) onchosen();
-    }
+    if (!row || !supportsCodexEffort(row, level)) return;
+    effortIntent?.request({ model: row.id, effort: level });
   }
   export function navigate(event: KeyboardEvent) {
     const target = event.target as HTMLElement;
@@ -186,11 +196,15 @@
   <ModelCard
     bind:this={control}
     subject={card}
+    pendingEffort={effortIntent?.desired?.model === current?.id
+      ? effortIntent?.desired?.effort
+      : null}
     {expanded}
     region="{uid}-effort"
     bind:pill
     ontoggle={toggle}
     onNativeEffort={(level) => void effort(level)}
+    onNativeCancel={() => effortIntent?.cancelPending()}
     onstir={() => rest()}
   />
   {#if pending && card.effort === null}
@@ -206,6 +220,7 @@
 {:else}<p class="note" role="status">
     {codexCapability(view) ?? codexStatus(view)}
   </p>{/if}
+{#if effortIntent?.desired}<p class="note" role="status">{m.codex_selection_pending()}</p>{/if}
 {#if loadFailed}<p class="note failure" role="alert">{m.codex_load_failed()}</p>{/if}
 {#if view?.error}<p class="note failure" role="alert">{codexFault(view.error)}</p>{/if}
 {#if session?.observationFailed}<p class="note failure" role="alert">
@@ -216,6 +231,7 @@
   class="list"
   id={listId}
   role="listbox"
+  aria-busy={session?.checking || undefined}
   aria-label={m.codex_model()}
   aria-activedescendant={active && rows.some((row) => row.id === active)
     ? `${uid}-${rows.findIndex((row) => row.id === active)}`

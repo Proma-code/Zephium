@@ -13,9 +13,11 @@ custody. Core/Store own durable account/thread/source/removal contracts. Desktop
 joins those capabilities to the existing Page/browser authority. The frame's
 `domain/codex` and lazy `features/codex` project state without granting authority.
 
-The old `zephium-chatgpt` production surface is retained-account recovery only;
-its offline protocol fixtures do not enable direct login or inference. Existing
-API/Work settings remain separate from the Codex sidebar selection.
+The old direct ChatGPT, gateway and OpenCode Go connectors are removed. Minimal
+compatibility cleanup erases only the retained profile-scoped credential targets
+when the user explicitly removes that profile. Startup and Settings never inspect,
+refresh or revoke those grants. Original API/Work settings remain separate from
+the Codex sidebar selection.
 
 See the [active acceptance](current-feature.md) and
 [connection guide](../../docs/subscription-accounts.md). Read actual source and

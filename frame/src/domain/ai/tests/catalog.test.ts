@@ -5,10 +5,7 @@ import {
   dollars,
   effortLevels,
   modelEffort,
-  hasGatewayModels,
-  hasGoModels,
   keyedProviders,
-  connectionName,
   locked,
   modelName,
   modelConnection,
@@ -178,116 +175,47 @@ test("OpenAI names stay clean while connection metadata distinguishes identical 
   expect(searchEntries(groups.ready, "gpt example chatgpt")).toEqual([]);
 });
 
-describe("local gateway catalog sources", () => {
-  const gateway = () =>
-    entry("compatible", "same-model", "Same model", false, ["lead", "page", "light"], {
-      id: `gateway/${"a".repeat(32)}/same-model`,
-      price: null,
-    });
-  test("only native checked gateway models are usable without enabling a legacy endpoint", () => {
-    const view = models({});
-    view.entries.push(gateway());
-    expect(hasGatewayModels(view)).toBe(true);
-    expect(usable(view, "compatible")).toBe(false);
-    expect(
-      pickerGroups(view, "page").ready.find((group) => group.provider === "compatible")?.entries,
-    ).toEqual([gateway()]);
-    expect(modelConnection(gateway())).toBe("gateway");
-    expect(connectionName("gateway")).toBe("Local gateway");
-    expect(priceTier(gateway().price)).toBeNull();
-    expect(modelName(gateway())).toBe("Same model");
+test("all retired connection entries are excluded without modifying saved state or API access", () => {
+  const view = models({
+    keys: Object.fromEntries(keyedProviders.map((provider) => [provider, "valid"])),
+    base: "http://localhost:11434/v1",
   });
-  test("endpoint discovery cannot fabricate gateway access, even when endpoint BYOK is usable", () => {
-    for (const base of [undefined, "http://localhost:11434/v1"]) {
-      const view = models({ base });
-      expect(hasGatewayModels(view)).toBe(false);
-      expect(
-        pickerGroups(view, "lead", [gateway()]).ready.flatMap((group) => group.entries),
-      ).not.toContainEqual(gateway());
+  const endpoint = entry("compatible", "local", "Local", false);
+  for (const [provider, prefix] of [
+    ["open_ai", "chatgpt"],
+    ["compatible", "gateway"],
+    ["open_code_go", "opencode-go"],
+  ] as const) {
+    const retired = entry(provider, "example", "Example", false, ["lead", "page", "light"], {
+      id: `${prefix}/saved/example`,
+    });
+    view.entries.push(retired);
+    view.chosen.page = retired.id;
+    view.efforts.push({ id: retired.id, levels: ["high"], effort: "high" });
+    const before = structuredClone(view);
+    for (const role of ["lead", "page", "light"] as const) {
+      const offered = pickerGroups(view, role, [endpoint, retired]).ready.flatMap(
+        (group) => group.entries,
+      );
+      expect(offered.some((row) => /^(chatgpt|gateway|opencode-go)\//u.test(row.id))).toBe(false);
+      expect(offered).toContainEqual(endpoint);
     }
-  });
-  test("independent endpoint model survives gateway disconnection and names need no source suffix", () => {
-    const endpoint = entry("compatible", "same-model", "Same model", false);
-    const view = models({ base: "http://localhost:11434/v1" });
-    view.entries.push(gateway());
-    expect(
-      pickerGroups(view, "lead", [endpoint]).ready.find((group) => group.provider === "compatible")
-        ?.entries,
-    ).toEqual([gateway(), endpoint]);
-    view.chosen.page = gateway().id;
-    view.entries = view.entries.filter((row) => !row.id.startsWith("gateway/"));
-    expect(
-      pickerGroups(view, "page", [endpoint]).ready.find((group) => group.provider === "compatible")
-        ?.entries,
-    ).toEqual([endpoint]);
-    expect(view.chosen.page).toBe(gateway().id);
-    expect(modelConnection(endpoint)).toBe("endpoint");
-  });
-  test("malformed gateway identities are not admitted merely because their provider is compatible", () => {
-    const view = models({ base: "http://localhost:11434/v1" });
-    view.entries.push({ ...gateway(), id: "gateway/not-a-native-connection/model" });
-    expect(hasGatewayModels(view)).toBe(false);
-    expect(pickerGroups(view, "lead").ready).toEqual([]);
-  });
-});
-
-describe("OpenCode Go is its own native-managed provider", () => {
-  const go = () =>
-    entry("open_code_go", "example", "Example", false, ["lead", "page", "light"], {
-      id: `opencode-go/${"a".repeat(32)}/example`,
-      price: null,
-    });
-  test("native catalog admission never uses global API-key settings or Custom endpoint access", () => {
-    const view = models({});
-    view.entries.push(go());
-    expect(keyedProviders).not.toContain("open_code_go");
-    expect(hasGoModels(view)).toBe(true);
-    expect(usable(view, "open_code_go")).toBe(false);
-    expect(pickerGroups(view, "lead").ready.map((group) => group.provider)).toEqual([
-      "open_code_go",
-    ]);
-    expect(modelName(go())).toBe("Example");
-    expect(modelConnection(go())).toBe("go");
-    expect(connectionName("go")).toBe("OpenCode Go");
-  });
-  test("an endpoint or more-model reply cannot fabricate Go access", () => {
-    const view = models({ keys: { open_ai: "valid" }, base: "http://localhost:11434/v1" });
-    expect(
-      pickerGroups(view, "lead", [go()]).ready.flatMap((group) => group.entries),
-    ).not.toContainEqual(go());
-    view.entries.push({ ...go(), id: "opencode-go/unscoped/example" });
-    expect(hasGoModels(view)).toBe(false);
-    expect(
-      pickerGroups(view, "lead").ready.some((group) => group.provider === "open_code_go"),
-    ).toBe(false);
-  });
-  test("a more-model result cannot relabel a native Go identity as another billing provider", () => {
-    const view = models({ keys: { open_ai: "valid" } });
-    view.entries.push(go());
-    const spoof = entry("open_ai", "example", "API example", false, ["lead"], { id: go().id });
-    const offered = pickerGroups(view, "lead", [spoof]).ready.flatMap((group) => group.entries);
-    expect(offered.filter((row) => row.id === go().id)).toEqual([go()]);
-  });
-  test("disconnect preserves unrelated catalogs and the unavailable saved Go choice", () => {
-    const view = models({ keys: { open_ai: "valid" }, base: "http://localhost:11434/v1" });
-    view.entries.push(go());
-    view.chosen.page = go().id;
-    const endpoint = entry("compatible", "example", "Example", false);
-    expect(
-      pickerGroups(view, "page", [endpoint]).ready.some(
-        (group) => group.provider === "open_code_go",
-      ),
-    ).toBe(true);
-    view.entries = view.entries.filter((row) => row.model.provider !== "open_code_go");
-    expect(view.chosen.page).toBe(go().id);
-    expect(usable(view, "open_ai")).toBe(true);
-    expect(usable(view, "compatible")).toBe(true);
-    expect(
-      pickerGroups(view, "page", [endpoint]).ready.some(
-        (group) => group.provider === "open_code_go",
-      ),
-    ).toBe(false);
-  });
+    expect(effortLevels(view, retired.id)).toEqual([]);
+    expect(view).toEqual(before);
+  }
+  expect(keyedProviders).toEqual([
+    "anthropic",
+    "open_ai",
+    "google",
+    "xai",
+    "mistral",
+    "deep_seek",
+    "groq",
+    "cerebras",
+    "open_router",
+    "compatible",
+  ]);
+  for (const provider of keyedProviders) expect(usable(view, provider)).toBe(true);
 });
 
 describe("model context provenance", () => {

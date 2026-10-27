@@ -306,6 +306,8 @@ pub(crate) fn discover(
     cached_release: Option<&str>,
     cancelled: &AtomicBool,
 ) -> Result<DetectedCli, DiscoveryFault> {
+    #[cfg(all(debug_assertions, feature = "native-fixtures"))]
+    crate::fixture_activity::DISCOVERY.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     let mut search = Search {
         deadline,
         cancelled,

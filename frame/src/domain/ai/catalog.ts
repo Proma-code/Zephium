@@ -80,25 +80,6 @@ export function modelContext(entry: WorkModelEntry): string {
     : m.model_context({ size });
 }
 
-function gatewayEntry(entry: WorkModelEntry): boolean {
-  return entry.model.provider === "compatible" && /^gateway\/[0-9a-f]{32}\/.+$/u.test(entry.id);
-}
-
-export function hasGatewayModels(models: WorkModelsV1 | null): boolean {
-  return !!models?.entries.some(gatewayEntry);
-}
-
-function goEntry(entry: WorkModelEntry): boolean {
-  return (
-    entry.model.provider === "open_code_go" && /^opencode-go\/[0-9a-f]{32}\/.+$/u.test(entry.id)
-  );
-}
-
-/** A native-published supported catalog, not proof that the public listing authenticated a key. */
-export function hasGoModels(models: WorkModelsV1 | null): boolean {
-  return !!models?.entries.some(goEntry);
-}
-
 /** The model's name as the trigger shows it: the mark beside it says the family. */
 export function shortName(entry: WorkModelEntry): string {
   const name = modelName(entry);
@@ -148,12 +129,7 @@ export function pickerGroups(
   endpoint: readonly WorkModelEntry[] = [],
 ) {
   const entries = [...(models?.entries ?? []), ...endpoint];
-  const accountEntries = new Set(
-    models?.entries
-      .filter((entry) => gatewayEntry(entry) || goEntry(entry))
-      .map((entry) => entry.id) ?? [],
-  );
-  const order: readonly WorkModelProvider[] = ["cloud", ...keyedProviders, "open_code_go"];
+  const order: readonly WorkModelProvider[] = ["cloud", ...keyedProviders];
   const ready: ModelGroup[] = [];
   const needsKey: WorkModelProvider[] = [];
   for (const provider of order) {
@@ -161,7 +137,7 @@ export function pickerGroups(
     const offered = entries
       .filter((entry) => {
         if (
-          entry.id.startsWith("chatgpt/") ||
+          /^(chatgpt|gateway|opencode-go)\//u.test(entry.id) ||
           entry.model.provider !== provider ||
           !(entry.roles.includes(role) || (role !== "decision" && entry.roles.includes("lead")))
         )
@@ -172,11 +148,7 @@ export function pickerGroups(
       })
       .sort((a, b) => Number(b.recommended) - Number(a.recommended));
     const providerUsable = usable(models, provider);
-    const available = offered.filter((entry) => {
-      if (entry.model.provider === "open_code_go" || entry.id.startsWith("opencode-go/"))
-        return goEntry(entry) && accountEntries.has(entry.id);
-      return entry.id.startsWith("gateway/") ? accountEntries.has(entry.id) : providerUsable;
-    });
+    const available = providerUsable ? offered : [];
     if (available.length) ready.push({ provider, entries: available });
     if (!providerUsable && !available.length && suggested.includes(provider))
       needsKey.push(provider);
@@ -201,7 +173,7 @@ export function entryOf(models: WorkModelsV1 | null, id: string | null | undefin
 
 /** The efforts `id` takes as the lead, weakest first; empty when it takes none. */
 export function effortLevels(models: WorkModelsV1 | null, id: string | null | undefined) {
-  if (!models || !id || id.startsWith("chatgpt/")) return [];
+  if (!models || !id || /^(chatgpt|gateway|opencode-go)\//u.test(id)) return [];
   return models.efforts.find((row) => row.id === id)?.levels ?? [];
 }
 

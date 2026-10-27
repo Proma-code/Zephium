@@ -1,252 +1,28 @@
-//! One explicit Work run's protected model-source admission. The scope is a
-//! profile/connection, not a role, model name or individual resolved client.
-//! It never touches persistent credentials or another Work run's state.
-use std::collections::HashMap;
+//! Reject retained references to retired subscription sources before any client
+//! call. Original API-key and Cloud clients pass through unchanged.
+use super::WorkLeadModels;
 use std::sync::Arc;
-
-use tokio::sync::Mutex;
 use zephium_core::ids::ProfileId;
 use zephium_core::work::model::*;
 
-use super::WorkLeadModels;
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-enum Connection {
-    // Each profile has exactly one native ChatGPT connection slot. A native
-    // account replacement revokes its old leases; it cannot revive this run.
-    ChatGpt,
-    Gateway(String),
-    InvalidGateway,
-    Go(String),
-    InvalidGo,
-}
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct Source {
-    profile: ProfileId,
-    connection: Connection,
-}
-#[derive(Clone, Copy)]
-enum Kind {
-    ChatGpt,
-    Gateway,
-    Go,
-}
-impl Kind {
-    fn uncertain(self) -> WorkModelError {
-        match self {
-            // Protocol is the existing non-retriable unknown-outcome signal.
-            // Do not downgrade an unobserved dispatched request to a refusal.
-            Self::ChatGpt => WorkModelError::Protocol,
-            Self::Go => WorkModelError::OpenCodeGo {
-                fault: OpenCodeGoModelFault::Unavailable,
-                usage_unknown: true,
-            },
-            Self::Gateway => WorkModelError::Gateway {
-                fault: GatewayModelFault::Unavailable,
-                usage_unknown: true,
-            },
-        }
-    }
-    fn unsupported(self) -> WorkModelError {
-        match self {
-            Self::ChatGpt => WorkModelError::ChatGpt {
-                fault: ChatGptModelFault::Unsupported,
-            },
-            Self::Go => WorkModelError::OpenCodeGo {
-                fault: OpenCodeGoModelFault::Unsupported,
-                usage_unknown: false,
-            },
-            Self::Gateway => WorkModelError::Gateway {
-                fault: GatewayModelFault::Unsupported,
-                usage_unknown: false,
-            },
-        }
-    }
-    fn usage_unavailable(self) -> WorkModelError {
-        match self {
-            Self::ChatGpt => WorkModelError::ChatGpt {
-                fault: ChatGptModelFault::Diagnostic {
-                    stage: ChatGptFailureStage::Complete,
-                    status: None,
-                    issue: ChatGptFailureIssue::UsageUnavailable,
-                    field: None,
-                },
-            },
-            Self::Gateway => WorkModelError::Gateway {
-                fault: GatewayModelFault::UsageUnavailable,
-                usage_unknown: true,
-            },
-            Self::Go => WorkModelError::OpenCodeGo {
-                fault: OpenCodeGoModelFault::UsageUnavailable,
-                usage_unknown: true,
-            },
-        }
-    }
-    fn terminal(self, error: WorkModelError) -> WorkModelError {
-        match (self, error) {
-            (Self::ChatGpt, error @ WorkModelError::ChatGpt { .. })
-            | (Self::Gateway, error @ WorkModelError::Gateway { .. })
-            | (Self::Go, error @ WorkModelError::OpenCodeGo { .. }) => error,
-            // A protected client must not leak a retriable API error through
-            // this boundary, including a cancellation with unknown dispatch.
-            _ => self.uncertain(),
-        }
-    }
-}
-
-fn source(profile: ProfileId, entry: &WorkModelEntry) -> Option<(Source, Kind, bool)> {
-    if let Some(model) = entry.id.strip_prefix("chatgpt/") {
-        let valid = !model.is_empty()
-            && model == entry.model.model
-            && entry.model.provider == WorkModelProvider::OpenAi
-            && entry.model.wire == WorkModelWire::OpenAiResponses;
-        return Some((
-            Source {
-                profile,
-                connection: Connection::ChatGpt,
-            },
-            Kind::ChatGpt,
-            valid,
-        ));
-    }
-    if entry.id.starts_with("opencode-go/") || entry.model.provider == WorkModelProvider::OpenCodeGo
-    {
-        let pair = entry
-            .id
-            .strip_prefix("opencode-go/")
-            .and_then(|id| id.split_once('/'));
-        let (connection, valid) = match pair {
-            Some((scope, model))
-                if scope.len() == 32
-                    && scope
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
-            {
-                (
-                    Connection::Go(scope.into()),
-                    !model.is_empty()
-                        && model == entry.model.model
-                        && entry.model.provider == WorkModelProvider::OpenCodeGo
-                        && matches!(
-                            entry.model.wire,
-                            WorkModelWire::ChatCompletions | WorkModelWire::OpenAiResponses
-                        ),
-                )
-            }
-            _ => (Connection::InvalidGo, false),
-        };
-        return Some((
-            Source {
-                profile,
-                connection,
-            },
-            Kind::Go,
-            valid,
-        ));
-    }
-    let id = entry.id.strip_prefix("gateway/")?;
-    let (connection, valid) = match id.split_once('/') {
-        Some((scope, model))
-            if scope.len() == 32
-                && scope
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
-        {
-            (
-                Connection::Gateway(scope.into()),
-                !model.is_empty()
-                    && model == entry.model.model
-                    && entry.model.provider == WorkModelProvider::Compatible
-                    && entry.model.wire == WorkModelWire::ChatCompletions,
-            )
-        }
-        _ => (Connection::InvalidGateway, false),
-    };
-    Some((
-        Source {
-            profile,
-            connection,
-        },
-        Kind::Gateway,
-        valid,
-    ))
-}
-
-type SharedGate = Arc<Mutex<Option<WorkModelError>>>;
-struct GuardedClient {
-    inner: Arc<dyn WorkModelClient>,
-    gate: SharedGate,
-    kind: Kind,
-    valid: bool,
-}
-impl WorkModelClient for GuardedClient {
+struct RetiredClient(WorkModelError);
+impl WorkModelClient for RetiredClient {
     fn call<'a>(
         &'a self,
-        request: WorkModelRequest,
-        events: &'a (dyn Fn(WorkModelEvent) + Send + Sync),
+        _: WorkModelRequest,
+        _: &'a (dyn Fn(WorkModelEvent) + Send + Sync),
     ) -> WorkModelFuture<'a> {
-        Box::pin(async move {
-            // Waiting does not mutate the gate. Dropping a queued waiter must
-            // not poison the active owner's successful response.
-            let mut terminal = self.gate.lock().await;
-            if let Some(error) = *terminal {
-                return Err(error);
-            }
-            if !self.valid {
-                let error = self.kind.unsupported();
-                *terminal = Some(error);
-                return Err(error);
-            }
-            // Hold the source lock across this call. Only one role/model may
-            // dispatch on it at a time, so no sibling can emit tools after an
-            // earlier sibling's failure. A dropped dispatched owner leaves the
-            // marker intact; dropping its future also drops the inner future.
-            // Upstream charges already dispatched cannot be rolled back here.
-            *terminal = Some(self.kind.uncertain());
-            match self.inner.call(request, events).await {
-                Ok(outcome) if !outcome.usage.is_reported() => {
-                    // Work's normal plain-text path nudges another call. Stop
-                    // this source for the run before any such continuation.
-                    let error = self.kind.usage_unavailable();
-                    *terminal = Some(error);
-                    Err(error)
-                }
-                Ok(outcome) => {
-                    // This is still the same exclusive owner: no other failure
-                    // can be overwritten by its successful completion.
-                    *terminal = None;
-                    Ok(outcome)
-                }
-                Err(error) => {
-                    let error = self.kind.terminal(error);
-                    *terminal = Some(error);
-                    Err(error)
-                }
-            }
-        })
+        Box::pin(async move { Err(self.0) })
     }
 }
 
-/// Wrap all roles once for a newly admitted explicit Work run, before cloning
-/// clients into page/decision/search adapters. Same-source model variants share
-/// a terminal latch; different connections and ordinary API clients do not.
-/// Fresh explicit Work must resolve fresh native clients and call this again.
-pub fn guard_run_sources(profile: ProfileId, mut models: WorkLeadModels) -> WorkLeadModels {
-    let mut gates: HashMap<Source, SharedGate> = HashMap::new();
+/// A defensive admission boundary even for clients supplied outside the picker.
+/// Retired clients are dropped, never invoked, retried, or replaced with BYOK.
+pub fn guard_run_sources(_profile: ProfileId, mut models: WorkLeadModels) -> WorkLeadModels {
     for model in [&mut models.lead, &mut models.page, &mut models.light] {
-        let Some((source, kind, valid)) = source(profile, &model.entry) else {
-            continue;
-        };
-        let gate = gates
-            .entry(source)
-            .or_insert_with(|| Arc::new(Mutex::new(None)))
-            .clone();
-        model.client = Arc::new(GuardedClient {
-            inner: model.client.clone(),
-            gate,
-            kind,
-            valid,
-        });
+        if let Some(error) = crate::work_models::retired_source_error(&model.entry) {
+            model.client = Arc::new(RetiredClient(error));
+        }
     }
     models
 }

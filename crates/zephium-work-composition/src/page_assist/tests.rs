@@ -218,7 +218,7 @@ impl Diagnostics for Notes {
 /// One scripted model call: text deltas, then tool calls or the end.
 #[derive(Clone, Default)]
 struct Turn {
-    /// Fixed offline wire fixture, decoded by the actual ChatGPT adapter.
+    /// Fixed offline wire fixture, decoded by the retained offline Responses protocol fixture.
     wire_response: Option<Vec<u8>>,
     deltas: Vec<String>,
     tools: Vec<(String, Value)>,
@@ -274,7 +274,7 @@ impl WorkModelClient for FakeClient {
             let _flag = flag;
             if let Some(response) = turn.wire_response {
                 let (body, outcome) =
-                    zephium_chatgpt::inference::fixture_call(&request, &response, events)?;
+                    zephium_work_protocol_fixtures::responses::fixture_call(&request, &response, events)?;
                 encoded.lock().unwrap().push(body);
                 return Ok(outcome);
             }
@@ -1668,7 +1668,7 @@ async fn real_page_prompt_and_tools_complete_through_offline_chatgpt_wire_withou
         WorkModelReasoning::XHigh,
         WorkModelReasoning::Max,
     ] {
-        let model = zephium_chatgpt::inference::Model {
+        let model = zephium_work_protocol_fixtures::responses::Model {
             slug: "gpt-6.1-sol".into(),
             display_name: "GPT-6.1 Sol".into(),
         }
@@ -1930,7 +1930,7 @@ async fn completed_chatgpt_plain_text_without_usage_is_not_an_inference_failure(
                     },
                     say("must not retry"),
                 ],
-                zephium_chatgpt::inference::Model {
+                zephium_work_protocol_fixtures::responses::Model {
                     slug: "gpt-6.1-sol".into(),
                     display_name: "GPT-6.1 Sol".into(),
                 }
@@ -1993,7 +1993,7 @@ fn chatgpt_wire_text(text: &str) -> Value {
 }
 
 fn chatgpt_page_entry() -> WorkModelEntry {
-    zephium_chatgpt::inference::Model {
+    zephium_work_protocol_fixtures::responses::Model {
         slug: "gpt-6.1-sol".into(),
         display_name: "GPT-6.1 Sol".into(),
     }

@@ -73,6 +73,8 @@ fn fetch_response(
     outer_deadline: Instant,
     cancel: &AtomicBool,
 ) -> Result<OfficialReleaseResponse, Fault> {
+    #[cfg(all(debug_assertions, feature = "native-fixtures"))]
+    crate::fixture_activity::NETWORK.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     let started = Instant::now();
     let deadline = (started + FETCH_TIMEOUT).min(outer_deadline);
     current(deadline, cancel)?;

@@ -20,8 +20,9 @@ choice; API keys stay separate. Preserve existing non-Codex provider configurati
   fencing and composition with the existing Page dispatcher.
 - Frame: existing compact picker/Settings, transient state and truthful projections;
   no credentials, provider thread adoption or independent authority.
-- `zephium-chatgpt`: retained direct-account inspection/disconnect/cleanup only.
-  New direct login/catalog/inference is retired; old records are not converted.
+- Retired connector compatibility: preserve old records and schema versions; erase
+  exact local credential targets only on explicit profile deletion. No legacy
+  inspection, login, disconnect, refresh or inference route remains.
 
 ## Acceptance
 

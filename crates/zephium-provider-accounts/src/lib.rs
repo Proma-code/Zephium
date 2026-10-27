@@ -19,7 +19,7 @@ pub mod quota;
 pub mod status;
 
 /// CLI-oriented account setup policy; these are not Work model provider IDs.
-/// Direct Windows SIWC is implemented separately in `zephium-chatgpt`.
+/// Historical CLI classifications remain separate from active model providers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AccountProvider {
     /// The Codex-managed ChatGPT CLI route, separate from direct SIWC.

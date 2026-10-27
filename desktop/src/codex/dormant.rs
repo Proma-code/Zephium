@@ -47,7 +47,7 @@ fn source(service: &Arc<Service>) -> Option<Arc<Service>> {
     }
 }
 
-fn healthy(service: &Service) -> bool {
+pub(super) fn healthy(service: &Service) -> bool {
     service.done.load(Ordering::Acquire)
         && service
             .dormant
@@ -328,7 +328,7 @@ impl Action {
             Command::Quota => ActionKind::Quota,
             Command::Logout => ActionKind::Logout,
             Command::Login(attempt) => ActionKind::Login(attempt),
-            command => return command, // Select already retains its exact min8/original deadline.
+            command => return command, // Local preferences never enter runtime preparation.
         };
         Command::Action(Self {
             kind,
@@ -420,9 +420,6 @@ pub(super) struct Demand {
     fresh_wake: bool,
 }
 impl Demand {
-    pub(super) fn deadline(&self) -> Instant {
-        self.deadline
-    }
     fn current(&self) -> Result<(), CodexFaultV1> {
         if self.cancel.load(Ordering::Acquire) {
             return Err(CodexFaultV1::Cancelled);

@@ -5,10 +5,7 @@
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
-pub mod chatgpt;
 pub mod codex;
-pub mod local_gateway;
-pub mod opencode_go;
 pub mod page_assist;
 mod time;
 pub mod work;
