@@ -464,6 +464,12 @@ mod tests {
         let owner = owner_sid().unwrap();
         let parent = root.path().join("protected-owned-parent");
         create_dir(&parent, &owner).unwrap();
+        // Prepare the dedicated real alias before the restrictive parent pin:
+        // constructing test data is not a mutation of a held cleanup namespace.
+        let linked_file = parent.join("hardlink-source");
+        let second_link = parent.join("second-link");
+        std::fs::write(&linked_file, b"synthetic-linked").unwrap();
+        std::fs::hard_link(&linked_file, &second_link).unwrap();
         let parent_pin = held(&parent);
         let volume = identity(&parent_pin).unwrap().volume;
         let nested = parent.join("inherited-child");
@@ -521,11 +527,22 @@ mod tests {
             &descriptor(&format!("O:{owner}D:NO_ACCESS_CONTROL")),
         );
         assert_eq!(verify(&null, &owner, volume), Err(RemovalFault::Scope));
-        std::fs::hard_link(&file, parent.join("second-link")).unwrap();
+        let source_pin = held(&linked_file);
+        let alias_pin = held(&second_link);
         assert_eq!(
-            verify(&held(&file), &owner, volume),
+            identity(&source_pin).unwrap(),
+            identity(&alias_pin).unwrap()
+        );
+        let mut links = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe { GetFileInformationByHandle(HANDLE(source_pin.as_raw_handle()), &mut links) }
+            .unwrap();
+        assert_eq!(links.nNumberOfLinks, 2);
+        assert_eq!(
+            verify(&source_pin, &owner, volume),
             Err(RemovalFault::Scope)
         );
+        drop(alias_pin);
+        drop(source_pin);
         drop(broad);
         drop(null);
         drop(parent_pin);
