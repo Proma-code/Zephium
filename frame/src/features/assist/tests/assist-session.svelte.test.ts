@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { PageAssistAskResponseV1 } from "$shared/ipc/bindings";
-import { AssistSession } from "../lib/assist-session.svelte";
+import { AssistSession, MESSAGE_LIMIT } from "../lib/assist-session.svelte";
 import { status } from "./fixtures";
 
 const native = vi.hoisted(() => ({ ask: vi.fn(), read: vi.fn(), close: vi.fn() }));
@@ -89,6 +89,60 @@ beforeEach(() => {
 });
 afterEach(() => {
   for (const session of owners.splice(0)) session.dispose();
+});
+
+test("native Page capability keeps browser suggestions, attachments and exact words", async () => {
+  native.read.mockResolvedValue(
+    status([], {
+      model: { ...status().model!, id: "gpt-original", source: "codex", capabilities: "page" },
+    }),
+  );
+  native.ask.mockResolvedValue({ reply: 1, fault: null });
+  const session = await owner();
+  expect(await session.ask("  Explain this page  ", "summarize")).toBe(true);
+  expect(native.ask).toHaveBeenCalledExactlyOnceWith({
+    space: "space-a",
+    conversation: "c1",
+    text: "  Explain this page  ",
+    suggestion: "summarize",
+    attachments: [{ kind: "page", tab: "tab-a" }],
+  });
+});
+
+test.each(["suggestion", "attachment"] as const)(
+  "native TextOnly still refuses a browser %s without dispatch",
+  async (input) => {
+    native.read.mockResolvedValue(
+      status([], {
+        page: null,
+        model: {
+          ...status().model!,
+          id: "gpt-original",
+          source: "codex",
+          capabilities: "text_only",
+        },
+      }),
+    );
+    const session = await owner();
+    if (input === "attachment") session.others = ["tab-other"];
+    expect(await session.ask("Original words", input === "suggestion" ? "summarize" : null)).toBe(
+      false,
+    );
+    expect(native.ask).not.toHaveBeenCalled();
+    expect(session.notice).toEqual({ reason: "native_conversation", fault: "unsupported_input" });
+  },
+);
+
+test("native Page capability does not remove the original untruncated input bound", async () => {
+  native.read.mockResolvedValue(
+    status([], {
+      model: { ...status().model!, id: "gpt-original", source: "codex", capabilities: "page" },
+    }),
+  );
+  const session = await owner();
+  expect(await session.ask("x".repeat(MESSAGE_LIMIT + 1))).toBe(false);
+  expect(native.ask).not.toHaveBeenCalled();
+  expect(session.notice).toEqual({ reason: "native_conversation", fault: "limit" });
 });
 
 test.each(["success", "refused", "rejected"] as const)(

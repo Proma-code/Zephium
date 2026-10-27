@@ -619,3 +619,172 @@ pub(crate) fn removal_child(
         _ => Ok(()),
     }
 }
+
+/// Fixed Browser transcript peer; all offered definitions and instructions are
+/// the same native fixture manifest. No arbitrary request/response script.
+pub(crate) fn browser_child(
+    scenario: super::browser_fixtures::Scenario,
+) -> Result<(), &'static str> {
+    use super::browser_fixtures::{manifest, Scenario as B, INPUT, INSTRUCTIONS};
+    let home = std::env::var("CODEX_HOME").map_err(|_| "browser-peer-home")?;
+    let cwd = std::env::current_dir()
+        .map_err(|_| "browser-peer-cwd")?
+        .to_str()
+        .ok_or("browser-peer-cwd")?
+        .to_owned();
+    let mut peer = Peer {
+        input: std::io::BufReader::new(std::io::stdin()),
+        output: std::io::stdout(),
+        last: 0,
+        had_first_turn: false,
+        withhold_open: false,
+        default_choices: false,
+        pending_quota: None,
+        malformed_quota: false,
+        refused_quota: false,
+        home,
+        cwd,
+    };
+    peer.bootstrap()?;
+    let rounds = if matches!(scenario, B::TwoTurns) {
+        2
+    } else {
+        1
+    };
+    for round in 0..rounds {
+        let resume = round > 0 || matches!(scenario, B::ColdResume);
+        let method = if resume {
+            "thread/resume"
+        } else {
+            "thread/start"
+        };
+        let (id, actual) = peer.request(method)?;
+        let text = crate::text_policy::prepare_browser_text(INPUT.into())
+            .map_err(|_| "browser-peer-input")?
+            .into_validated_text();
+        let config = crate::compatibility::ConfigProjection::V164Plus.fixed_config(&text);
+        let mut params = json!({"model":MODEL,"modelProvider":"openai","cwd":peer.cwd,"approvalPolicy":"never","sandbox":"read-only","serviceTier":null,"config":config,"developerInstructions":INSTRUCTIONS});
+        if resume {
+            params["threadId"] = json!(THREAD);
+            params["excludeTurns"] = json!(true);
+        } else {
+            params["environments"] = json!([]);
+            params["ephemeral"] = json!(false);
+            params["allowProviderModelFallback"] = json!(false);
+            params["dynamicTools"] = manifest()?.tools().wire().clone();
+            params["selectedCapabilityRoots"] = json!([]);
+        }
+        if actual != json!({"id":id,"method":method,"params":params}) {
+            return Err("browser-peer-open-policy");
+        }
+        peer.reply(id,json!({"thread":{"id":THREAD,"ephemeral":false,"status":{"type":"idle"},"environments":[]},"model":MODEL,"modelProvider":"openai","reasoningEffort":null,"cwd":peer.cwd,"approvalPolicy":"never","sandbox":{"type":"readOnly","networkAccess":false}}))?;
+        let id=peer.expect(json!({"method":"turn/start","params":{"threadId":THREAD,"input":[{"type":"text","text":INPUT,"text_elements":[]}],"model":MODEL,"environments":[]}}))?;
+        let turn = if round == 0 {
+            "browser-turn-one"
+        } else {
+            "browser-turn-two"
+        };
+        let rpc = if round == 0 {
+            json!(-7)
+        } else {
+            json!("server-string-id")
+        };
+        let call = format!("browser-call-{round}");
+        let request = json!({"id":rpc,"method":"item/tool/call","params":{"threadId":THREAD,"turnId":turn,"callId":call,"namespace":null,"tool":"read_page","arguments":{"value":"owned"}}});
+        let item = json!({"type":"dynamicToolCall","id":call,"namespace":null,"tool":"read_page","arguments":{"value":"owned"},"status":"inProgress","contentItems":null,"success":null,"durationMs":null});
+        peer.note(
+            "item/started",
+            json!({"threadId":THREAD,"turnId":turn,"item":item,"startedAtMs":1}),
+        )?;
+        peer.send(request.clone())?;
+        if matches!(scenario, B::DuplicateCall) {
+            peer.send(request)?;
+        }
+        peer.reply(
+            id,
+            json!({"turn":{"id":turn,"status":"inProgress","error":null}}),
+        )?;
+        if matches!(scenario, B::DuplicateCall) {
+            if peer.read()?.is_some() {
+                return Err("browser-duplicate-produced-response");
+            }
+            return Ok(());
+        }
+        if matches!(scenario, B::TerminalRevocation | B::LocalLost) {
+            let marker =
+                std::path::PathBuf::from(std::env::var_os("TEMP").ok_or("browser-peer-temp")?)
+                    .join("browser-effect-entered");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !marker.is_file() {
+                if std::time::Instant::now() >= deadline {
+                    return Err("browser-effect-marker-timeout");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            if matches!(scenario, B::TerminalRevocation) {
+                let answer = "authentic browser final";
+                let final_item = json!({"id":"browser-final","type":"agentMessage","text":answer,"phase":"final_answer"});
+                let values = [
+                    json!({"method":"item/agentMessage/delta","params":{"threadId":THREAD,"turnId":turn,"itemId":"browser-final","delta":answer}}),
+                    json!({"method":"item/completed","params":{"threadId":THREAD,"turnId":turn,"item":final_item}}),
+                    json!({"method":"turn/completed","params":{"threadId":THREAD,"turn":{"id":turn,"status":"completed","error":null,"itemsView":"full","items":[item,final_item]}}}),
+                    json!({"method":"account/updated","params":{"authMode":"chatgpt"}}),
+                ];
+                let mut batch = Vec::new();
+                for value in values {
+                    serde_json::to_writer(&mut batch, &value).map_err(|_| "browser-peer-batch")?;
+                    batch.push(b'\n');
+                }
+                peer.output
+                    .write_all(&batch)
+                    .map_err(|_| "browser-peer-batch")?;
+                peer.output.flush().map_err(|_| "browser-peer-batch")?;
+                if let Some(value) = peer.read()? {
+                    if value.get("method").and_then(Value::as_str) != Some("thread/unsubscribe")
+                        || value["params"] != json!({"threadId":THREAD})
+                    {
+                        return Err("browser-revocation-unexpected-send");
+                    }
+                }
+                return Ok(());
+            }
+            peer.browser_complete(turn, &item)?;
+        } else {
+            let response = peer.read()?.ok_or("browser-peer-response-eof")?;
+            if response
+                != json!({"id":rpc,"result":{"contentItems":[{"type":"inputText","text":"synthetic readout"}],"success":true}})
+            {
+                return Err("browser-peer-response-identity");
+            }
+            let mut done = item;
+            done["status"] = json!("completed");
+            done["contentItems"] = json!([{"type":"inputText","text":"synthetic readout"}]);
+            done["success"] = json!(true);
+            done["durationMs"] = json!(1);
+            peer.note(
+                "item/completed",
+                json!({"threadId":THREAD,"turnId":turn,"item":done,"completedAtMs":2}),
+            )?;
+            peer.browser_complete(turn, &done)?;
+        }
+    }
+    if peer.read()?.is_some() {
+        return Err("browser-peer-unexpected-frame");
+    }
+    Ok(())
+}
+
+impl<R: BufRead, W: Write> Peer<R, W> {
+    fn browser_complete(&mut self, turn: &str, dynamic: &Value) -> Result<(), &'static str> {
+        let answer = "authentic browser final";
+        let item = json!({"id":format!("final-{turn}"),"type":"agentMessage","text":answer,"phase":"final_answer"});
+        self.note("item/agentMessage/delta",json!({"threadId":THREAD,"turnId":turn,"itemId":format!("final-{turn}"),"delta":answer}))?;
+        self.note(
+            "item/completed",
+            json!({"threadId":THREAD,"turnId":turn,"item":item}),
+        )?;
+        self.note("turn/completed",json!({"threadId":THREAD,"turn":{"id":turn,"status":"completed","error":null,"itemsView":"full","items":[dynamic,item]}}))?;
+        self.close_without_turn()?;
+        self.usage_tail(turn)
+    }
+}

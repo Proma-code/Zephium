@@ -15,6 +15,7 @@ struct State {
     capacity: usize,
     queue: Arc<Semaphore>,
     turn: Arc<Semaphore>,
+    browser_turn: Arc<AtomicBool>,
     ready: AtomicBool,
 }
 pub(super) struct Queue<T> {
@@ -39,6 +40,79 @@ pub(super) struct Reserved {
 /// caller completion/cancellation is deliberately not represented here.
 pub(super) struct Turn {
     _permit: OwnedSemaphorePermit,
+    browser: Option<Arc<AtomicBool>>,
+    committed: bool,
+    settled: bool,
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        if let Some(browser) = self
+            .browser
+            .as_ref()
+            .filter(|_| !self.committed || self.settled)
+        {
+            browser.store(false, Ordering::Release);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum TurnMode {
+    Text,
+    Browser,
+}
+
+/// Physical original-process completion alone cannot release a Browser turn.
+/// The actor retains this same slot until its exact dual-settlement event.
+pub(super) struct Settling {
+    pub(super) conversation: String,
+    pub(super) reply: u32,
+    mode: TurnMode,
+    _turn: Turn,
+}
+
+impl Settling {
+    pub(super) fn new(conversation: String, reply: u32, turn: Turn) -> Self {
+        let mode = if turn.browser.is_some() {
+            TurnMode::Browser
+        } else {
+            TurnMode::Text
+        };
+        Self {
+            conversation,
+            reply,
+            mode,
+            _turn: turn,
+        }
+    }
+
+    pub(super) fn has_local_obligation(&self) -> bool {
+        self.mode == TurnMode::Browser
+    }
+
+    pub(super) fn matches_browser(&self, conversation: &str, reply: u64) -> bool {
+        self.has_local_obligation()
+            && self.conversation == conversation
+            && u64::from(self.reply) == reply
+    }
+    /// Only the matching native dual-settlement event consumes this path.
+    /// Dropping a committed turn instead leaves queue quarantine sticky.
+    pub(super) fn release_browser(mut self) {
+        if self.has_local_obligation() {
+            self._turn.settled = true;
+        }
+    }
+}
+
+/// Text's existing physical-close fallback is not evidence for Browser tools.
+pub(super) fn release_text_after_close(held: &mut Option<Settling>) {
+    if held
+        .as_ref()
+        .is_some_and(|value| !value.has_local_obligation())
+    {
+        held.take();
+    }
 }
 
 pub(super) fn channel<T>(capacity: usize) -> (Queue<T>, Receiver<T>) {
@@ -49,6 +123,7 @@ pub(super) fn channel<T>(capacity: usize) -> (Queue<T>, Receiver<T>) {
         capacity,
         queue: Arc::new(Semaphore::new(capacity)),
         turn: Arc::new(Semaphore::new(1)),
+        browser_turn: Arc::new(AtomicBool::new(false)),
         ready: AtomicBool::new(false),
     });
     (
@@ -63,7 +138,10 @@ impl<T> Queue<T> {
     /// Every command, not only turns, consumes the same physical queue budget.
     pub(super) fn enqueue(&self, value: T, revocation: bool) -> Result<(), Error> {
         let _guard = self.state.gate.lock().map_err(|_| Error::Closed)?;
-        if !revocation && self.state.turn.available_permits() == 0 {
+        if !revocation
+            && (self.state.turn.available_permits() == 0
+                || self.state.browser_turn.load(Ordering::Acquire))
+        {
             return Err(Error::Busy);
         }
         let capacity = self
@@ -88,7 +166,9 @@ impl<T> Queue<T> {
         retire: impl FnOnce() -> Result<R, Error>,
     ) -> Result<R, Error> {
         let _guard = self.state.gate.lock().map_err(|_| Error::Closed)?;
-        if self.state.turn.available_permits() == 0 {
+        if self.state.turn.available_permits() == 0
+            || self.state.browser_turn.load(Ordering::Acquire)
+        {
             return Err(Error::Busy);
         }
         let result = retire()?;
@@ -103,9 +183,16 @@ impl<T> Queue<T> {
         self.state.ready.store(ready, Ordering::Release);
     }
     pub(super) fn reserve(&self) -> Result<Reserved, Error> {
+        self.reserve_mode(TurnMode::Text)
+    }
+    pub(super) fn reserve_browser(&self) -> Result<Reserved, Error> {
+        self.reserve_mode(TurnMode::Browser)
+    }
+    fn reserve_mode(&self, mode: TurnMode) -> Result<Reserved, Error> {
         let _guard = self.state.gate.try_lock().map_err(|_| Error::Busy)?;
         if !self.state.ready.load(Ordering::Acquire)
             || self.state.queue.available_permits() != self.state.capacity
+            || self.state.browser_turn.load(Ordering::Acquire)
         {
             return Err(Error::Busy);
         }
@@ -121,11 +208,39 @@ impl<T> Queue<T> {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::Busy)?;
+        let browser = (mode == TurnMode::Browser).then(|| {
+            self.state.browser_turn.store(true, Ordering::Release);
+            self.state.browser_turn.clone()
+        });
         Ok(Reserved {
             state: self.state.clone(),
             capacity,
-            turn: Turn { _permit: turn },
+            turn: Turn {
+                _permit: turn,
+                browser,
+                committed: false,
+                settled: false,
+            },
         })
+    }
+    /// Observational lifecycle only. The worker closes ordinary readiness
+    /// before checking this under the same gate, preventing an exit from
+    /// stranding a pre-say reservation or a synchronous committed handoff.
+    pub(super) fn browser_occupied(&self) -> bool {
+        let Ok(_guard) = self.state.gate.lock() else {
+            return true;
+        };
+        self.state.browser_turn.load(Ordering::Acquire)
+    }
+    /// A committed Browser envelope/owner was dropped without the observed
+    /// dual receipt. This is quarantine, never a no-send or cleanup proof.
+    pub(super) fn browser_handoff_lost(&self) -> bool {
+        let _guard = self
+            .state
+            .gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.state.browser_turn.load(Ordering::Acquire) && self.state.turn.available_permits() != 0
     }
     /// Nonblocking validation suitable for Page's short transcript commit lock.
     pub(super) fn validate(&self, reserved: &Reserved) -> bool {
@@ -134,13 +249,44 @@ impl<T> Queue<T> {
         };
         Arc::ptr_eq(&self.state, &reserved.state) && self.state.ready.load(Ordering::Acquire)
     }
+    /// One read-only owner inspection for the exact held reservation, before
+    /// Page commits a visible reply. It uses this same queue's temporary
+    /// capacity; the original handoff capacity and turn remain reserved.
+    /// This is not a generic bypass of occupied-turn command admission.
+    pub(super) fn inspect_reserved(&self, reserved: &Reserved, value: T) -> Result<(), Error> {
+        let _guard = self.state.gate.try_lock().map_err(|_| Error::Busy)?;
+        if !Arc::ptr_eq(&self.state, &reserved.state) {
+            return Err(Error::Closed);
+        }
+        if !self.state.ready.load(Ordering::Acquire)
+            || self.state.queue.available_permits() != self.state.capacity - 1
+        {
+            return Err(Error::Busy);
+        }
+        let capacity = self
+            .state
+            .queue
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Busy)?;
+        self.state.ready.store(false, Ordering::Release);
+        self.sender
+            .try_send(Envelope {
+                value,
+                _capacity: capacity,
+            })
+            .map_err(|_| Error::Closed)
+    }
     /// Consumes the already-reserved physical slot. Other enqueues cannot take
     /// that slot, so this cannot newly become queue-full after Page.say().
     pub(super) fn handoff(
         &self,
-        reserved: Reserved,
+        mut reserved: Reserved,
         build: impl FnOnce(Turn) -> T,
     ) -> Result<(), Error> {
+        // The caller has already committed Page.say. Even a poisoned gate or
+        // closed receiver is now an unknown handoff, not an unsent reservation.
+        reserved.turn.committed = true;
         let _guard = self.state.gate.lock().map_err(|_| Error::Closed)?;
         if !Arc::ptr_eq(&self.state, &reserved.state) {
             return Err(Error::Closed);
@@ -215,6 +361,190 @@ pub(super) fn route_selection<T: Clone, R>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn browser_inspection_retains_exact_handoff_capacity_and_turn() {
+        let (queue, receiver) = channel::<Option<Turn>>(2);
+        queue.set_ready(true);
+        let reserved = queue.reserve().unwrap();
+        queue.inspect_reserved(&reserved, None).unwrap();
+        assert!(matches!(queue.reserve(), Err(Error::Busy)));
+        assert_eq!(queue.enqueue(None, false), Err(Error::Busy));
+        assert!(receiver.try_recv().unwrap().is_none());
+        // Inspection delivery is not proof that native validation succeeded.
+        assert!(!queue.validate(&reserved));
+        queue.set_ready(true);
+        assert!(queue.validate(&reserved));
+        queue.handoff(reserved, Some).unwrap();
+        let turn = receiver.try_recv().unwrap().unwrap();
+        queue.set_ready(true);
+        assert!(matches!(queue.reserve(), Err(Error::Busy)));
+        drop(turn);
+        assert!(queue.reserve().is_ok());
+    }
+
+    #[test]
+    fn browser_inspection_cannot_borrow_foreign_reservation_or_revoked_lane() {
+        let (first, _) = channel::<()>(2);
+        let (other, other_receiver) = channel::<()>(2);
+        first.set_ready(true);
+        other.set_ready(true);
+        let reserved = first.reserve().unwrap();
+        assert_eq!(other.inspect_reserved(&reserved, ()), Err(Error::Closed));
+        assert!(matches!(
+            other_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        first.set_ready(false);
+        assert_eq!(first.inspect_reserved(&reserved, ()), Err(Error::Busy));
+    }
+
+    #[test]
+    fn insufficient_inspection_capacity_refuses_before_consuming_handoff() {
+        let (queue, receiver) = channel::<Option<Turn>>(1);
+        queue.set_ready(true);
+        let reserved = queue.reserve().unwrap();
+        // There is no second physical queue and no unbudgeted control command.
+        // This capacity-one fixture cannot inspect; the original slot survives.
+        assert_eq!(queue.inspect_reserved(&reserved, None), Err(Error::Busy));
+        assert!(queue.validate(&reserved));
+        queue.handoff(reserved, Some).unwrap();
+        drop(receiver.try_recv().unwrap());
+    }
+
+    #[test]
+    fn browser_slot_survives_worker_exit_unwind_and_lost_local_receiver() {
+        let (queue, receiver) = channel::<Settling>(2);
+        queue.set_ready(true);
+        let reserved = queue.reserve_browser().unwrap();
+        assert!(queue.browser_occupied());
+        queue
+            .handoff(reserved, |turn| {
+                Settling::new("same-conversation".into(), 7, turn)
+            })
+            .unwrap();
+        let mut held = Some(receiver.try_recv().unwrap());
+        // The actual worker's exit and catch_unwind paths use this helper.
+        // Neither physical process closure nor a lost Page receipt is enough.
+        release_text_after_close(&mut held);
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            release_text_after_close(&mut held);
+            panic!("synthetic worker unwind");
+        }));
+        assert!(unwind.is_err());
+        assert!(held.as_ref().unwrap().has_local_obligation());
+        queue.set_ready(true);
+        assert!(matches!(queue.reserve(), Err(Error::Busy)));
+        assert_eq!(queue.retire_if_idle(|| Ok(())), Err(Error::Busy));
+        assert!(!held
+            .as_ref()
+            .unwrap()
+            .matches_browser("other-conversation", 7));
+        assert!(!held
+            .as_ref()
+            .unwrap()
+            .matches_browser("same-conversation", 8));
+        assert!(held
+            .as_ref()
+            .unwrap()
+            .matches_browser("same-conversation", 7));
+        // Only the native owner's matching BrowserSettled event takes this
+        // value in production. The test supplies that exact local projection.
+        held.take().unwrap().release_browser();
+        assert!(!queue.browser_occupied());
+        assert!(queue.reserve().is_ok());
+    }
+
+    #[test]
+    fn stopped_worker_must_wait_for_browser_reservation_drop_or_synchronous_handoff() {
+        let (queue, receiver) = channel::<Turn>(2);
+        queue.set_ready(true);
+        let before_say = queue.reserve_browser().unwrap();
+        queue.set_ready(false); // ordinary admission retired under same gate
+        assert!(queue.browser_occupied());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        drop(before_say); // no Page/native dispatch obligation was created
+        assert!(!queue.browser_occupied());
+
+        queue.set_ready(true);
+        let committed = queue.reserve_browser().unwrap();
+        queue.set_ready(false);
+        // Post-say commit cannot be turned into a newly full/refused queue.
+        queue.handoff(committed, |turn| turn).unwrap();
+        assert!(queue.browser_occupied());
+        let actor_owned = receiver.try_recv().unwrap();
+        assert!(queue.browser_occupied());
+        Settling::new("same-conversation".into(), 1, actor_owned).release_browser();
+        assert!(!queue.browser_occupied());
+    }
+
+    #[test]
+    fn queued_committed_browser_drop_cannot_masquerade_as_unsent_reservation_release() {
+        let (queue, receiver) = channel::<Turn>(2);
+        queue.set_ready(true);
+        let reserved = queue.reserve_browser().unwrap();
+        queue.handoff(reserved, |turn| turn).unwrap();
+        // A panic/worker exit before adoption drops the queued envelope. No
+        // actual Page receipt was consumed, even though the semaphore frees.
+        drop(receiver);
+        assert!(queue.browser_occupied());
+        assert!(queue.browser_handoff_lost());
+        queue.set_ready(true);
+        assert!(matches!(queue.reserve_browser(), Err(Error::Busy)));
+        assert!(matches!(queue.reserve(), Err(Error::Busy)));
+        assert_eq!(queue.retire_if_idle(|| Ok(())), Err(Error::Busy));
+    }
+
+    #[test]
+    fn panic_during_post_say_handoff_keeps_browser_quarantine_sticky() {
+        let (queue, _receiver) = channel::<Turn>(2);
+        queue.set_ready(true);
+        let reserved = queue.reserve_browser().unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = queue.handoff(reserved, |_turn| panic!("synthetic handoff unwind"));
+        }));
+        assert!(result.is_err());
+        assert!(queue.browser_occupied());
+        assert!(queue.browser_handoff_lost());
+        assert!(queue.reserve().is_err());
+    }
+
+    #[test]
+    fn gate_failure_after_page_commit_cannot_release_as_unsent() {
+        let (queue, _receiver) = channel::<Turn>(2);
+        queue.set_ready(true);
+        let reserved = queue.reserve_browser().unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = queue.state.gate.lock().unwrap();
+            panic!("synthetic failure after Page validation");
+        }));
+        assert_eq!(queue.handoff(reserved, |turn| turn), Err(Error::Closed));
+        assert!(queue.browser_handoff_lost());
+        assert!(queue.reserve().is_err());
+    }
+
+    #[test]
+    fn text_close_fallback_never_accepts_a_browser_settlement_event() {
+        let (queue, receiver) = channel::<Settling>(1);
+        queue.set_ready(true);
+        let reserved = queue.reserve().unwrap();
+        queue
+            .handoff(reserved, |turn| {
+                Settling::new("text-conversation".into(), 3, turn)
+            })
+            .unwrap();
+        let mut held = Some(receiver.try_recv().unwrap());
+        assert!(!held
+            .as_ref()
+            .unwrap()
+            .matches_browser("text-conversation", 3));
+        release_text_after_close(&mut held);
+        assert!(held.is_none());
+        queue.set_ready(true);
+        assert!(queue.reserve().is_ok());
+    }
     #[test]
     fn lifecycle_busy_is_atomic_and_side_effect_free_until_actual_turn_release() {
         let (queue, receiver) = channel::<Turn>(2);

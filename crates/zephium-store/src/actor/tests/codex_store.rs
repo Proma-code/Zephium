@@ -19,6 +19,7 @@ fn codex_store_actor_flushes_registered_profile_and_commits_exact_pending_record
     let Reply::Association(Some(ready)) = store.codex_call(
         profile,
         Call::Bind {
+            policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
             expected_revision: None,
             scope,
             conversation: "page-1".into(),
@@ -30,6 +31,7 @@ fn codex_store_actor_flushes_registered_profile_and_commits_exact_pending_record
     let Reply::Association(Some(pending)) = store.codex_call(
         profile,
         Call::Begin {
+            policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
             scope,
             conversation: "page-1".into(),
             expected_revision: ready.revision,
@@ -113,17 +115,19 @@ fn concurrent_begin_and_skip_cannot_both_consume_the_same_revision() {
     let store = Arc::new(SqliteStore::in_memory().unwrap());
     store.save_session(sample());
     let profile = ProfileId::from(1);
-    let Reply::Scope(scope) = store.codex_call(
+    let opened = store.codex_call(
         profile,
         Call::Open {
             incarnation: [4; 16],
         },
-    ) else {
-        panic!()
+    );
+    let Reply::Scope(scope) = opened else {
+        panic!("expected canonical scope: {opened:?}")
     };
     let Reply::Association(Some(ready)) = store.codex_call(
         profile,
         Call::Bind {
+            policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
             scope,
             conversation: "page-1".into(),
             thread_id: "thread".into(),
@@ -143,6 +147,7 @@ fn concurrent_begin_and_skip_cannot_both_consume_the_same_revision() {
                 profile,
                 if skip {
                     Call::Skip {
+                        policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                         scope,
                         conversation: "page-1".into(),
                         expected_revision: Some(revision),
@@ -150,6 +155,7 @@ fn concurrent_begin_and_skip_cannot_both_consume_the_same_revision() {
                     }
                 } else {
                     Call::Begin {
+                        policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                         scope,
                         conversation: "page-1".into(),
                         expected_revision: revision,
@@ -199,7 +205,15 @@ fn lost_skip_ack_is_outcome_unknown_not_a_durable_not_sent_receipt() {
     let (tx, rx) = mpsc::sync_channel(1);
     let store = test_store_with_sender(tx);
     let receiver = std::thread::spawn(move || {
-        let Cmd::Codex(_, Call::Skip { .. }, reply) = rx.recv().unwrap() else {
+        let Cmd::Codex(
+            _,
+            Call::Skip {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
+                ..
+            },
+            reply,
+        ) = rx.recv().unwrap()
+        else {
             panic!("exact Skip command")
         };
         drop(reply);
@@ -208,6 +222,7 @@ fn lost_skip_ack_is_outcome_unknown_not_a_durable_not_sent_receipt() {
         store.codex_call(
             ProfileId::from(1),
             Call::Skip {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 scope: zephium_core::codex_store::Scope {
                     incarnation: [4; 16],
                     grant_epoch: 1
@@ -220,4 +235,53 @@ fn lost_skip_ack_is_outcome_unknown_not_a_durable_not_sent_receipt() {
         Reply::Failed(Fault::OutcomeUnknown)
     );
     receiver.join().unwrap();
+}
+
+#[test]
+fn actor_commits_original_browser_policy_and_refuses_different_manifest_without_scope_change() {
+    use zephium_core::codex_store::ConversationPolicy;
+    let store = SqliteStore::in_memory().unwrap();
+    store.save_session(sample());
+    let profile = ProfileId::from(1);
+    let opened = store.codex_call(
+        profile,
+        Call::Open {
+            incarnation: [4; 16],
+        },
+    );
+    let Reply::Scope(scope) = opened else {
+        panic!("expected canonical scope: {opened:?}")
+    };
+    let policy = ConversationPolicy::BrowserV1 {
+        tool_manifest_sha256: [1; 32],
+        instruction_policy_sha256: [2; 32],
+    };
+    let Reply::Association(Some(value)) = store.codex_call(
+        profile,
+        Call::Skip {
+            scope,
+            policy,
+            conversation: "page-1".into(),
+            expected_revision: None,
+            reply: 2,
+        },
+    ) else {
+        panic!("confirmed policy")
+    };
+    assert_eq!(value.policy, policy);
+    assert_eq!(
+        store.codex_call(
+            profile,
+            Call::Load {
+                scope,
+                policy: ConversationPolicy::TextOnlyLegacy,
+                conversation: "page-1".into()
+            }
+        ),
+        Reply::Failed(Fault::PolicyMismatch)
+    );
+    assert_eq!(
+        store.codex_call(profile, Call::InspectOwner),
+        Reply::Owner(Some(scope))
+    );
 }

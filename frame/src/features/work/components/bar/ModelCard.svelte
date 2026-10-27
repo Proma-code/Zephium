@@ -5,7 +5,7 @@
 
   /** Native metadata is presentation-only: no invented Work wire, pricing or capabilities. */
   export type NativeCardSubject = {
-    native: { id: string; name: string; source: string };
+    native: { id: string; name: string; source: string; detail: string | null };
     levels: readonly CodexEffortV1[];
     effort: CodexEffortSelectionV1 | null;
     defaultAvailable: boolean;
@@ -80,7 +80,8 @@
 
   /** What the model is like, then only what limits it. */
   const character = $derived.by(() => {
-    if ("native" in subject) return `${subject.native.source} · ${m.codex_picker_text_only()}`;
+    if ("native" in subject)
+      return [subject.native.source, subject.native.detail].filter(Boolean).join(" · ");
     const { entry, tier } = subject;
     const words: string[] = [];
     const connection = modelConnection(entry);

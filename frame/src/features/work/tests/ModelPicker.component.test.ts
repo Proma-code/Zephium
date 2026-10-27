@@ -1129,6 +1129,7 @@ test("Page Codex uses original catalog and exact supported effort without a Work
   };
   const catalog = codexView(PROFILE, {
     state: "connected",
+    text_only: false,
     models: [{ ...original, efforts: [...original.efforts] }],
   });
   codex.read.mockResolvedValue(catalog);
@@ -1145,6 +1146,8 @@ test("Page Codex uses original catalog and exact supported effort without a Work
   await expect
     .element(page.getByRole("option", { name: "Original Native Name", exact: true }))
     .toBeVisible();
+  await expect.element(page.getByText("Browser tools", { exact: true })).toBeVisible();
+  expect(page.getByText("Text only · internal preview", { exact: true }).query()).toBeNull();
   expect(codex.read).toHaveBeenCalledExactlyOnceWith(PROFILE);
   expect(codex.select).not.toHaveBeenCalled();
   expect(codex.connect).not.toHaveBeenCalled();

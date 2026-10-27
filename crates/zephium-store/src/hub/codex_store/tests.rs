@@ -24,6 +24,7 @@ fn bind(hub: &mut Hub, profile: ProfileId, scope: Scope) -> Association {
     association(hub.codex_call(
         profile,
         Call::Bind {
+            policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
             expected_revision: None,
             scope,
             conversation: "page-1".into(),
@@ -35,6 +36,7 @@ fn begin(hub: &mut Hub, profile: ProfileId, value: &Association, reply: u64) -> 
     association(hub.codex_call(
         profile,
         Call::Begin {
+            policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
             scope: value.scope,
             conversation: value.conversation.clone(),
             expected_revision: value.revision,
@@ -50,6 +52,7 @@ fn original_thread_continues_after_completed_turn_without_changing_home_epoch() 
     let started = association(hub.codex_call(
         profile,
         Call::RecordTurn {
+            policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
             scope,
             conversation: "page-1".into(),
             expected_revision: pending.revision,
@@ -60,6 +63,7 @@ fn original_thread_continues_after_completed_turn_without_changing_home_epoch() 
     let settled = association(hub.codex_call(
         profile,
         Call::Settle {
+            policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
             scope,
             conversation: "page-1".into(),
             expected_revision: started.revision,
@@ -81,6 +85,7 @@ fn original_thread_continues_after_completed_turn_without_changing_home_epoch() 
         hub.codex_call(
             profile,
             Call::Load {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 scope,
                 conversation: "page-1".into()
             }
@@ -111,24 +116,28 @@ fn uncertain_pending_cannot_be_replayed_reset_or_rebound() {
     let pending = begin(&mut hub, profile, &ready, 2);
     for call in [
         Call::Begin {
+            policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
             scope,
             conversation: "page-1".into(),
             expected_revision: pending.revision,
             reply: 3,
         },
         Call::Bind {
+            policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
             expected_revision: None,
             scope,
             conversation: "page-1".into(),
             thread_id: "replacement".into(),
         },
         Call::Bind {
+            policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
             expected_revision: None,
             scope,
             conversation: "page-2".into(),
             thread_id: "original-thread-1".into(),
         },
         Call::RecordTurn {
+            policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
             scope,
             conversation: "page-1".into(),
             expected_revision: ready.revision,
@@ -145,6 +154,7 @@ fn uncertain_pending_cannot_be_replayed_reset_or_rebound() {
         hub.codex_call(
             profile,
             Call::Load {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 scope,
                 conversation: "page-1".into()
             }
@@ -160,6 +170,7 @@ fn exact_terminal_can_reconcile_pending_but_not_a_different_original_turn() {
     let recorded = association(hub.codex_call(
         profile,
         Call::RecordTurn {
+            policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
             scope,
             conversation: "page-1".into(),
             expected_revision: pending.revision,
@@ -171,6 +182,7 @@ fn exact_terminal_can_reconcile_pending_but_not_a_different_original_turn() {
         hub.codex_call(
             profile,
             Call::Settle {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 scope,
                 conversation: "page-1".into(),
                 expected_revision: recorded.revision,
@@ -184,6 +196,7 @@ fn exact_terminal_can_reconcile_pending_but_not_a_different_original_turn() {
     let terminal = association(hub.codex_call(
         profile,
         Call::Settle {
+            policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
             scope,
             conversation: "page-1".into(),
             expected_revision: recorded.revision,
@@ -224,6 +237,7 @@ fn auth_epoch_cas_retires_old_authority_without_deleting_conversation_or_visible
         hub.codex_call(
             profile,
             Call::Load {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 scope: next,
                 conversation: "page-1".into()
             }
@@ -282,6 +296,7 @@ fn wrong_profile_invalid_ids_degraded_and_failed_write_never_produce_success() {
         hub.codex_call(
             profile,
             Call::Load {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 scope,
                 conversation: "../page".into()
             }
@@ -341,6 +356,7 @@ fn disk_restart_preserves_pending_and_exact_scope_without_runtime_version_identi
         execute(
             &conn,
             Call::Bind {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 expected_revision: None,
                 scope,
                 conversation: "page-1".into(),
@@ -353,6 +369,7 @@ fn disk_restart_preserves_pending_and_exact_scope_without_runtime_version_identi
         execute(
             &conn,
             Call::Begin {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 scope,
                 conversation: "page-1".into(),
                 expected_revision: ready.revision,
@@ -379,6 +396,7 @@ fn disk_restart_preserves_pending_and_exact_scope_without_runtime_version_identi
         execute(
             &conn,
             Call::Load {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 scope,
                 conversation: "page-1".into()
             }
@@ -386,7 +404,7 @@ fn disk_restart_preserves_pending_and_exact_scope_without_runtime_version_identi
         .unwrap(),
         Reply::Association(Some(pending))
     );
-    conn.pragma_update(None, "user_version", 39).unwrap();
+    conn.pragma_update(None, "user_version", 40).unwrap();
     assert!(migrations::validate_current(&conn, migrations::PROFILE).is_err());
 }
 #[test]
@@ -399,6 +417,7 @@ fn explicit_history_deletion_removes_association_but_does_not_reset_account_epoc
         hub.codex_call(
             profile,
             Call::Load {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 scope,
                 conversation: "page-1".into()
             }
@@ -449,6 +468,7 @@ fn association_count_is_bounded_and_stale_grants_cannot_evict_saved_history() {
             hub.codex_call(
                 profile,
                 Call::Bind {
+                    policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                     expected_revision: None,
                     scope,
                     conversation: format!("page-{index}"),
@@ -462,6 +482,7 @@ fn association_count_is_bounded_and_stale_grants_cannot_evict_saved_history() {
         hub.codex_call(
             profile,
             Call::Bind {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 expected_revision: None,
                 scope,
                 conversation: "overflow".into(),
@@ -474,6 +495,7 @@ fn association_count_is_bounded_and_stale_grants_cannot_evict_saved_history() {
         hub.codex_call(
             profile,
             Call::Load {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 scope,
                 conversation: "page-0".into()
             }
@@ -520,6 +542,7 @@ fn skip(
     hub.codex_call(
         profile,
         Call::Skip {
+            policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
             scope,
             conversation: "page-1".into(),
             expected_revision: revision,
@@ -541,6 +564,7 @@ fn proven_unsent_before_thread_retains_reply_and_original_receipt_fills_only_exa
         hub.codex_call(
             profile,
             Call::Begin {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 scope,
                 conversation: "page-1".into(),
                 expected_revision: skipped.revision,
@@ -554,6 +578,7 @@ fn proven_unsent_before_thread_retains_reply_and_original_receipt_fills_only_exa
             hub.codex_call(
                 profile,
                 Call::Bind {
+                    policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                     scope,
                     conversation: "page-1".into(),
                     thread_id: "original-thread".into(),
@@ -566,6 +591,7 @@ fn proven_unsent_before_thread_retains_reply_and_original_receipt_fills_only_exa
     let bound = association(hub.codex_call(
         profile,
         Call::Bind {
+            policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
             scope,
             conversation: "page-1".into(),
             thread_id: "original-thread".into(),
@@ -579,6 +605,7 @@ fn proven_unsent_before_thread_retains_reply_and_original_receipt_fills_only_exa
         hub.codex_call(
             profile,
             Call::Bind {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 scope,
                 conversation: "page-1".into(),
                 thread_id: "replacement".into(),
@@ -591,6 +618,7 @@ fn proven_unsent_before_thread_retains_reply_and_original_receipt_fills_only_exa
         hub.codex_call(
             profile,
             Call::Begin {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 scope,
                 conversation: "page-1".into(),
                 expected_revision: bound.revision,
@@ -639,6 +667,7 @@ fn skip_requires_exact_reply_revision_and_no_observed_original_turn() {
     let started = association(hub.codex_call(
         profile,
         Call::RecordTurn {
+            policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
             scope,
             conversation: "page-1".into(),
             expected_revision: pending.revision,
@@ -682,6 +711,7 @@ fn skipped_history_survives_retired_grant_without_becoming_current_resume_author
         hub.codex_call(
             profile,
             Call::Load {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 scope: next,
                 conversation: "page-1".into()
             }
@@ -762,7 +792,7 @@ fn v37_to_v38_preserves_every_existing_identity_revision_unknown_and_visible_his
     let names = ["ready", "pending", "started", "retired"];
     let before: Vec<_> = names
         .iter()
-        .map(|name| read(&conn, name).unwrap())
+        .map(|name| read_legacy_v38(&conn, name).unwrap())
         .collect();
     let owner = scope(&conn).unwrap();
     migrations::apply(&mut conn, migrations::PROFILE).unwrap();
@@ -783,13 +813,14 @@ fn v37_to_v38_preserves_every_existing_identity_revision_unknown_and_visible_his
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        38
+        39
     );
     let current = owner.unwrap();
     assert_eq!(
         execute(
             &conn,
             Call::Begin {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 scope: current,
                 conversation: "pending".into(),
                 expected_revision: 9,
@@ -803,6 +834,7 @@ fn v37_to_v38_preserves_every_existing_identity_revision_unknown_and_visible_his
         execute(
             &conn,
             Call::Load {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 scope: current,
                 conversation: "retired".into()
             }
@@ -866,14 +898,14 @@ fn schema_allows_absent_thread_only_for_explicit_skipped_and_preserves_unique_or
     ] {
         assert!(conn
             .execute(
-                "INSERT INTO codex_conversations VALUES('bad',?1,1,NULL,1,?2,?3,?4,?5)",
+                "INSERT INTO codex_conversations VALUES('bad',?1,1,NULL,1,?2,?3,?4,?5,0,NULL,NULL)",
                 params![[7_u8; 16].as_slice(), state, reply, turn, outcome]
             )
             .is_err());
     }
     for page in ["skip-a", "skip-b"] {
         conn.execute(
-            "INSERT INTO codex_conversations VALUES(?1,?2,1,NULL,1,3,2,NULL,NULL)",
+            "INSERT INTO codex_conversations VALUES(?1,?2,1,NULL,1,3,2,NULL,NULL,0,NULL,NULL)",
             params![page, [7_u8; 16].as_slice()],
         )
         .unwrap();
@@ -916,6 +948,7 @@ fn skipped_none_reopens_as_history_not_a_thread_or_permission_to_replay() {
         execute(
             &conn,
             Call::Skip {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 scope,
                 conversation: "page-1".into(),
                 expected_revision: None,
@@ -952,6 +985,7 @@ fn skipped_none_reopens_as_history_not_a_thread_or_permission_to_replay() {
         execute(
             &conn,
             Call::Begin {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 scope,
                 conversation: "page-1".into(),
                 expected_revision: skipped.revision,
@@ -965,6 +999,7 @@ fn skipped_none_reopens_as_history_not_a_thread_or_permission_to_replay() {
         execute(
             &conn,
             Call::Skip {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 scope,
                 conversation: "page-1".into(),
                 expected_revision: Some(skipped.revision),
@@ -978,6 +1013,7 @@ fn skipped_none_reopens_as_history_not_a_thread_or_permission_to_replay() {
         execute(
             &conn,
             Call::Skip {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 scope: Scope {
                     incarnation: [8; 16],
                     ..scope
@@ -1036,6 +1072,7 @@ fn inspect_owner_is_read_only_registered_and_preserves_real_scope() {
         hub.codex_call(
             profile,
             Call::Load {
+                policy: zephium_core::codex_store::ConversationPolicy::TextOnlyLegacy,
                 scope,
                 conversation: association.conversation.clone()
             }
@@ -1106,3 +1143,30 @@ fn inspect_owner_rejects_unrecognized_or_extra_owner_rows() {
         );
     }
 }
+
+// Historical schema reader only for immutable37/38 migration evidence.
+fn read_legacy_v38(conn: &Connection, conversation: &str) -> rusqlite::Result<Option<Association>> {
+    conn.query_row("SELECT incarnation, grant_epoch, thread_id, revision, dispatch, reply, turn_id, outcome FROM codex_conversations WHERE conversation = ?1", [conversation], |row| {
+        let incarnation: Vec<u8> = row.get(0)?;
+        let epoch: i64 = row.get(1)?;
+        let thread_id: Option<String> = row.get(2)?;
+        let revision: i64 = row.get(3)?;
+        let state: i64 = row.get(4)?;
+        let reply: i64 = row.get(5)?;
+        let turn: Option<String> = row.get(6)?;
+        let outcome: Option<i64> = row.get(7)?;
+        let scope = Scope {incarnation: incarnation.try_into().map_err(|_|rusqlite::Error::InvalidQuery)?,grant_epoch:u64::try_from(epoch).map_err(|_|rusqlite::Error::InvalidQuery)?};
+        if !scope.valid() || revision < 1 || thread_id.as_ref().is_some_and(|id| !zephium_core::codex_store::valid_provider_id(id))
+            || turn.as_ref().is_some_and(|id| !zephium_core::codex_store::valid_provider_id(id)) { return Err(rusqlite::Error::InvalidQuery); }
+        let dispatch = match (state, reply, turn, outcome) {
+            (0,0,None,None) if thread_id.is_some() => Dispatch::Ready,
+            (1,reply,turn_id,None) if reply > 0 && thread_id.is_some() => Dispatch::Pending {reply:reply as u64,turn_id},
+            (2,reply,Some(turn_id),Some(outcome)) if reply > 0 && thread_id.is_some() => Dispatch::Settled {reply:reply as u64,turn_id,outcome:match outcome {1=>Terminal::Completed,2=>Terminal::Interrupted,3=>Terminal::Failed,_=>return Err(rusqlite::Error::InvalidQuery)}},
+            (3,reply,None,None) if reply > 0 => Dispatch::Skipped {reply:reply as u64},
+            _=>return Err(rusqlite::Error::InvalidQuery),
+        };
+        Ok(Association {scope,policy:ConversationPolicy::TextOnlyLegacy,conversation:conversation.into(),thread_id,revision:revision as u64,dispatch})
+    }).optional()
+}
+
+mod policy;

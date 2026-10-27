@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::catalog::ModelChoice;
 
 const MAX_TEXT: usize = 2 * 1024 * 1024;
-const MAX_ITEMS: usize = 1024;
+pub(crate) const MAX_ITEMS: usize = 1024;
 const MAX_EVENTS: usize = 100_000;
 const MAX_EARLY_EVENTS: usize = 128;
 
@@ -23,6 +23,23 @@ pub struct Scope {
     generation: u64,
 }
 impl Scope {
+    #[cfg(any(
+        test,
+        all(
+            windows,
+            any(feature = "native-fixtures", feature = "trial-integration")
+        )
+    ))]
+    pub(crate) fn correlation_digest(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"codex-native-scope-v1");
+        hash.update((self.profile.len() as u64).to_le_bytes());
+        hash.update(self.profile.as_bytes());
+        hash.update(self.connection);
+        hash.update(self.generation.to_le_bytes());
+        hash.finalize().into()
+    }
     #[cfg(all(
         windows,
         any(feature = "native-fixtures", feature = "trial-integration")

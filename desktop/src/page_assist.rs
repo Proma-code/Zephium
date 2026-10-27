@@ -647,6 +647,18 @@ mod product {
     struct Models;
 
     impl ModelSource for Models {
+        fn reserve_native_browser<'a>(
+            &'a self,
+            profile: &'a ProfileId,
+            expected: NativeConversationChoice,
+            draft: NativeConversationDraft,
+            manifest: NativeBrowserManifest,
+        ) -> BoxFuture<'a, Result<Box<dyn NativeConversationReservation>, PageBackendError>>
+        {
+            Box::pin(async move {
+                crate::codex::reserve_page_browser(*profile, expected, draft, manifest).await
+            })
+        }
         fn entry<'a>(&'a self, profile: &'a ProfileId) -> BoxFuture<'a, Option<PageBackendChoice>> {
             Box::pin(async move {
                 if crate::codex::page_requested(*profile) {

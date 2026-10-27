@@ -51,6 +51,7 @@ const nativeConversationMessages = {
   protocol: m.assist_codex_protocol,
   limit: m.assist_codex_limit,
   outcome_unknown: m.assist_codex_unknown,
+  local_interruption: m.assist_codex_local_interruption,
   history_uncertain: m.assist_codex_history_uncertain,
   history_diverged: m.assist_codex_history_diverged,
   not_sent: m.assist_codex_not_sent,

@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   codex_broker:
-    name: Original Codex runtime and managed ownership (no account or turn)
+    name: Original Codex runtime and managed ownership (no live account or inference)
     if: github.repository == 'Proma-code/Zephium'
     runs-on: windows-2025
     timeout-minutes: 20
@@ -64,6 +64,13 @@ jobs:
           $removal | Write-Output
           if ($code -ne 0) { exit $code }
           if (@($removal | Where-Object { $_ -cmatch '^test result: ok\. 15 passed; 0 failed; 0 ignored;' }).Count -ne 1) { throw 'Expected all fifteen protected removal, recovery, and existing-only admission tests.' }
+      - name: Bounded schema-output custody controls (synthetic data only)
+        run: |
+          $schema = @(cargo test -p zephium-codex-broker --locked --features native-fixtures,trial-integration --lib browser_capability::tests:: -- --ignored --test-threads=1)
+          $code = $LASTEXITCODE
+          $schema | Write-Output
+          if ($code -ne 0) { exit $code }
+          if (@($schema | Where-Object { $_ -cmatch '^test result: ok\. 14 passed; 0 failed; 0 ignored;' }).Count -ne 1) { throw 'Expected all fourteen schema-output custody, pinned-root writing, limit, and cleanup controls.' }
       - name: Original CLI and standalone startup/config/close (no login or model request)
         run: pwsh -NoProfile -File crates/zephium-codex-broker/qualify-windows.ps1
       - name: Managed synthetic owner and original adjacent compatibility (no login or model request)

@@ -18,6 +18,40 @@ pub const MAX_TEXT_BYTES: usize = 24 * 1024;
 /// Longest title, in characters.
 pub const MAX_TITLE_CHARS: usize = 60;
 
+/// Original-client outcome, independent from Page action admission or cancellation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeConversationStatus {
+    /// The original runtime confirmed completion.
+    Completed,
+    /// Exact original-writer no-send proof and durable Skip acknowledgement.
+    /// Not derived from cancellation, timeout, or an absent provider turn ID.
+    NeverStarted,
+    /// Genuine original terminal; local durable history settlement is unconfirmed.
+    HistoryUncertain,
+    /// The original runtime confirmed interruption.
+    Interrupted,
+    /// The original runtime confirmed failure.
+    Failed,
+    /// The original outcome is not established; never a completed reply.
+    Unknown,
+}
+
+/// Bounded original-provider final text plus a separate local Page failure.
+/// This is native output data, not authority to admit effects or to restore a run.
+pub struct NativeTerminalProjection {
+    /// Existing native text block; cards and action blocks are not replaceable.
+    pub block: u16,
+    /// The original result, never inferred from local cancellation.
+    pub status: NativeConversationStatus,
+    /// Exact completed-item selection after citation rewriting. Absent text clears
+    /// a known completed answer, but preserves partial text for an unknown/failed turn.
+    pub final_text: Option<String>,
+    /// Citations proven by the same reply's retained read ledger.
+    pub cites: Vec<crate::ipc::PageAssistCiteV1>,
+    /// Local delivery/action failure, independent from the provider result.
+    pub local_fault: Option<crate::ipc::PageAssistNativeFaultV1>,
+}
+
 /// A conversation and its event counter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Conversation {
@@ -300,6 +334,137 @@ impl Conversation {
         Some(self.changed(reply, kind))
     }
 
+    /// Projects one sealed original-runtime result without reopening Page effects.
+    ///
+    /// The caller must hold the exact live native reply/foreground/profile identity
+    /// and consume its settlement only once. Unlike streaming `TextSnapshot`, this
+    /// may replace final text after a local cancellation/failure. It emits a reload
+    /// notification rather than replaying an artificial Working state. The local
+    /// fault is separate from the original status; unknown provider outcomes remain
+    /// unknown. Citations must come from that reply's retained citation book.
+    pub fn project_native_terminal(
+        &mut self,
+        reply: u32,
+        projection: NativeTerminalProjection,
+    ) -> Option<Changed> {
+        let NativeTerminalProjection {
+            block,
+            status,
+            final_text,
+            cites,
+            local_fault,
+        } = projection;
+        use crate::ipc::{PageAssistFaultV1 as Fault, PageAssistNativeFaultV1 as NativeFault};
+        if (status == NativeConversationStatus::Completed
+            && local_fault.is_some_and(|fault| {
+                !matches!(
+                    fault,
+                    NativeFault::LocalInterruption | NativeFault::Limit | NativeFault::Protocol
+                )
+            }))
+            || (status == NativeConversationStatus::NeverStarted && final_text.is_some())
+            || (final_text.is_none() && !cites.is_empty())
+            || final_text
+                .as_ref()
+                .is_some_and(|text| text.len() > MAX_TEXT_BYTES)
+            || cites.len() > crate::citations::MAX_SOURCES
+            || cites.iter().enumerate().any(|(index, cite)| {
+                cite.n == 0
+                    || usize::from(cite.n) > crate::citations::MAX_SOURCES
+                    || cites[..index].iter().any(|previous| previous.n == cite.n)
+                    || cite.excerpt.chars().count() > crate::ipc::PAGE_ASSIST_MAX_EXCERPT_CHARS
+            })
+        {
+            return None;
+        }
+        let message = self
+            .view
+            .messages
+            .iter_mut()
+            .find(|message| matches!(message, Message::Reply { id, .. } if *id == reply))?;
+        let Message::Reply {
+            state,
+            phase,
+            blocks,
+            cost,
+            fault,
+            ..
+        } = message
+        else {
+            return None;
+        };
+        let index = usize::from(block);
+        if index > blocks.len()
+            || index >= MAX_BLOCKS
+            || blocks
+                .get(index)
+                .is_some_and(|value| !matches!(value, Block::Text { .. }))
+        {
+            return None;
+        }
+        if status == NativeConversationStatus::NeverStarted
+            && (*state == ReplyState::Done
+                || blocks.iter().any(|block| match block {
+                    Block::Text { text, cites } => !text.is_empty() || !cites.is_empty(),
+                    _ => true,
+                }))
+        {
+            // A no-send claim cannot erase contradictory provider/effect evidence.
+            return None;
+        }
+        if final_text.is_some()
+            || matches!(
+                status,
+                NativeConversationStatus::Completed
+                    | NativeConversationStatus::HistoryUncertain
+                    | NativeConversationStatus::NeverStarted
+            )
+        {
+            let text = Block::Text {
+                text: final_text.unwrap_or_default(),
+                cites,
+            };
+            if index == blocks.len() {
+                blocks.push(text);
+            } else {
+                blocks[index] = text;
+            }
+        }
+        // An absent final item for Unknown/Interrupted/Failed is not an empty
+        // answer. Keep the existing bounded provisional text/cites, with its
+        // truthful terminal state below; never promote it to a completed answer.
+        let (next_state, next_fault) = match status {
+            NativeConversationStatus::Completed => match local_fault {
+                Some(fault) => (ReplyState::Failed, Some(fault)),
+                None => (ReplyState::Done, None),
+            },
+            NativeConversationStatus::NeverStarted => (
+                ReplyState::Failed,
+                Some(match local_fault {
+                    Some(NativeFault::Limit) => NativeFault::Limit,
+                    Some(NativeFault::Protocol) => NativeFault::Protocol,
+                    _ => NativeFault::NotSent,
+                }),
+            ),
+            NativeConversationStatus::HistoryUncertain => {
+                (ReplyState::Failed, Some(NativeFault::HistoryUncertain))
+            }
+            NativeConversationStatus::Interrupted => match local_fault {
+                Some(fault) if fault != NativeFault::Cancelled => (ReplyState::Failed, Some(fault)),
+                _ => (ReplyState::Cancelled, None),
+            },
+            NativeConversationStatus::Failed => (ReplyState::Failed, Some(NativeFault::Upstream)),
+            NativeConversationStatus::Unknown => {
+                (ReplyState::Failed, Some(NativeFault::OutcomeUnknown))
+            }
+        };
+        *state = next_state;
+        *phase = None;
+        *cost = None;
+        *fault = next_fault.map(|fault| Fault::NativeConversation { fault });
+        Some(self.changed(reply, Event::Invalidated))
+    }
+
     /// The next block index of `reply`.
     pub fn next_block(&self, reply: u32) -> u16 {
         self.blocks(reply)
@@ -468,5 +633,206 @@ mod tests {
         assert!(c.apply(first, Event::Inert).is_some());
         assert!(c.apply(first, Event::Inert).is_none());
         assert!(c.apply(second, Event::Inert).is_some());
+    }
+
+    fn terminal(status: NativeConversationStatus, text: Option<&str>) -> NativeTerminalProjection {
+        NativeTerminalProjection {
+            block: 0,
+            status,
+            final_text: text.map(str::to_owned),
+            cites: Vec::new(),
+            local_fault: None,
+        }
+    }
+
+    #[test]
+    fn sealed_final_clears_provisional_text_without_reopening_streaming() {
+        let mut c = conversation();
+        let (reply, _) = c.begin_reply();
+        c.apply(
+            reply,
+            Event::TextSnapshot {
+                block: 0,
+                text: "provisional".into(),
+            },
+        )
+        .unwrap();
+        c.apply(reply, Event::Cancelled).unwrap();
+        assert!(c
+            .apply(
+                reply,
+                Event::TextSnapshot {
+                    block: 0,
+                    text: "late callback".into()
+                }
+            )
+            .is_none());
+        let event = c
+            .project_native_terminal(reply, terminal(NativeConversationStatus::Completed, None))
+            .unwrap();
+        assert!(matches!(event.kind, Event::Invalidated));
+        assert!(
+            matches!(&c.messages()[0], Message::Reply { state: ReplyState::Done, blocks, .. }
+            if matches!(&blocks[0], Block::Text { text, .. } if text.is_empty()))
+        );
+        assert!(c
+            .apply(
+                reply,
+                Event::TextSnapshot {
+                    block: 0,
+                    text: "still late".into()
+                }
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn sealed_terminal_keeps_local_interruption_and_unknown_distinct_on_restore() {
+        use crate::ipc::{PageAssistFaultV1 as Fault, PageAssistNativeFaultV1 as NativeFault};
+        for (status, expected) in [
+            (
+                NativeConversationStatus::Completed,
+                NativeFault::LocalInterruption,
+            ),
+            (
+                NativeConversationStatus::HistoryUncertain,
+                NativeFault::HistoryUncertain,
+            ),
+            (
+                NativeConversationStatus::Unknown,
+                NativeFault::OutcomeUnknown,
+            ),
+        ] {
+            let mut c = conversation();
+            let (reply, _) = c.begin_reply();
+            let mut projection = terminal(status, Some("original item"));
+            projection.local_fault = Some(NativeFault::LocalInterruption);
+            c.project_native_terminal(reply, projection).unwrap();
+            let restored = Conversation::restore(c.view().clone(), "space".into());
+            assert!(matches!(&restored.messages()[0], Message::Reply {
+                state: ReplyState::Failed, fault: Some(Fault::NativeConversation { fault }), blocks, ..
+            } if *fault == expected && matches!(&blocks[0], Block::Text { text, .. } if text == "original item")));
+        }
+    }
+
+    #[test]
+    fn malformed_native_terminal_projection_is_atomic_and_bounded() {
+        use crate::ipc::PageAssistCiteV1;
+        let mut c = conversation();
+        let (reply, _) = c.begin_reply();
+        c.apply(
+            reply,
+            Event::TextSnapshot {
+                block: 0,
+                text: "prior".into(),
+            },
+        )
+        .unwrap();
+        for malformed in 0..6 {
+            let before = c.clone();
+            let mut projection = terminal(NativeConversationStatus::Completed, Some("valid"));
+            let target = if malformed == 0 { reply + 1 } else { reply };
+            match malformed {
+                1 => projection.status = NativeConversationStatus::NeverStarted,
+                2 => projection.final_text = Some("x".repeat(MAX_TEXT_BYTES + 1)),
+                3 => projection.block = 2,
+                4 => {
+                    projection.cites = vec![PageAssistCiteV1 {
+                        n: 0,
+                        tab: "tab".into(),
+                        host: "host".into(),
+                        excerpt: "quote".into(),
+                    }]
+                }
+                5 => {
+                    projection.cites = vec![
+                        PageAssistCiteV1 {
+                            n: 1,
+                            tab: "tab".into(),
+                            host: "host".into(),
+                            excerpt: "quote".into()
+                        };
+                        2
+                    ]
+                }
+                _ => {}
+            }
+            assert!(c.project_native_terminal(target, projection).is_none());
+            assert_eq!(c, before);
+        }
+    }
+
+    #[test]
+    fn absent_final_on_unconfirmed_or_failed_turn_preserves_partial_text() {
+        for status in [
+            NativeConversationStatus::Unknown,
+            NativeConversationStatus::Interrupted,
+            NativeConversationStatus::Failed,
+        ] {
+            let mut c = conversation();
+            let (reply, _) = c.begin_reply();
+            c.apply(
+                reply,
+                Event::TextSnapshot {
+                    block: 0,
+                    text: "partial, not final".into(),
+                },
+            )
+            .unwrap();
+            c.project_native_terminal(reply, terminal(status, None))
+                .unwrap();
+            assert!(
+                matches!(&c.messages()[0], Message::Reply { state, blocks, .. }
+                if *state != ReplyState::Done && matches!(&blocks[0], Block::Text { text, .. } if text == "partial, not final"))
+            );
+        }
+    }
+
+    #[test]
+    fn no_send_cannot_erase_prior_provider_text_or_done_evidence() {
+        for done in [false, true] {
+            let mut c = conversation();
+            let (reply, _) = c.begin_reply();
+            if done {
+                c.apply(reply, Event::Done { cost: None }).unwrap();
+            } else {
+                c.apply(
+                    reply,
+                    Event::TextSnapshot {
+                        block: 0,
+                        text: "provider text".into(),
+                    },
+                )
+                .unwrap();
+            }
+            let before = c.clone();
+            assert!(c
+                .project_native_terminal(
+                    reply,
+                    terminal(NativeConversationStatus::NeverStarted, None)
+                )
+                .is_none());
+            assert_eq!(c, before);
+        }
+    }
+
+    #[test]
+    fn completed_cannot_project_a_contradictory_no_send_or_unknown_local_claim() {
+        use crate::ipc::PageAssistNativeFaultV1 as NativeFault;
+        for fault in [
+            NativeFault::NotSent,
+            NativeFault::OutcomeUnknown,
+            NativeFault::HistoryUncertain,
+            NativeFault::ScopeChanged,
+            NativeFault::Cancelled,
+        ] {
+            let mut c = conversation();
+            let (reply, _) = c.begin_reply();
+            let before = c.clone();
+            let mut projection = terminal(NativeConversationStatus::Completed, Some("known final"));
+            projection.local_fault = Some(fault);
+            assert!(c.project_native_terminal(reply, projection).is_none());
+            assert_eq!(c, before);
+        }
     }
 }

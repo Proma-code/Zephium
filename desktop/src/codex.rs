@@ -244,6 +244,31 @@ pub(crate) fn reserve_page(
 }
 
 #[cfg(feature = "work-product")]
+pub(crate) async fn reserve_page_browser(
+    profile: zephium_core::ids::ProfileId,
+    expected: zephium_work_composition::page_assist::port::NativeConversationChoice,
+    draft: zephium_work_composition::page_assist::port::NativeConversationDraft,
+    manifest: zephium_work_composition::page_assist::port::NativeBrowserManifest,
+) -> Result<
+    Box<dyn zephium_work_composition::page_assist::port::NativeConversationReservation>,
+    zephium_work_composition::page_assist::port::PageBackendError,
+> {
+    #[cfg(all(windows, feature = "windows-subscription-trial"))]
+    {
+        live::reserve_page_browser(profile, expected, draft, manifest).await
+    }
+    #[cfg(not(all(windows, feature = "windows-subscription-trial")))]
+    {
+        let _ = (profile, expected, draft, manifest);
+        Err(
+            zephium_work_composition::page_assist::port::PageBackendError::NativeConversation(
+                zephium_ipc::page_assist::PageAssistNativeFaultV1::Unavailable,
+            ),
+        )
+    }
+}
+
+#[cfg(feature = "work-product")]
 pub(crate) fn page_requested(profile: zephium_core::ids::ProfileId) -> bool {
     #[cfg(all(windows, feature = "windows-subscription-trial"))]
     {

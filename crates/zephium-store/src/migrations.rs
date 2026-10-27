@@ -2706,6 +2706,10 @@ pub static PROFILE: &[Migration] = &[
         version: 38,
         up: |tx| tx.execute_batch(include_str!("codex_continuity_v38.sql")),
     },
+    Migration {
+        version: 39,
+        up: |tx| tx.execute_batch(include_str!("codex_continuity_v39.sql")),
+    },
 ];
 
 #[cfg(test)]
@@ -2801,6 +2805,7 @@ mod tests {
         (36, 0xa35d00504cb31a89),
         (37, 0xa05b97004c839285),
         (38, 0x2db4a48eb4bd1bf0),
+        (39, 0x5dcace2b419ad8a8),
     ];
 
     #[test]
@@ -3027,7 +3032,7 @@ mod tests {
             assert_eq!(validate_current(&conn, PROFILE).unwrap(), version as i64);
             apply(&mut conn, PROFILE).unwrap();
             apply(&mut conn, PROFILE).unwrap();
-            assert_eq!(validate_current(&conn, PROFILE).unwrap(), 38);
+            assert_eq!(validate_current(&conn, PROFILE).unwrap(), 39);
             assert_eq!(
                 conn.query_row("SELECT title FROM history", [], |r| r.get::<_, String>(0))
                     .unwrap(),
@@ -3111,7 +3116,7 @@ mod tests {
         .unwrap();
         apply(&mut conn, PROFILE).unwrap();
         apply(&mut conn, PROFILE).unwrap();
-        assert_eq!(validate_current(&conn, PROFILE).unwrap(), 38);
+        assert_eq!(validate_current(&conn, PROFILE).unwrap(), 39);
         assert_eq!(
             conn.query_row("SELECT title FROM history", [], |row| row
                 .get::<_, String>(0))
@@ -4445,7 +4450,7 @@ mod tests {
                 .unwrap(),
             14
         );
-        assert_eq!(PROFILE.last().map(|migration| migration.version), Some(38));
+        assert_eq!(PROFILE.last().map(|migration| migration.version), Some(39));
     }
 
     #[test]

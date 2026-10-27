@@ -703,7 +703,7 @@ mod tests {
         )
         .unwrap();
         conn.execute("INSERT INTO codex_owner(singleton,schema_version,incarnation,grant_epoch) VALUES(1,1,?1,1)",[vec![7_u8;16]]).unwrap();
-        conn.execute("INSERT INTO codex_conversations(conversation,incarnation,grant_epoch,thread_id,revision,dispatch,reply,turn_id,outcome) VALUES('scrub-chat',?1,1,?2,2,1,2,NULL,NULL)",params![vec![7_u8;16],PROFILE_SCRUB_MARKER]).unwrap();
+        conn.execute("INSERT INTO codex_conversations(conversation,incarnation,grant_epoch,thread_id,revision,dispatch,reply,turn_id,outcome,policy_kind,tool_manifest_sha256,instruction_policy_sha256) VALUES('scrub-chat',?1,1,?2,2,1,2,NULL,NULL,0,NULL,NULL)",params![vec![7_u8;16],PROFILE_SCRUB_MARKER]).unwrap();
         conn.execute(
             "INSERT INTO blocker_statistics VALUES(1,?1)",
             [r#"{"day":700000,"days":[0,0,0,0,0,0,12]}"#],

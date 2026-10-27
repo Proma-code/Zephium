@@ -5,10 +5,18 @@ fn main() {
         let mode = args.get(1).and_then(|value| value.to_str());
         let result = match (mode, args.len()) {
             (Some("transport"), 2) => zephium_codex_broker::qualify_transport(),
+            (Some("browser-owner"), 2) => zephium_codex_broker::qualify_browser_owner(),
             (Some("owner"), 2) => zephium_codex_broker::qualify_owner(),
             (Some("quota"), 2) => zephium_codex_broker::qualify_quota(),
             (Some("removal"), 2) => zephium_codex_broker::qualify_removal(),
             (Some("vault"), 2) => zephium_codex_broker::qualify_vault(),
+            (Some("browser-schema"), 4) => match args[2].to_str() {
+                Some(version) => zephium_codex_broker::qualify_browser_schema(
+                    version,
+                    std::path::Path::new(&args[3]),
+                ),
+                None => Err("browser-schema-version"),
+            },
             (Some("compatibility"), 4) => match args[2].to_str() {
                 Some(version) => zephium_codex_broker::qualify_compatibility(
                     version,

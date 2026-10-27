@@ -5,6 +5,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+pub use super::native_browser::{
+    NativeBrowserBridge, NativeBrowserCompletion, NativeBrowserInput, NativeBrowserLocalOutcome,
+    NativeBrowserLocalSettlement, NativeBrowserManifest, NativeBrowserParts,
+    NativeBrowserRevocation, NativeBrowserRevokeReason, NativeBrowserSettlement,
+    NativeBrowserToolOutput, NativeBrowserToolRequest, NATIVE_BROWSER_ARGUMENT_BYTES,
+    NATIVE_BROWSER_INPUT_BYTES, NATIVE_BROWSER_RESULT_BYTES, NATIVE_BROWSER_TOOL_CALLS,
+};
+pub use super::native_budget::{NativeBudgetFault, NativeBudgetView};
 use zephium_app::work_models::WorkCallSource;
 use zephium_core::ids::ProfileId;
 use zephium_core::work::model::{
@@ -351,6 +359,8 @@ pub struct NativeConversationChoice {
     pub id: String,
     pub name: String,
     pub source: zephium_ipc::page_assist::PageAssistModelSourceV1,
+    /// Captured native capability proof, not inferred from account/catalog state.
+    pub capabilities: zephium_ipc::page_assist::PageAssistCapabilitiesV1,
     pub effort: Option<String>,
 }
 
@@ -408,23 +418,13 @@ pub enum NativeConversationEvent {
     TextSnapshot { text: String },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NativeConversationStatus {
-    Completed,
-    /// Exact original-writer no-send proof and durable Skip acknowledgement.
-    /// Not derived from cancellation, timeout, or an absent provider turn ID.
-    NeverStarted,
-    /// Genuine original terminal; local durable history settlement is unconfirmed.
-    HistoryUncertain,
-    Interrupted,
-    Failed,
-    Unknown,
-}
+pub use zephium_page_assist::conversation::NativeConversationStatus;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeConversationOutcome {
     pub status: NativeConversationStatus,
-    /// The original completed-item selection; None is a valid empty result.
+    /// The original completed-item selection. None is a valid empty completed
+    /// result, not permission to erase partial text when the terminal is unknown.
     pub final_response: Option<String>,
 }
 
@@ -471,10 +471,49 @@ pub trait NativeConversationReservation: Send {
         'static,
         Result<NativeConversationOutcome, zephium_ipc::page_assist::PageAssistNativeFaultV1>,
     >;
+
+    /// BrowserV1 handoff for the same already-reserved draft and manifest.
+    /// Implementations must synchronously retain the native slot and original
+    /// intent, then wait for the one prepared input without sending early. A
+    /// dropped/failed preparation is not itself a NeverStarted receipt.
+    /// Normal terminal must close the bridge's action admission before joining
+    /// local settlement. Only an actual dual join is `Joined`; retained custody
+    /// failure is explicitly `Quarantined`, even with a known provider answer.
+    /// An outer error without a provider outcome is likewise delayed until
+    /// actual join or retained native quarantine; it cannot release custody.
+    /// The default refuses; it never falls back to the text-only protocol.
+    fn commit_browser(
+        self: Box<Self>,
+        _reply: u32,
+        _cancel: Arc<std::sync::atomic::AtomicBool>,
+        _events: NativeConversationEvents,
+        _browser: NativeBrowserBridge,
+    ) -> BoxFuture<
+        'static,
+        Result<NativeBrowserCompletion, zephium_ipc::page_assist::PageAssistNativeFaultV1>,
+    > {
+        Box::pin(async { Err(zephium_ipc::page_assist::PageAssistNativeFaultV1::UnsupportedInput) })
+    }
 }
 
 /// The person's Page backend.
 pub trait ModelSource: Send + Sync {
+    /// Reserve the original draft plus the native-owned BrowserV1 manifest.
+    /// No provider thread ID or renderer-selected capability map is accepted.
+    /// Old text-only associations must explicitly refuse, not fake an upgrade.
+    fn reserve_native_browser<'a>(
+        &'a self,
+        _profile: &'a ProfileId,
+        _expected: NativeConversationChoice,
+        _draft: NativeConversationDraft,
+        _manifest: NativeBrowserManifest,
+    ) -> BoxFuture<'a, Result<Box<dyn NativeConversationReservation>, PageBackendError>> {
+        Box::pin(async {
+            Err(PageBackendError::NativeConversation(
+                zephium_ipc::page_assist::PageAssistNativeFaultV1::UnsupportedInput,
+            ))
+        })
+    }
     /// Resolve and reserve one exact native draft before Page mutates its transcript.
     /// No provider send is permitted here. Dropping/timing out this future must
     /// cancel queued reservation acquisition and release undelivered reservations.

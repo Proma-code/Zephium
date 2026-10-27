@@ -49,7 +49,8 @@ mod write_fence;
 pub(crate) use write_fence::WriteFence;
 mod write_receipt;
 pub(crate) use write_receipt::{
-    MatchedUnsent, TurnHistory, TurnIntent, TurnOperation, TurnWrite, UnsentTurn,
+    BrowserInputIntent, MatchedUnsent, TurnHistory, TurnIntent, TurnOperation, TurnWrite,
+    UnsentTurn,
 };
 use write_receipt::{OwnedFrame, SessionStamp, TurnBinding, TurnTicket, WriteOutcome};
 
@@ -60,13 +61,14 @@ pub(crate) mod fixtures;
 // constructors and digests cannot be substituted by test executable paths.
 enum Image {
     Original(Arc<PinnedImage>),
+    SchemaExport(Arc<PinnedImage>),
     #[cfg(debug_assertions)]
     Fixture(Arc<fixtures::FixtureImage>, fixtures::Mode),
 }
 impl Image {
     fn path(&self) -> &Path {
         match self {
-            Self::Original(image) => image.path(),
+            Self::Original(image) | Self::SchemaExport(image) => image.path(),
             #[cfg(debug_assertions)]
             Self::Fixture(image, _) => image.path(),
         }
@@ -74,6 +76,13 @@ impl Image {
     fn args(&self) -> &'static [&'static str] {
         match self {
             Self::Original(image) => image.kind().args(),
+            Self::SchemaExport(_) => &[
+                "app-server",
+                "generate-json-schema",
+                "--experimental",
+                "--out",
+                "schema-output",
+            ],
             #[cfg(debug_assertions)]
             Self::Fixture(_, mode) => mode.args(),
         }
@@ -287,12 +296,49 @@ pub(crate) struct Session {
     observed_pending_write: bool,
 }
 
+#[cfg(all(debug_assertions, feature = "native-fixtures"))]
+pub(crate) struct FixtureBrowserReceipt {
+    stamp: SessionStamp,
+}
 impl Session {
+    #[cfg(all(debug_assertions, feature = "native-fixtures"))]
+    pub(crate) fn fixture_browser_receipt(&self) -> Option<FixtureBrowserReceipt> {
+        matches!(self._image, Image::Fixture(_, fixtures::Mode::Browser(_))).then(|| {
+            FixtureBrowserReceipt {
+                stamp: self.write_stamp.clone(),
+            }
+        })
+    }
+    #[cfg(all(debug_assertions, feature = "native-fixtures"))]
+    pub(crate) fn owns_fixture_browser(&self, receipt: &FixtureBrowserReceipt) -> bool {
+        matches!(self._image, Image::Fixture(_, fixtures::Mode::Browser(_)))
+            && self.write_stamp.same(&receipt.stamp)
+    }
+    pub(crate) fn owns_original_image(&self, expected: &Arc<PinnedImage>) -> bool {
+        match &self._image {
+            Image::Original(image) => Arc::ptr_eq(image, expected),
+            Image::SchemaExport(_) => false,
+            #[cfg(debug_assertions)]
+            Image::Fixture(..) => false,
+        }
+    }
+
     pub(crate) fn spawn(
         image: Arc<PinnedImage>,
         runtime: Arc<RuntimePaths>,
     ) -> Result<Self, Fault> {
         Self::spawn_image(Image::Original(image), runtime)
+    }
+
+    /// Fixed full-CLI data exporter only; cwd/output are owned disposable paths.
+    pub(crate) fn spawn_schema_export(
+        image: Arc<PinnedImage>,
+        runtime: Arc<RuntimePaths>,
+    ) -> Result<Self, Fault> {
+        if image.kind() != crate::pin::ImageKind::Cli {
+            return Err(Fault::InvalidRuntime);
+        }
+        Self::spawn_image(Image::SchemaExport(image), runtime)
     }
 
     fn spawn_image(image: Image, runtime: Arc<RuntimePaths>) -> Result<Self, Fault> {
@@ -498,6 +544,20 @@ impl Session {
             self.write_sequence,
             operation,
         ))
+    }
+    pub(crate) fn reserve_browser_input(
+        &mut self,
+        operation: TurnOperation,
+    ) -> Result<BrowserInputIntent, Fault> {
+        if self.settled {
+            return Err(Fault::UnexpectedExit);
+        }
+        self.write_sequence = self.write_sequence.checked_add(1).ok_or(Fault::Writer)?;
+        BrowserInputIntent::new(self.write_stamp.clone(), self.write_sequence, operation)
+            .ok_or(Fault::Writer)
+    }
+    pub(crate) fn reject_browser_input(&self, intent: BrowserInputIntent) -> Option<UnsentTurn> {
+        intent.reject(&self.write_stamp, self.write_sequence)
     }
     /// This proves no turn-frame handoff, not that prior thread preparation or
     /// original process custody has settled. The caller must retain those gates.
@@ -778,7 +838,14 @@ impl Session {
 
     /// Close stdin, then require the process, descendant job and pipe writer to
     /// finish. A forced cleanup is an error, never graceful success.
-    pub(crate) fn finish(mut self, deadline: Instant) -> Result<Exit, Fault> {
+    pub(crate) fn finish(self, deadline: Instant) -> Result<Exit, Fault> {
+        self.finish_cancellable(deadline, &AtomicBool::new(false))
+    }
+    pub(crate) fn finish_cancellable(
+        mut self,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<Exit, Fault> {
         if self.settled {
             // A prior transport fault already forced cleanup. Ignoring that
             // fault cannot turn a later finish into a graceful receipt.
@@ -786,6 +853,9 @@ impl Session {
         }
         self.stdin.take();
         loop {
+            if cancel.load(Ordering::Acquire) {
+                return self.fail(Fault::Cancelled);
+            }
             if Instant::now() >= deadline {
                 return self.fail(Fault::Timeout);
             }

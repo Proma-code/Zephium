@@ -1,15 +1,16 @@
 <script lang="ts">
-  import { type CodexSession, codexStatus, codexFault } from "$domain/codex";
+  import { type CodexSession, codexStatus, codexFault, codexCapability } from "$domain/codex";
   import Button from "$shared/ui/Button";
   import CodexQuota from "./CodexQuota.svelte";
   import * as m from "$shared/i18n/messages";
   let { session }: { session: CodexSession } = $props();
   const view = $derived(session.view);
+  const capability = $derived(codexCapability(view));
 </script>
 
 <div class="codex-connection">
   <p class="status" aria-live="polite">{codexStatus(view)}</p>
-  <p>{m.codex_picker_text_only()}</p>
+  {#if capability}<p>{capability}</p>{/if}
   {#if view?.page_selected}<p>{m.codex_selected()}</p>{/if}
   {#if view?.state === "signed_out" || view?.state === "unavailable"}<p>{m.codex_consent()}</p>{/if}
   <div class="actions">

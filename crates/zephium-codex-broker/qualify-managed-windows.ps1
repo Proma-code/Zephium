@@ -53,6 +53,17 @@ Assert-Receipts $output @(
     'codex-owner-unsent-skip-ack-unknown',
     'codex-owner-preparation-ack-unknown'
 )
+$output=@(& $fixture browser-owner); $code=$LASTEXITCODE; $output | Write-Output
+if ($code -ne 0) { throw 'Synthetic Browser actor qualification failed.' }
+Assert-Receipts $output @(
+    'codex-browser-fixture-session-mode-bound',
+    'codex-browser-two-turns-same-thread',
+    'codex-browser-cold-store-same-thread',
+    'codex-browser-input-cancel-skip-next-turn',
+    'codex-browser-terminal-revocation-local-drain',
+    'codex-browser-local-receipt-loss-quarantined',
+    'codex-browser-duplicate-request-no-effect'
+)
 $output=@(& $fixture quota); $code=$LASTEXITCODE; $output | Write-Output
 if ($code -ne 0) { throw 'Synthetic observational quota qualification failed.' }
 Assert-Receipts $output @(
@@ -121,6 +132,12 @@ foreach ($pin in $pins) {
     $output | Write-Output
     if ($code -ne 0) { throw 'Original adjacent runtime compatibility qualification failed.' }
     Assert-Receipts $output @("codex-compatibility-$($pin.Version)")
+    $output=@(& $fixture browser-schema $pin.Version $path)
+    $code=$LASTEXITCODE
+    $output | Write-Output
+    if ($code -ne 0) { throw 'Original fixed experimental Browser schema qualification failed.' }
+    Assert-Receipts $output @("codex-browser-schema-$($pin.Version)")
 }
 # This proves startup/config/account absence and physical teardown for both
-# releases, not real login, model responses or cross-version authenticated turns.
+# releases plus same-image experimental Browser schema export/cleanup, not real
+# login, model responses, Page effects or cross-version authenticated turns.

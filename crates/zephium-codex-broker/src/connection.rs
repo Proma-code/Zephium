@@ -28,6 +28,15 @@ use std::{
     time::{Duration, Instant},
 };
 use zephium_core::codex_store as durable;
+mod browser_api;
+pub use crate::browser_owner::LocalOutcome as BrowserLocalOutcome;
+pub use crate::connection_events::{ConversationKey, Event, ScopedEvent};
+use browser_api::BrowserAttempt;
+pub use browser_api::{
+    BrowserCommit, BrowserDraft, BrowserQuarantine, BrowserStartFailure, PreparedBrowser,
+    RejectedBrowser, RejectedBrowserSettled,
+};
+
 pub use zephium_provider_accounts::codex::{AccountState, LoginUrl};
 /// The trusted native adapter binds one Store actor and profile at construction.
 /// Renderer data cannot select a database, profile, grant, or durability receipt.
@@ -68,17 +77,7 @@ pub enum Fault {
     HistoryUncertain,
     HistoryDiverged,
     PersistenceUnavailable,
-}
-/// A native Page conversation key, not a provider thread ID or resumed history.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct ConversationKey(String);
-impl ConversationKey {
-    pub fn from_native(value: String) -> Option<Self> {
-        durable::valid_conversation(&value).then_some(Self(value))
-    }
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+    HistoryPolicy,
 }
 /// Retained native cancellation and selection generation. A renderer cannot
 /// construct this through IPC; the owning actor supplies its exact live atomics.
@@ -131,35 +130,6 @@ pub struct TextRequest {
     pub effort: EffortSelection,
     pub text: String,
 }
-pub enum Event {
-    Account(AccountState),
-    OpenBrowser(LoginUrl),
-    Catalog(Catalog),
-    Quota(QuotaView),
-    Conversation(conversation::Event),
-    /// Original terminal is known, but durable continuation acknowledgement is not.
-    HistoryUncertain(conversation::TurnResult),
-    /// No model-frame handoff, exact durable Skip, and all preparation closed.
-    NeverStarted {
-        reply: u64,
-    },
-}
-pub struct ScopedEvent {
-    scope: Scope,
-    conversation: Option<ConversationKey>,
-    event: Event,
-}
-impl ScopedEvent {
-    pub fn scope(&self) -> &Scope {
-        &self.scope
-    }
-    pub fn conversation(&self) -> Option<&ConversationKey> {
-        self.conversation.as_ref()
-    }
-    pub fn into_event(self) -> Event {
-        self.event
-    }
-}
 enum PendingKind {
     Account,
     Quota(quota::QuotaPending),
@@ -171,8 +141,10 @@ struct Pending {
     deadline: Instant,
 }
 struct Prompt {
+    policy: durable::ConversationPolicy,
     operation: TurnOperation,
     intent: Option<TurnIntent>,
+    browser_intent: Option<windows::BrowserInputIntent>,
     unsent: Option<windows::MatchedUnsent>,
     acknowledged_revision: Option<u64>,
     admission: TextAdmission,
@@ -190,6 +162,9 @@ struct StoreBinding {
     scope: durable::Scope,
 }
 pub struct Connection {
+    owner_stamp: Arc<()>,
+    browser_capability: Option<crate::browser_capability::BrowserCapability>,
+    browser: Option<BrowserAttempt>,
     release_version: Option<String>,
     projection: ConfigProjection,
     scope: Scope,
@@ -252,8 +227,23 @@ impl NativePreparation {
 }
 /// A native-held authenticated image that passed the exact production semantic
 /// startup policy in a fresh signed-out disposable home. No account home was open.
-pub(crate) struct CompatibleImage(Arc<crate::PinnedImage>);
+pub(crate) struct CompatibleImage(
+    Arc<crate::PinnedImage>,
+    Option<crate::browser_capability::BrowserCapability>,
+);
 impl CompatibleImage {
+    fn with_browser(mut self, deadline: Instant, cancel: &AtomicBool) -> Result<Self, Fault> {
+        self.1 =
+            crate::browser_capability::BrowserCapability::probe(self.0.clone(), deadline, cancel)
+                .map_err(|fault| match fault {
+                crate::browser_capability::Fault::Cancelled => Fault::Cancelled,
+                crate::browser_capability::Fault::Expired => Fault::Timeout,
+                crate::browser_capability::Fault::Setup => Fault::Profile,
+                crate::browser_capability::Fault::Custody => Fault::Transport,
+                crate::browser_capability::Fault::Output => Fault::UnsupportedRuntime,
+            })?;
+        Ok(self)
+    }
     pub(crate) fn prepare(
         image: Arc<crate::PinnedImage>,
         deadline: Instant,
@@ -271,7 +261,7 @@ impl CompatibleImage {
         result?;
         cleanup?;
         check(deadline, cancel)?;
-        Ok(Self(image))
+        Ok(Self(image, None))
     }
 }
 impl Connection {
@@ -360,6 +350,12 @@ impl Connection {
         preparation.check(cancel)?;
         let prepared = CompatibleImage::prepare(detected.into_image(), deadline, cancel)?;
         preparation.check(cancel)?;
+        let prepared = if preparation.removal.is_none() {
+            prepared.with_browser(deadline, cancel)?
+        } else {
+            prepared
+        };
+        preparation.check(cancel)?;
         // No authenticated profile or OS credential target is touched until the
         // exact retained image passed the disposable production-policy probe.
         crate::vault_probe::verify().map_err(|_| Fault::Vault)?;
@@ -440,6 +436,7 @@ impl Connection {
         let preparation = preparation.next_rpc();
         let release_version = prepared.0.version().to_owned();
         let projection = prepared.0.projection();
+        let browser_capability = prepared.1;
         let session = Session::spawn(prepared.0, Arc::clone(&runtime)).map_err(transport)?;
         preparation.check(cancel)?;
         let mut connection = Self::bootstrap_session(
@@ -455,6 +452,7 @@ impl Connection {
             cancel,
         )?;
         connection.release_version = Some(release_version);
+        connection.browser_capability = browser_capability;
         Ok(connection)
     }
     fn bootstrap_session(
@@ -471,6 +469,9 @@ impl Connection {
         let account =
             policy_handshake(&mut session, &runtime, &scope, projection, deadline, cancel)?;
         let mut connection = Self {
+            owner_stamp: Arc::new(()),
+            browser_capability: None,
+            browser: None,
             release_version: None,
             projection,
             scope: scope.clone(),
@@ -540,7 +541,8 @@ impl Connection {
         }
     }
     fn idle(&self) -> Result<(), Fault> {
-        if self.active.is_some()
+        if self.browser.is_some()
+            || self.active.is_some()
             || self
                 .pending
                 .values()
@@ -663,7 +665,7 @@ impl Connection {
             self.quota_owner.invalidate(false);
             self.catalog = None;
             self.catalog_builder = None;
-            if self.active.is_some() || self.prompt.is_some() {
+            if self.active.is_some() || self.prompt.is_some() || self.browser.is_some() {
                 return self.fail(Fault::NotConnected);
             }
         }
@@ -860,13 +862,20 @@ impl Connection {
         }
         let loaded = match self.associations.call(durable::Call::Load {
             scope: self.association_scope,
+            policy: durable::ConversationPolicy::TextOnlyLegacy,
             conversation: key.0.clone(),
         }) {
             durable::Reply::Association(value) => value,
             durable::Reply::Failed(durable::Fault::StaleGrant) => return Err(Fault::ScopeChanged),
+            durable::Reply::Failed(durable::Fault::PolicyMismatch) => {
+                return Err(Fault::HistoryPolicy)
+            }
             _ => return self.fail(Fault::PersistenceUnavailable),
         };
         if let Some(record) = loaded {
+            if record.policy != durable::ConversationPolicy::TextOnlyLegacy {
+                return Err(Fault::HistoryPolicy);
+            }
             self.validate_record(&key, &record)?;
             let recorded_previous = match record.dispatch {
                 durable::Dispatch::Ready => None,
@@ -947,8 +956,10 @@ impl Connection {
         let now = Instant::now();
         self.notification_frames = 0;
         self.prompt = Some(Prompt {
+            policy: durable::ConversationPolicy::TextOnlyLegacy,
             operation,
             intent: Some(intent),
+            browser_intent: None,
             unsent: None,
             acknowledged_revision,
             admission,
@@ -999,13 +1010,13 @@ impl Connection {
         if prompt.unsent.is_some() {
             return Ok(());
         }
-        let intent = prompt.intent.take().ok_or(Fault::Protocol)?;
-        let proof = self
-            .session
-            .as_ref()
-            .ok_or(Fault::Closed)?
-            .reject_intent(intent)
-            .ok_or(Fault::Protocol)?;
+        let session = self.session.as_ref().ok_or(Fault::Closed)?;
+        let proof = if let Some(intent) = prompt.browser_intent.take() {
+            session.reject_browser_input(intent)
+        } else {
+            session.reject_intent(prompt.intent.take().ok_or(Fault::Protocol)?)
+        }
+        .ok_or(Fault::Protocol)?;
         prompt.unsent = Some(proof.consume(&prompt.operation).ok_or(Fault::Protocol)?);
         prompt.text = None;
         Ok(())
@@ -1043,11 +1054,22 @@ impl Connection {
             &key,
             durable::Call::Skip {
                 scope: self.association_scope,
+                policy: self.prompt.as_ref().ok_or(Fault::Protocol)?.policy,
                 conversation: key.0.clone(),
                 expected_revision,
                 reply,
             },
         )?;
+        if let Some(browser) = &mut self.browser {
+            browser
+                .owner
+                .close_admission(Some(crate::browser_port::BrowserRevokeReason::Cancelled))
+                .map_err(|_| Fault::Protocol)?;
+            browser
+                .owner
+                .original_settled()
+                .map_err(|_| Fault::Protocol)?;
+        }
         self.prompt = None;
         self.active = None;
         self.closing_deadline = None;
@@ -1109,18 +1131,24 @@ impl Connection {
                 &key,
                 durable::Call::Begin {
                     scope: self.association_scope,
+                    policy: self.prompt.as_ref().ok_or(Fault::Protocol)?.policy,
                     conversation: key.0.clone(),
                     expected_revision,
                     reply,
                 },
             )?;
             self.check_prompt_scope(cancel)?;
-            let fence = self
+            let mut fence = self
                 .prompt
                 .as_ref()
                 .ok_or(Fault::Protocol)?
                 .admission
                 .writer_fence();
+            if let Some(browser) = &self.browser {
+                fence = fence
+                    .with_browser_budget(browser.owner.budget())
+                    .ok_or(Fault::Protocol)?;
+            }
             self.pending.insert(
                 id,
                 Pending {
@@ -1165,13 +1193,31 @@ impl Connection {
                 .as_mut()
                 .map(|p| &mut p.text)
                 .unwrap_or(&mut empty);
-            let message = wire::command(
+            let mut message = wire::command(
                 &command,
                 path(self.runtime.as_ref().ok_or(Fault::Closed)?.cwd())?,
                 prepared,
                 self.projection,
             )
             .map_err(|_| Fault::Policy)?;
+            if preparation {
+                if let Some(browser) = &self.browser {
+                    let params = message
+                        .get_mut("params")
+                        .and_then(Value::as_object_mut)
+                        .ok_or(Fault::Policy)?;
+                    params.insert(
+                        "developerInstructions".into(),
+                        Value::String(browser.owner.manifest().instructions().into()),
+                    );
+                    if matches!(command, Command::StartThread { .. }) {
+                        params.insert(
+                            "dynamicTools".into(),
+                            browser.owner.manifest().tools().wire().clone(),
+                        );
+                    }
+                }
+            }
             self.pending.insert(
                 id,
                 Pending {
@@ -1207,7 +1253,7 @@ impl Connection {
         if prompt.unsent.is_some() {
             return Ok(());
         }
-        if prompt.intent.is_some() {
+        if prompt.intent.is_some() || prompt.browser_intent.is_some() {
             let phase = self.conversations.get(&key).ok_or(Fault::Protocol)?.phase();
             if matches!(phase, Phase::New | Phase::Closed) {
                 self.reject_local_intent()?;
@@ -1288,6 +1334,7 @@ impl Connection {
                             &key,
                             durable::Call::Bind {
                                 scope: self.association_scope,
+                                policy: self.prompt.as_ref().ok_or(Fault::Protocol)?.policy,
                                 conversation: key.0.clone(),
                                 thread_id: thread_id.clone(),
                                 expected_revision: self
@@ -1326,6 +1373,24 @@ impl Connection {
                     self.send_command(command, Instant::now() + RPC, cancel)?;
                 }
                 conversation::Event::TurnStarted { turn_id } => {
+                    if let Some(browser) = &mut self.browser {
+                        let thread = self
+                            .conversations
+                            .get(&key)
+                            .and_then(Conversation::thread_id)
+                            .ok_or(Fault::Protocol)?;
+                        let binding = crate::dynamic_tools::TurnBinding::new(
+                            self.scope.clone(),
+                            self.association_scope.grant_epoch,
+                            key.0.clone(),
+                            browser.reply,
+                            thread.to_owned(),
+                            turn_id.clone(),
+                            browser.owner.manifest().tools(),
+                        )
+                        .map_err(|_| Fault::Protocol)?;
+                        browser.owner.bind(binding).map_err(|_| Fault::Protocol)?;
+                    }
                     let record = self
                         .records
                         .get(&key)
@@ -1335,6 +1400,7 @@ impl Connection {
                         &key,
                         durable::Call::RecordTurn {
                             scope: self.association_scope,
+                            policy: self.prompt.as_ref().ok_or(Fault::Protocol)?.policy,
                             conversation: key.0.clone(),
                             expected_revision: record.revision,
                             reply,
@@ -1343,6 +1409,12 @@ impl Connection {
                     )?;
                 }
                 conversation::Event::Terminal(result) => {
+                    if let Some(browser) = &mut self.browser {
+                        browser
+                            .owner
+                            .close_admission(None)
+                            .map_err(|_| Fault::Protocol)?;
+                    }
                     let outcome = match result.outcome {
                         conversation::Outcome::Completed => durable::Terminal::Completed,
                         conversation::Outcome::Interrupted => durable::Terminal::Interrupted,
@@ -1360,6 +1432,7 @@ impl Connection {
                         &key,
                         durable::Call::Settle {
                             scope: self.association_scope,
+                            policy: self.prompt.as_ref().ok_or(Fault::Protocol)?.policy,
                             conversation: key.0.clone(),
                             expected_revision: record.revision,
                             reply,
@@ -1377,6 +1450,12 @@ impl Connection {
                     self.closing_deadline = Some(Instant::now() + RPC);
                 }
                 conversation::Event::Closed { .. } => {
+                    if let Some(browser) = &mut self.browser {
+                        browser
+                            .owner
+                            .original_settled()
+                            .map_err(|_| Fault::Protocol)?;
+                    }
                     if self.prompt.as_ref().is_some_and(|p| p.unsent.is_some()) {
                         self.finish_unsent()?;
                         out.append(&mut self.ready_events);
@@ -1437,15 +1516,7 @@ impl Connection {
             Err(fault) => {
                 // A failed connection must not deliver an undispatched browser
                 // URL or re-authorize account/catalog readiness from this batch.
-                observed.retain(|event| {
-                    matches!(
-                        event.event,
-                        Event::Conversation(_)
-                            | Event::HistoryUncertain(_)
-                            | Event::NeverStarted { .. }
-                    )
-                });
-                wire::preserve_observed(observed, &mut self.failure_events);
+                crate::connection_events::preserve_failure(observed, &mut self.failure_events);
                 self.fail(fault)
             }
         }
@@ -1453,6 +1524,16 @@ impl Connection {
     fn poll_inner(&mut self, cancel: &AtomicBool, out: &mut Vec<ScopedEvent>) -> Result<(), Fault> {
         self.quota_tick();
         let mut deadline = self.deadline;
+        if let Some(browser) = &self.browser {
+            if !browser.owner.draining() {
+                deadline = deadline.min(
+                    browser
+                        .owner
+                        .deadline(Instant::now())
+                        .map_err(|_| Fault::Timeout)?,
+                );
+            }
+        }
         if let Some(setup) = &self.removal_setup {
             setup.current()?;
             deadline = deadline.min(setup.deadline);
@@ -1479,6 +1560,7 @@ impl Connection {
             }
         }
         check(deadline, cancel)?;
+        self.browser_input(cancel)?;
         if self
             .prompt
             .as_ref()
@@ -1498,6 +1580,15 @@ impl Connection {
             else {
                 break;
             };
+            let dynamic = self.browser_request(&bytes);
+            if matches!(dynamic, Ok(true)) {
+                bytes.fill(0);
+                continue;
+            }
+            if let Err(fault) = dynamic {
+                bytes.fill(0);
+                return Err(fault);
+            }
             let incoming = wire::decode(&bytes);
             bytes.fill(0);
             match incoming.map_err(|f| {
@@ -1513,6 +1604,10 @@ impl Connection {
                 }
             }
         }
+        // Authentic no-send/terminal facts precede the dual settlement that can
+        // release their exact caller slot, including cancellation before input.
+        out.append(&mut self.ready_events);
+        self.browser_pump(cancel, out)?;
         self.schedule_quota(cancel)?;
         self.publish_quota();
         out.append(&mut self.ready_events);
@@ -1651,7 +1746,7 @@ impl Connection {
     fn notification(
         &mut self,
         method: &str,
-        params: Value,
+        mut params: Value,
         cancel: &AtomicBool,
         out: &mut Vec<ScopedEvent>,
     ) -> Result<(), Fault> {
@@ -1666,6 +1761,41 @@ impl Connection {
         if method == "account/rateLimits/updated" {
             self.quota_notification(&params);
             return Ok(());
+        }
+        if let Some(browser) = &self.browser {
+            if let Some((thread, turn)) = self.settled_turns.values().find(|(thread, turn)| {
+                params.get("threadId").and_then(Value::as_str) == Some(thread.as_str())
+                    && params.get("turnId").and_then(Value::as_str) == Some(turn.as_str())
+            }) {
+                if browser
+                    .owner
+                    .late_lifecycle(method, &params, thread, turn)
+                    .map_err(|_| Fault::Protocol)?
+                {
+                    return Ok(());
+                }
+            }
+        }
+        if let Some(browser) = &mut self.browser {
+            browser
+                .owner
+                .observe_item_identity(method, &params)
+                .map_err(|_| Fault::Protocol)?;
+            if browser
+                .owner
+                .lifecycle(method, &params)
+                .map_err(|_| Fault::Protocol)?
+            {
+                return Ok(());
+            }
+        }
+        if method == "turn/completed" {
+            if let Some(browser) = &self.browser {
+                browser
+                    .owner
+                    .project_terminal(&mut params)
+                    .map_err(|_| Fault::Protocol)?;
+            }
         }
         let classified =
             wire::classify_notification(method, &params).map_err(|fault| match fault {
@@ -1798,6 +1928,7 @@ impl Connection {
         record: &durable::Association,
     ) -> Result<(), Fault> {
         if record.scope != self.association_scope
+            || !record.policy.valid()
             || record.conversation != key.0
             || record.revision == 0
             || record.revision > i64::MAX as u64
@@ -1841,6 +1972,24 @@ impl Connection {
         if call_revision != prior_revision {
             return self.fail(Fault::PersistenceUnavailable);
         }
+        let expected_policy = match &call {
+            durable::Call::Bind { policy, .. }
+            | durable::Call::Skip { policy, .. }
+            | durable::Call::Begin { policy, .. }
+            | durable::Call::RecordTurn { policy, .. }
+            | durable::Call::Settle { policy, .. } => *policy,
+            _ => return self.fail(Fault::PersistenceUnavailable),
+        };
+        if previous
+            .as_ref()
+            .is_some_and(|prior| prior.policy != expected_policy)
+            || self
+                .prompt
+                .as_ref()
+                .is_some_and(|prompt| prompt.policy != expected_policy)
+        {
+            return self.fail(Fault::PersistenceUnavailable);
+        }
         let expected = call.clone();
         let record = match self.associations.call(call) {
             durable::Reply::Association(Some(r)) => r,
@@ -1848,6 +1997,7 @@ impl Connection {
         };
         let next = prior_revision.unwrap_or(0).checked_add(1);
         let exact = Some(record.revision) == next
+            && record.policy == expected_policy
             && match expected {
                 durable::Call::Bind { thread_id, .. } => {
                     record.thread_id.as_ref() == Some(&thread_id)
@@ -1924,6 +2074,11 @@ impl Connection {
         Ok(std::mem::take(&mut self.failure_events))
     }
     fn fail<T>(&mut self, fault: Fault) -> Result<T, Fault> {
+        if let Some(browser) = &mut self.browser {
+            let _ = browser
+                .owner
+                .close_admission(Some(browser_api::revoke_reason(fault)));
+        }
         if let Some(key) = self.active.take() {
             if let Some(conversation) = self.conversations.get_mut(&key) {
                 if let Ok(events) = conversation.transport_lost(&self.scope) {
@@ -1948,6 +2103,9 @@ impl Connection {
         let _ = self.account.close(&self.scope);
         // Dropping Session blocks until original process/job/writer settle.
         drop(self.session.take());
+        if let Some(browser) = &mut self.browser {
+            let _ = browser.owner.original_settled();
+        }
         Err(fault)
     }
     pub fn close(mut self) -> Result<(), Fault> {
@@ -2226,6 +2384,8 @@ fn managed_fault(fault: managed_account::Fault) -> Fault {
     }
 }
 
+#[cfg(all(debug_assertions, feature = "native-fixtures"))]
+pub(crate) mod browser_fixtures;
 #[cfg(all(debug_assertions, feature = "native-fixtures"))]
 pub(crate) mod fixture_peer;
 #[cfg(all(debug_assertions, feature = "native-fixtures"))]

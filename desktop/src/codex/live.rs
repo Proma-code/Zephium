@@ -1,6 +1,12 @@
 //! One native worker owns each profile's original process and all pending calls.
-use super::admission;
+use super::admission::{self, Settling};
 use super::delivery::ReplyDelivery;
+#[path = "browser.rs"]
+mod browser;
+#[path = "browser_reservation.rs"]
+mod browser_reservation;
+#[path = "browser_worker.rs"]
+mod browser_worker;
 #[path = "removal.rs"]
 mod removal;
 use super::*;
@@ -47,6 +53,7 @@ struct Service {
     selection_revision: AtomicU64,
     queue: admission::Queue<Command>,
     settling: Mutex<Option<Settling>>,
+    browser_quarantine: Mutex<Vec<browser_worker::Quarantine>>,
     join: Mutex<Option<JoinHandle<()>>>,
     removal: Mutex<Option<Arc<removal::Operation>>>,
 }
@@ -63,6 +70,7 @@ enum Command {
     Removal(Arc<removal::Operation>),
     RemovalLocal(removal::LocalRequest),
     Select(Box<SelectionCall>),
+    PrepareBrowser(Box<browser_reservation::Prepare>),
     Reply(ReplyCall),
 }
 struct SelectionCall {
@@ -71,11 +79,6 @@ struct SelectionCall {
     deadline: Instant,
     result: tokio::sync::oneshot::Sender<Result<page_choice::Reply, CodexFaultV1>>,
 }
-struct Settling {
-    conversation: String,
-    reply: u32,
-    _turn: admission::Turn,
-}
 struct ReplyCall {
     turn: Option<admission::Turn>,
     account_revision: u64,
@@ -83,9 +86,44 @@ struct ReplyCall {
     selection: CodexSelectionV1,
     events: NativeConversationEvents,
     cancel: Arc<AtomicBool>,
-    result: tokio::sync::oneshot::Sender<ReplyDelivery<NativeConversationOutcome>>,
+    result: ReplySink,
+    browser: Option<Box<browser_reservation::Start>>,
 }
+/// Text and Browser completion contracts cannot be silently interchanged.
+/// Only the exact dual receipt or explicit quarantine path constructs Browser
+/// completion; a provider terminal alone remains retained in Active.
+enum ReplySink {
+    Text(tokio::sync::oneshot::Sender<ReplyDelivery<NativeConversationOutcome>>),
+    Browser(tokio::sync::oneshot::Sender<ReplyDelivery<NativeBrowserCompletion>>),
+}
+impl ReplySink {
+    fn send(self, value: ReplyDelivery<NativeConversationOutcome>) -> Result<(), ()> {
+        match self {
+            Self::Text(sender) => sender.send(value).map_err(|_| ()),
+            Self::Browser(sender) => {
+                let fault = match value {
+                    ReplyDelivery::Failed(fault) => fault,
+                    ReplyDelivery::Settled(_) => PageAssistNativeFaultV1::Protocol,
+                };
+                sender.send(ReplyDelivery::Failed(fault)).map_err(|_| ())
+            }
+        }
+    }
+    fn browser(self, value: NativeBrowserCompletion) {
+        match self {
+            Self::Browser(sender) => {
+                let _ = sender.send(ReplyDelivery::Settled(value));
+            }
+            Self::Text(sender) => {
+                let _ = sender.send(ReplyDelivery::Failed(PageAssistNativeFaultV1::Protocol));
+            }
+        }
+    }
+}
+
 struct Active {
+    browser: bool,
+    delivery: Option<ReplyDelivery<NativeConversationOutcome>>,
     call: ReplyCall,
     items: HashMap<String, String>,
     cancel_sent: bool,
@@ -133,11 +171,11 @@ impl Registry {
             {
                 return Ok(service.clone());
             }
-            if !service.done.load(Ordering::Acquire) {
+            if !service.fully_settled() {
                 return Err(CodexFaultV1::Busy);
             }
         }
-        services.retain(|_, service| !service.done.load(Ordering::Acquire));
+        services.retain(|_, service| !service.fully_settled());
         if services.len() >= 64 {
             return Err(CodexFaultV1::Busy);
         }
@@ -167,6 +205,7 @@ impl Registry {
             selection_revision: AtomicU64::new(u64::MAX),
             queue,
             settling: Mutex::new(None),
+            browser_quarantine: Mutex::new(Vec::new()),
             join: Mutex::new(None),
             removal: Mutex::new(removal),
         });
@@ -182,17 +221,7 @@ impl Registry {
                         worker(&owned, &registry, receiver)
                     }
                 }));
-                if result.is_err() {
-                    set_fault(&owned, CodexFaultV1::Unavailable);
-                }
-                // worker has returned/unwound: its Connection has physically
-                // closed before any actor-held turn slot can be released.
-                owned
-                    .settling
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take();
-                owned.done.store(true, Ordering::Release);
+                worker_returned(&owned, result.is_err());
                 notify_models(&owned, &registry);
             })
             .map_err(|_| CodexFaultV1::Unavailable)?;
@@ -204,7 +233,77 @@ impl Registry {
         Ok(service)
     }
 }
+/// Called only after the owned worker returned or unwound. Original physical
+/// teardown is not proof that a committed Browser Page effect returned.
+fn worker_returned(service: &Service, panicked: bool) {
+    if panicked {
+        set_fault(
+            service,
+            if service.queue.browser_occupied() {
+                CodexFaultV1::RecoveryRequired
+            } else {
+                CodexFaultV1::Unavailable
+            },
+        );
+    }
+    admission::release_text_after_close(
+        &mut service.settling.lock().unwrap_or_else(|e| e.into_inner()),
+    );
+    service.done.store(true, Ordering::Release);
+}
+
+/// The same transfer runs in both the ordinary and retired queue drains. It
+/// never discards a different held turn or reconstructs a token from a reply ID.
+fn adopt_reply_turn(service: &Service, call: &mut ReplyCall) -> bool {
+    let mut held = service.settling.lock().unwrap_or_else(|e| e.into_inner());
+    if held.is_some() {
+        return false;
+    }
+    *held = call
+        .turn
+        .take()
+        .map(|turn| Settling::new(call.request.conversation.clone(), call.request.reply, turn));
+    held.is_some()
+}
+
+/// Browser presentation waits for the exact dual settlement. Page closes its
+/// request receiver and supplies local receipt independently, so this cannot
+/// deadlock entered effects. Text retains its existing terminal delivery.
+fn deliver_outcome(active: &mut Option<Active>, outcome: NativeConversationOutcome) {
+    if let Some(current) = active.as_mut().filter(|current| current.browser) {
+        if !matches!(current.delivery, Some(ReplyDelivery::Settled(_))) {
+            current.delivery = Some(ReplyDelivery::Settled(outcome));
+        }
+    } else if let Some(current) = active.take() {
+        let _ = current.call.result.send(ReplyDelivery::Settled(outcome));
+    }
+}
+
+fn deliver_failure(active: &mut Option<Active>, fault: PageAssistNativeFaultV1) {
+    if let Some(current) = active.as_mut().filter(|current| current.browser) {
+        if current.delivery.is_none() {
+            current.delivery = Some(ReplyDelivery::Failed(fault));
+        }
+    } else if let Some(current) = active.take() {
+        let _ = current.call.result.send(ReplyDelivery::Failed(fault));
+    }
+}
+
 impl Service {
+    /// A finished worker is not an absent owner while a Browser local effect
+    /// lacks its actual settlement receipt. A lost receipt quarantines the slot.
+    fn fully_settled(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+            && !self.queue.browser_occupied()
+            && self
+                .browser_quarantine
+                .lock()
+                .is_ok_and(|held| held.is_empty())
+            && self.settling.lock().is_ok_and(|held| {
+                held.as_ref()
+                    .is_none_or(|value| !value.has_local_obligation())
+            })
+    }
     fn advance_revision(&self) -> bool {
         self.account_revision
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
@@ -262,6 +361,7 @@ impl Service {
             || self.account_revision.load(Ordering::Acquire) == 0
         {
             view.quota = Default::default();
+            view.text_only = true;
         }
         view
     }
@@ -302,6 +402,7 @@ fn set_fault(service: &Service, fault: CodexFaultV1) {
             CodexStateV1::Unavailable
         };
         view.models.clear();
+        view.text_only = true;
         view.login_attempt = None;
         view.quota = Default::default();
     }
@@ -333,7 +434,7 @@ fn page_fault(value: Fault) -> PageAssistNativeFaultV1 {
         Fault::Cancelled => PageAssistNativeFaultV1::Cancelled,
         Fault::UnsupportedText => PageAssistNativeFaultV1::UnsupportedInput,
         Fault::HistoryUncertain => PageAssistNativeFaultV1::OutcomeUnknown,
-        Fault::UnknownConversation | Fault::HistoryDiverged => {
+        Fault::UnknownConversation | Fault::HistoryDiverged | Fault::HistoryPolicy => {
             PageAssistNativeFaultV1::HistoryDiverged
         }
         Fault::Limit => PageAssistNativeFaultV1::Limit,
@@ -596,6 +697,8 @@ fn worker(
     }
     let scope = connection.scope().clone();
     let mut active: Option<Active> = None;
+    let mut rejected_browser = None;
+    let mut retired_command = None;
     let mut removal_active: Option<Arc<removal::Operation>> = None;
     let mut models_requested = false;
     let mut published = service.snapshot();
@@ -622,7 +725,10 @@ fn worker(
             }
         }
         if let Some(current) = active.as_mut() {
-            if current.call.cancel.load(Ordering::Acquire) && !current.cancel_sent {
+            if current.delivery.is_none()
+                && current.call.cancel.load(Ordering::Acquire)
+                && !current.cancel_sent
+            {
                 current.cancel_sent = true;
                 if removal::cancel_turn(service, &mut connection, &scope).is_err() {
                     break;
@@ -634,26 +740,21 @@ fn worker(
                 // Receiving transfers local ownership even if the profile was
                 // revoked while queued. Physical teardown precedes release.
                 let occupied = if let Command::Reply(call) = &mut command {
-                    let mut settling = service.settling.lock().unwrap_or_else(|e| e.into_inner());
-                    if settling.is_some() {
-                        true
-                    } else {
-                        *settling = call.turn.take().map(|turn| Settling {
-                            conversation: call.request.conversation.clone(),
-                            reply: call.request.reply,
-                            _turn: turn,
-                        });
-                        settling.is_none()
-                    }
+                    !adopt_reply_turn(service, call)
                 } else {
                     false
                 };
                 let Some(registry) = registry.upgrade().filter(|r| r.current(service)) else {
+                    retired_command = Some(command);
                     break;
                 };
                 let ordinary_retired = service.removal.lock().is_ok_and(|value| value.is_some());
                 let result = match command {
                     Command::RemovalLocal(_) => Err(Fault::Busy),
+                    Command::PrepareBrowser(call) => {
+                        browser_reservation::prepare(service, &mut connection, &scope, *call);
+                        Ok(())
+                    }
                     Command::Removal(operation) => {
                         if operation.profile != service.profile || removal_active.is_some() {
                             Err(Fault::ScopeChanged)
@@ -792,70 +893,84 @@ fn worker(
                         let _ = call.result.send(response);
                         Ok(())
                     }
-                    Command::Reply(call) => {
-                        // Once Page has committed, only the actor may classify
-                        // cancelled/changed input. Never free this turn merely
-                        // because its waiting UI future was dropped.
-                        if occupied || active.is_some() {
-                            let _ = call
-                                .result
-                                .send(ReplyDelivery::Failed(PageAssistNativeFaultV1::Unavailable));
-                            service.request_stop();
-                            Err(Fault::Busy)
+                    Command::Reply(mut call) => {
+                        if let Some(start) = call.browser.take() {
+                            browser_worker::start(
+                                service,
+                                &mut connection,
+                                &scope,
+                                call,
+                                *start,
+                                &mut active,
+                                &mut rejected_browser,
+                            )
                         } else {
-                            let key =
-                                ConversationKey::from_native(call.request.conversation.clone());
-                            match key {
-                                None => {
-                                    let _ = call.result.send(ReplyDelivery::Failed(
-                                        PageAssistNativeFaultV1::Protocol,
-                                    ));
-                                    service.request_stop();
-                                    Err(Fault::Protocol)
-                                }
-                                Some(key) => {
-                                    // Captured natively before Page admits its first message. Never
-                                    // inferred from renderer data or a restarted reply counter.
-                                    let new_conversation = call.request.new_conversation;
-                                    let result = connection.start_text(
-                                        &scope,
-                                        TextRequest {
-                                            reply: u64::from(call.request.reply),
-                                            previous_reply: call
-                                                .request
-                                                .previous_reply
-                                                .map(u64::from),
-                                            admission: TextAdmission::from_native(
-                                                call.cancel.clone(),
-                                                service.account_revision.clone(),
-                                                call.account_revision,
-                                            ),
-                                            key,
-                                            new_conversation,
-                                            model: call.selection.model.clone(),
-                                            effort: selected_effort(call.selection.effort),
-                                            text: call.request.text.clone(),
-                                        },
-                                        &service.stop,
-                                    );
-                                    match result {
-                                        Ok(()) => {
-                                            active = Some(Active {
-                                                call,
-                                                items: HashMap::new(),
-                                                cancel_sent: false,
-                                            });
-                                            Ok(())
-                                        }
-                                        Err(error) => {
-                                            let _ = call
-                                                .result
-                                                .send(ReplyDelivery::Failed(page_fault(error)));
-                                            // A failed actor admission is not a generic
-                                            // local clean token. Retain the turn until
-                                            // this original connection physically closes.
-                                            service.request_stop();
-                                            Err(error)
+                            // Once Page has committed, only the actor may classify
+                            // cancelled/changed input. Never free this turn merely
+                            // because its waiting UI future was dropped.
+                            if occupied || active.is_some() {
+                                let _ = call.result.send(ReplyDelivery::Failed(
+                                    PageAssistNativeFaultV1::Unavailable,
+                                ));
+                                service.request_stop();
+                                Err(Fault::Busy)
+                            } else {
+                                let key =
+                                    ConversationKey::from_native(call.request.conversation.clone());
+                                match key {
+                                    None => {
+                                        let _ = call.result.send(ReplyDelivery::Failed(
+                                            PageAssistNativeFaultV1::Protocol,
+                                        ));
+                                        service.request_stop();
+                                        Err(Fault::Protocol)
+                                    }
+                                    Some(key) => {
+                                        // Captured natively before Page admits its first message. Never
+                                        // inferred from renderer data or a restarted reply counter.
+                                        let new_conversation = call.request.new_conversation;
+                                        let result = connection.start_text(
+                                            &scope,
+                                            TextRequest {
+                                                reply: u64::from(call.request.reply),
+                                                previous_reply: call
+                                                    .request
+                                                    .previous_reply
+                                                    .map(u64::from),
+                                                admission: TextAdmission::from_native(
+                                                    call.cancel.clone(),
+                                                    service.account_revision.clone(),
+                                                    call.account_revision,
+                                                ),
+                                                key,
+                                                new_conversation,
+                                                model: call.selection.model.clone(),
+                                                effort: selected_effort(call.selection.effort),
+                                                text: call.request.text.clone(),
+                                            },
+                                            &service.stop,
+                                        );
+                                        match result {
+                                            Ok(()) => {
+                                                active = Some(Active {
+                                                    browser: false,
+                                                    delivery: None,
+                                                    call,
+                                                    items: HashMap::new(),
+                                                    cancel_sent: false,
+                                                });
+                                                Ok(())
+                                            }
+                                            Err(error) => {
+                                                let _ = call
+                                                    .result
+                                                    .send(ReplyDelivery::Failed(page_fault(error)));
+                                                // A failed actor admission is not a generic
+                                                // local clean token. Retain the turn until
+                                                // this original connection physically closes.
+                                                service.request_stop();
+                                                Err(error)
+                                            }
                                         }
                                     }
                                 }
@@ -891,15 +1006,35 @@ fn worker(
         }
         let (events, poll_fault) = match connection.poll(&scope, &service.stop) {
             Ok(events) => (events, None),
-            Err(error) => (connection.take_failure_events(&scope), Some(error)),
+            Err(error) => (
+                connection.take_failure_events(&scope).unwrap_or_default(),
+                Some(error),
+            ),
         };
         for event in events {
-            if event.scope() != &scope || registry.upgrade().is_none_or(|r| !r.current(service)) {
+            if event.scope() != &scope {
                 service.request_stop();
-                break;
+                continue;
+            }
+            if registry.upgrade().is_none_or(|r| !r.current(service)) {
+                // Historical native receipts are not permission for another
+                // tool/request. Same-pump retirement must not erase a genuine
+                // Browser terminal; Page still checks exact display lifetime.
+                if active.as_ref().is_some_and(|value| value.browser)
+                    || service.queue.browser_occupied()
+                {
+                    browser_worker::historical(service, &scope, &mut active, vec![event]);
+                }
+                service.request_stop();
+                continue;
             }
             let key = event.conversation().map(|key| key.as_str().to_owned());
             match event.into_event() {
+                Event::BrowserSettled { reply, local } => {
+                    if let Some(key) = key.as_deref() {
+                        browser_worker::settled(service, key, reply, local, &mut active);
+                    }
+                }
                 Event::Account(account) => {
                     state(service, account);
                     if account != AccountState::ChatGpt {
@@ -932,21 +1067,21 @@ fn worker(
                             && reply == u64::from(active.call.request.reply)
                     });
                     if matches {
-                        if let Some(current) = active.take() {
-                            let _ = current.call.result.send(ReplyDelivery::Settled(
-                                NativeConversationOutcome {
-                                    status: NativeConversationStatus::NeverStarted,
-                                    final_response: None,
-                                },
-                            ));
-                        }
+                        deliver_outcome(
+                            &mut active,
+                            NativeConversationOutcome {
+                                status: NativeConversationStatus::NeverStarted,
+                                final_response: None,
+                            },
+                        );
                         // This exact broker event requires proof+Skip ACK and
                         // actual prep Closed, or no prep write at all. It is
                         // not minted from the UI cancellation bit.
                         let mut settling =
                             service.settling.lock().unwrap_or_else(|e| e.into_inner());
                         if settling.as_ref().is_some_and(|held| {
-                            Some(held.conversation.as_str()) == key.as_deref()
+                            !held.has_local_obligation()
+                                && Some(held.conversation.as_str()) == key.as_deref()
                                 && u64::from(held.reply) == reply
                         }) {
                             settling.take();
@@ -959,14 +1094,13 @@ fn worker(
                             .as_ref()
                             .map(|active| active.call.request.conversation.as_str())
                     {
-                        if let Some(current) = active.take() {
-                            let _ = current.call.result.send(ReplyDelivery::Settled(
-                                NativeConversationOutcome {
-                                    status: NativeConversationStatus::HistoryUncertain,
-                                    final_response: result.final_response().map(str::to_owned),
-                                },
-                            ));
-                        }
+                        deliver_outcome(
+                            &mut active,
+                            NativeConversationOutcome {
+                                status: NativeConversationStatus::HistoryUncertain,
+                                final_response: result.final_response().map(str::to_owned),
+                            },
+                        );
                     }
                 }
                 Event::Conversation(event) => {
@@ -975,7 +1109,8 @@ fn worker(
                             service.settling.lock().unwrap_or_else(|e| e.into_inner());
                         if active.is_none()
                             && settling.as_ref().is_some_and(|held| {
-                                Some(held.conversation.as_str()) == key.as_deref()
+                                !held.has_local_obligation()
+                                    && Some(held.conversation.as_str()) == key.as_deref()
                             })
                         {
                             // The broker emits Closed only after both original
@@ -1049,9 +1184,7 @@ fn worker(
                                 },
                                 final_response: result.final_response().map(str::to_owned),
                             };
-                            if let Some(current) = active.take() {
-                                let _ = current.call.result.send(ReplyDelivery::Settled(outcome));
-                            }
+                            deliver_outcome(&mut active, outcome);
                         }
                         conversation::Event::TransportLost { .. } => {}
                         _ => {}
@@ -1060,12 +1193,7 @@ fn worker(
             }
         }
         if let Some(error) = poll_fault {
-            if let Some(current) = active.take() {
-                let _ = current
-                    .call
-                    .result
-                    .send(ReplyDelivery::Failed(page_fault(error)));
-            }
+            deliver_failure(&mut active, page_fault(error));
             set_fault(service, fault(error));
             break;
         }
@@ -1099,9 +1227,16 @@ fn worker(
                 }
             }
         }
+        // This comes from the held original Session's sealed schema proof,
+        // never from account Connected, model names, or a caller preference.
+        if let Ok(mut view) = service.view.lock() {
+            view.text_only = !connection.browser_capable(&scope)
+                || service.stop.load(Ordering::Acquire)
+                || service.account_revision.load(Ordering::Acquire) == 0;
+        }
         service.queue.set_ready(
             service.removal.lock().is_ok_and(|value| value.is_none())
-                && connection.can_admit_text(&scope)
+                && connection.can_admit_browser(&scope)
                 && !service.stop.load(Ordering::Acquire)
                 && service.selection_revision.load(Ordering::Acquire) != u64::MAX,
         );
@@ -1111,6 +1246,27 @@ fn worker(
             notify_models(service, registry);
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+    if connection.browser_settlement_pending()
+        || service.queue.browser_occupied()
+        || rejected_browser.is_some()
+    {
+        let Some(drained) = browser_worker::drain(
+            service,
+            registry,
+            &receiver,
+            connection,
+            &scope,
+            &mut active,
+            browser_worker::Exit {
+                rejected: rejected_browser,
+                pending: retired_command,
+            },
+        ) else {
+            notify_models(service, registry);
+            return;
+        };
+        connection = drained;
     }
     if let Some(current) = active.take() {
         let _ = current.call.result.send(ReplyDelivery::Failed(
@@ -1122,11 +1278,9 @@ fn worker(
         removal::finish(registry, &operation, connection);
         service.retire_ordinary();
         set_fault(service, CodexFaultV1::Unavailable);
-        service
-            .settling
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        admission::release_text_after_close(
+            &mut service.settling.lock().unwrap_or_else(|e| e.into_inner()),
+        );
         notify_models(service, registry);
         removal::local_worker(service, registry, receiver);
         return;
@@ -1152,11 +1306,9 @@ fn worker(
             },
         );
     }
-    service
-        .settling
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take();
+    admission::release_text_after_close(
+        &mut service.settling.lock().unwrap_or_else(|e| e.into_inner()),
+    );
     notify_models(service, registry);
 }
 fn notify_models(service: &Service, registry: &std::sync::Weak<Registry>) {
@@ -1309,10 +1461,7 @@ pub(super) async fn drained() -> bool {
     };
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        if owners
-            .iter()
-            .all(|owner| owner.done.load(Ordering::Acquire))
-        {
+        if owners.iter().all(|owner| owner.fully_settled()) {
             for owner in owners {
                 if let Some(join) = owner
                     .join
@@ -1385,9 +1534,9 @@ pub(super) async fn commit_page_selection(
         epoch,
         || registry.scope(&profile.to_string()),
         |owner| {
-            if owner.done.load(Ordering::Acquire) {
+            if owner.fully_settled() {
                 admission::OwnerState::Settled
-            } else if owner.stop.load(Ordering::Acquire) {
+            } else if owner.stop.load(Ordering::Acquire) || owner.done.load(Ordering::Acquire) {
                 admission::OwnerState::Retiring
             } else {
                 admission::OwnerState::Active { epoch: owner.epoch }
@@ -1703,6 +1852,11 @@ fn choice_from_view(view: &CodexViewV1) -> Option<NativeConversationChoice> {
         id: row.id.clone(),
         name: row.name.clone(),
         source: PageAssistModelSourceV1::Codex,
+        capabilities: if view.text_only {
+            zephium_ipc::page_assist::PageAssistCapabilitiesV1::TextOnly
+        } else {
+            zephium_ipc::page_assist::PageAssistCapabilitiesV1::Page
+        },
         effort: match selected.effort {
             CodexEffortSelectionV1::Default => None,
             CodexEffortSelectionV1::Explicit(value) => Some(effort(value).as_str().into()),
@@ -1724,6 +1878,34 @@ pub(super) fn reserve_page(
     expected: NativeConversationChoice,
     draft: NativeConversationDraft,
 ) -> Result<Box<dyn NativeConversationReservation>, PageBackendError> {
+    reserve_page_value(profile, expected, draft, admission::TurnMode::Text)
+        .map(|value| Box::new(value) as Box<dyn NativeConversationReservation>)
+}
+
+pub(super) async fn reserve_page_browser(
+    profile: ProfileId,
+    expected: NativeConversationChoice,
+    draft: NativeConversationDraft,
+    manifest: NativeBrowserManifest,
+) -> Result<Box<dyn NativeConversationReservation>, PageBackendError> {
+    browser_reservation::reserve(profile, expected, draft, manifest).await
+}
+
+fn reserve_page_value(
+    profile: ProfileId,
+    expected: NativeConversationChoice,
+    draft: NativeConversationDraft,
+    mode: admission::TurnMode,
+) -> Result<Reservation, PageBackendError> {
+    let required = match mode {
+        admission::TurnMode::Text => zephium_ipc::page_assist::PageAssistCapabilitiesV1::TextOnly,
+        admission::TurnMode::Browser => zephium_ipc::page_assist::PageAssistCapabilitiesV1::Page,
+    };
+    if expected.capabilities != required {
+        return Err(PageBackendError::NativeConversation(
+            PageAssistNativeFaultV1::UnsupportedInput,
+        ));
+    }
     let registry = REGISTRY.get().ok_or(PageBackendError::NativeConversation(
         PageAssistNativeFaultV1::Unavailable,
     ))?;
@@ -1759,10 +1941,11 @@ pub(super) fn reserve_page(
                 PageAssistNativeFaultV1::ScopeChanged,
             ));
         }
-        let reserved = service
-            .queue
-            .reserve()
-            .map_err(|_| PageBackendError::Busy)?;
+        let reserved = match mode {
+            admission::TurnMode::Text => service.queue.reserve(),
+            admission::TurnMode::Browser => service.queue.reserve_browser(),
+        }
+        .map_err(|_| PageBackendError::Busy)?;
         (
             view.selection
                 .clone()
@@ -1773,7 +1956,7 @@ pub(super) fn reserve_page(
             reserved,
         )
     };
-    Ok(Box::new(Reservation {
+    Ok(Reservation {
         service,
         account_revision,
         selection_revision: snapshot.revision,
@@ -1781,7 +1964,7 @@ pub(super) fn reserve_page(
         choice: expected,
         draft,
         reserved: Some(reserved),
-    }))
+    })
 }
 struct Reservation {
     account_revision: u64,
@@ -1883,7 +2066,8 @@ impl NativeConversationReservation for Reservation {
                 selection: self.selection,
                 events,
                 cancel,
-                result: send,
+                result: ReplySink::Text(send),
+                browser: None,
             })
         });
         Box::pin(async move {
@@ -1913,6 +2097,10 @@ mod tests {
             PageAssistNativeFaultV1::HistoryDiverged
         );
         assert_eq!(
+            page_fault(Fault::HistoryPolicy),
+            PageAssistNativeFaultV1::HistoryDiverged
+        );
+        assert_eq!(
             page_fault(Fault::HistoryUncertain),
             PageAssistNativeFaultV1::OutcomeUnknown
         );
@@ -1936,12 +2124,295 @@ mod tests {
                 selection_revision: AtomicU64::new(0),
                 queue,
                 settling: Mutex::new(None),
+                browser_quarantine: Mutex::new(Vec::new()),
                 join: Mutex::new(None),
                 removal: Mutex::new(None),
             },
             receiver,
         )
     }
+    fn queued_browser_reply(
+        service: &Service,
+    ) -> tokio::sync::oneshot::Receiver<ReplyDelivery<NativeBrowserCompletion>> {
+        service.queue.set_ready(true);
+        let reserved = service.queue.reserve_browser().unwrap();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        service
+            .queue
+            .handoff(reserved, |turn| {
+                Command::Reply(ReplyCall {
+                    turn: Some(turn),
+                    account_revision: 1,
+                    request: NativeConversationRequest {
+                        conversation: "owned-page".into(),
+                        reply: 7,
+                        new_conversation: true,
+                        previous_reply: None,
+                        text: "exact words".into(),
+                    },
+                    selection: CodexSelectionV1 {
+                        model: "native-model".into(),
+                        effort: CodexEffortSelectionV1::Default,
+                    },
+                    events: Arc::new(|_| Ok(())),
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    result: ReplySink::Browser(send),
+                    // These ownership tests never construct a native preparation proof
+                    // or claim a provider send. The actual Turn determines Browser mode.
+                    browser: None,
+                })
+            })
+            .unwrap();
+        receive
+    }
+
+    #[test]
+    fn worker_panic_before_queued_reply_adoption_cannot_release_browser_owner() {
+        let (service, receiver) = owned_service();
+        let service = Arc::new(service);
+        let mut receive = queued_browser_reply(&service);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _owned_receiver = receiver;
+            panic!("synthetic worker unwind before command adoption");
+        }));
+        worker_returned(&service, result.is_err());
+        assert!(service.done.load(Ordering::Acquire));
+        assert!(!service.fully_settled());
+        assert!(service.queue.browser_handoff_lost());
+        assert_eq!(
+            service.snapshot().error,
+            Some(CodexFaultV1::RecoveryRequired)
+        );
+        assert!(receive.try_recv().is_err());
+        service.queue.set_ready(true);
+        assert!(matches!(
+            service.queue.reserve_browser(),
+            Err(admission::Error::Busy)
+        ));
+        assert!(matches!(
+            service.queue.retire_if_idle(|| Ok(())),
+            Err(admission::Error::Busy)
+        ));
+        let owners = Mutex::new(HashMap::from([(service.profile, service.clone())]));
+        let route = admission::route_selection(
+            &owners,
+            service.profile,
+            service.epoch,
+            || Some(service.epoch),
+            |owner| {
+                if owner.fully_settled() {
+                    admission::OwnerState::Settled
+                } else {
+                    admission::OwnerState::Retiring
+                }
+            },
+            || -> () { panic!("quarantined owner is not an absent-owner commit path") },
+        );
+        assert!(matches!(route, Err(admission::Error::Busy)));
+    }
+
+    #[test]
+    fn retired_queue_adopts_same_browser_turn_and_waits_for_exact_dual_reply() {
+        let (service, receiver) = owned_service();
+        let mut receive = queued_browser_reply(&service);
+        service.request_stop();
+        let Command::Reply(mut call) = receiver.try_recv().unwrap() else {
+            panic!("exact reply");
+        };
+        assert!(adopt_reply_turn(&service, &mut call));
+        assert!(call.turn.is_none());
+        let mut active = Some(Active {
+            browser: true,
+            delivery: None,
+            call,
+            items: HashMap::new(),
+            cancel_sent: false,
+        });
+        deliver_outcome(
+            &mut active,
+            NativeConversationOutcome {
+                status: NativeConversationStatus::Completed,
+                final_response: Some("confirmed final".into()),
+            },
+        );
+        assert!(matches!(
+            receive.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        // A later source failure cannot erase the original known terminal.
+        deliver_failure(&mut active, PageAssistNativeFaultV1::ScopeChanged);
+        worker_returned(&service, false);
+        assert!(!service.fully_settled());
+        browser_worker::settled(
+            &service,
+            "other-page",
+            7,
+            zephium_codex_broker::connection::BrowserLocalOutcome::Observed,
+            &mut active,
+        );
+        browser_worker::settled(
+            &service,
+            "owned-page",
+            8,
+            zephium_codex_broker::connection::BrowserLocalOutcome::Observed,
+            &mut active,
+        );
+        assert!(matches!(
+            receive.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        // Exercise the actual Desktop dual-event consumer. This synthetic call
+        // is not evidence that an original process or browser effect settled.
+        browser_worker::settled(
+            &service,
+            "owned-page",
+            7,
+            zephium_codex_broker::connection::BrowserLocalOutcome::Observed,
+            &mut active,
+        );
+        let outcome = receive.try_recv().unwrap().receive(true, false).unwrap();
+        assert_eq!(
+            outcome.outcome.final_response.as_deref(),
+            Some("confirmed final")
+        );
+        assert_eq!(outcome.outcome.status, NativeConversationStatus::Completed);
+        assert_eq!(
+            outcome.settlement,
+            NativeBrowserSettlement::Joined {
+                local: NativeBrowserLocalOutcome::Observed
+            }
+        );
+        assert!(active.is_none());
+        assert!(service.fully_settled());
+    }
+
+    #[test]
+    fn browser_successful_future_never_precedes_exact_dual_settlement() {
+        let (service, receiver) = owned_service();
+        let mut receive = queued_browser_reply(&service);
+        let Command::Reply(mut call) = receiver.try_recv().unwrap() else {
+            panic!("exact reply");
+        };
+        assert!(adopt_reply_turn(&service, &mut call));
+        let mut active = Some(Active {
+            browser: true,
+            delivery: None,
+            call,
+            items: HashMap::new(),
+            cancel_sent: false,
+        });
+        deliver_outcome(
+            &mut active,
+            NativeConversationOutcome {
+                status: NativeConversationStatus::Completed,
+                final_response: Some("done".into()),
+            },
+        );
+        // Original terminal, actual local return alone, or physical close alone
+        // never call the dual-event consumer and therefore cannot resolve it.
+        assert!(matches!(
+            receive.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        admission::release_text_after_close(&mut service.settling.lock().unwrap());
+        assert!(service.queue.browser_occupied());
+        assert!(matches!(
+            receive.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        browser_worker::settled(
+            &service,
+            "owned-page",
+            7,
+            zephium_codex_broker::connection::BrowserLocalOutcome::Observed,
+            &mut active,
+        );
+        assert!(matches!(receive.try_recv(), Ok(ReplyDelivery::Settled(_))));
+    }
+
+    #[test]
+    fn browser_known_terminal_quarantine_is_explicit_and_never_releases_slot() {
+        let (service, receiver) = owned_service();
+        let mut receive = queued_browser_reply(&service);
+        let Command::Reply(mut call) = receiver.try_recv().unwrap() else {
+            panic!("exact reply");
+        };
+        assert!(adopt_reply_turn(&service, &mut call));
+        let mut active = Some(Active {
+            browser: true,
+            delivery: None,
+            call,
+            items: HashMap::new(),
+            cancel_sent: false,
+        });
+        deliver_outcome(
+            &mut active,
+            NativeConversationOutcome {
+                status: NativeConversationStatus::Completed,
+                final_response: Some("known before receipt loss".into()),
+            },
+        );
+        browser_worker::quarantine_waiter(&mut active);
+        let result = receive.try_recv().unwrap().receive(true, false).unwrap();
+        assert_eq!(result.settlement, NativeBrowserSettlement::Quarantined);
+        assert_eq!(
+            result.outcome.final_response.as_deref(),
+            Some("known before receipt loss")
+        );
+        worker_returned(&service, false);
+        assert!(!service.fully_settled());
+        assert!(service.queue.browser_occupied());
+        service.queue.set_ready(true);
+        assert!(matches!(
+            service.queue.reserve_browser(),
+            Err(admission::Error::Busy)
+        ));
+    }
+
+    #[test]
+    fn browser_dual_receipt_keeps_individual_result_loss_distinct_from_provider_outcome() {
+        let (service, receiver) = owned_service();
+        let mut receive = queued_browser_reply(&service);
+        let Command::Reply(mut call) = receiver.try_recv().unwrap() else {
+            panic!("exact reply");
+        };
+        assert!(adopt_reply_turn(&service, &mut call));
+        let mut active = Some(Active {
+            browser: true,
+            delivery: None,
+            call,
+            items: HashMap::new(),
+            cancel_sent: false,
+        });
+        deliver_outcome(
+            &mut active,
+            NativeConversationOutcome {
+                status: NativeConversationStatus::Completed,
+                final_response: Some("original known".into()),
+            },
+        );
+        browser_worker::settled(
+            &service,
+            "owned-page",
+            7,
+            zephium_codex_broker::connection::BrowserLocalOutcome::ResultUnobserved,
+            &mut active,
+        );
+        let result = receive.try_recv().unwrap().receive(true, true).unwrap();
+        assert_eq!(
+            result.settlement,
+            NativeBrowserSettlement::Joined {
+                local: NativeBrowserLocalOutcome::ResultUnobserved
+            }
+        );
+        assert_eq!(result.outcome.status, NativeConversationStatus::Completed);
+        assert_eq!(
+            result.outcome.final_response.as_deref(),
+            Some("original known")
+        );
+        assert!(!service.queue.browser_occupied());
+    }
+
     #[test]
     fn busy_lifecycle_gate_leaves_account_login_and_model_presentation_untouched() {
         let (service, _receiver) = owned_service();
@@ -2069,6 +2540,7 @@ mod tests {
             let (service, _receiver) = owned_service();
             {
                 let mut view = service.view.lock().unwrap();
+                view.text_only = false;
                 view.quota = CodexQuotaViewV1 {
                     state: CodexQuotaStateV1::Current,
                     account_epoch: Some("1".into()),
@@ -2090,6 +2562,7 @@ mod tests {
                 _ => unreachable!(),
             }
             assert_eq!(service.snapshot().quota, CodexQuotaViewV1::default());
+            assert!(service.snapshot().text_only);
             if retirement == 3 {
                 assert_eq!(
                     service.view.lock().unwrap().quota,
@@ -2184,6 +2657,21 @@ mod tests {
         assert_eq!(choice.id, "native-id");
         assert_eq!(choice.name, "Original Model");
         assert_eq!(choice.effort.as_deref(), Some("high"));
+        assert_eq!(
+            choice.capabilities,
+            zephium_ipc::page_assist::PageAssistCapabilitiesV1::TextOnly
+        );
+        // Projection only: the production writer of this observation is the
+        // same held Connection::browser_capable schema proof above.
+        view.text_only = false;
+        let browser = choice_from_view(&view).unwrap();
+        assert_eq!(
+            browser.capabilities,
+            zephium_ipc::page_assist::PageAssistCapabilitiesV1::Page
+        );
+        assert_eq!(browser.id, choice.id);
+        assert_eq!(browser.name, choice.name);
+        assert_ne!(browser, choice);
         view.selection.as_mut().unwrap().effort =
             CodexEffortSelectionV1::Explicit(CodexEffortV1::Max);
         assert!(choice_from_view(&view).is_none());

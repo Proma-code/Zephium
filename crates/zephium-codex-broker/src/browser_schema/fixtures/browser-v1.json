@@ -1,0 +1,532 @@
+{
+  "client_requests": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "definitions": {
+      "DynamicToolSpec": {
+        "oneOf": [
+          {
+            "properties": {
+              "deferLoading": {
+                "type": "boolean"
+              },
+              "description": {
+                "type": "string"
+              },
+              "inputSchema": true,
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "function"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "description",
+              "inputSchema",
+              "name",
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "RequestId": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "format": "int64",
+            "type": "integer"
+          }
+        ]
+      },
+      "ThreadResumeParams": {
+        "properties": {
+          "developerInstructions": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "threadId"
+        ],
+        "type": "object"
+      },
+      "ThreadStartParams": {
+        "properties": {
+          "developerInstructions": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dynamicTools": {
+            "items": {
+              "$ref": "#/definitions/DynamicToolSpec"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      }
+    },
+    "oneOf": [
+      {
+        "properties": {
+          "id": {
+            "$ref": "#/definitions/RequestId"
+          },
+          "method": {
+            "enum": [
+              "thread/start"
+            ],
+            "type": "string"
+          },
+          "params": {
+            "$ref": "#/definitions/ThreadStartParams"
+          }
+        },
+        "required": [
+          "id",
+          "method",
+          "params"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "id": {
+            "$ref": "#/definitions/RequestId"
+          },
+          "method": {
+            "enum": [
+              "thread/resume"
+            ],
+            "type": "string"
+          },
+          "params": {
+            "$ref": "#/definitions/ThreadResumeParams"
+          }
+        },
+        "required": [
+          "id",
+          "method",
+          "params"
+        ],
+        "type": "object"
+      }
+    ]
+  },
+  "rpc_response": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "definitions": {
+      "RequestId": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "format": "int64",
+            "type": "integer"
+          }
+        ]
+      }
+    },
+    "properties": {
+      "id": {
+        "$ref": "#/definitions/RequestId"
+      },
+      "result": true
+    },
+    "required": [
+      "id",
+      "result"
+    ],
+    "type": "object"
+  },
+  "server_notifications": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "definitions": {
+      "DynamicToolCallOutputContentItem": {
+        "oneOf": [
+          {
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "inputText"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "text",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "imageUrl": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "inputImage"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "imageUrl",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "audioUrl": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "inputAudio"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "audioUrl",
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "DynamicToolCallStatus": {
+        "enum": [
+          "inProgress",
+          "completed",
+          "failed"
+        ],
+        "type": "string"
+      },
+      "ItemCompletedNotification": {
+        "properties": {
+          "completedAtMs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "item": {
+            "$ref": "#/definitions/ThreadItem"
+          },
+          "threadId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "completedAtMs",
+          "item",
+          "threadId",
+          "turnId"
+        ],
+        "type": "object"
+      },
+      "ItemStartedNotification": {
+        "properties": {
+          "item": {
+            "$ref": "#/definitions/ThreadItem"
+          },
+          "startedAtMs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "threadId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "item",
+          "startedAtMs",
+          "threadId",
+          "turnId"
+        ],
+        "type": "object"
+      },
+      "ThreadItem": {
+        "oneOf": [
+          {
+            "properties": {
+              "arguments": true,
+              "contentItems": {
+                "items": {
+                  "$ref": "#/definitions/DynamicToolCallOutputContentItem"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "durationMs": {
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "id": {
+                "type": "string"
+              },
+              "namespace": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "$ref": "#/definitions/DynamicToolCallStatus"
+              },
+              "success": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "tool": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "dynamicToolCall"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "arguments",
+              "id",
+              "status",
+              "tool",
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      }
+    },
+    "oneOf": [
+      {
+        "properties": {
+          "method": {
+            "enum": [
+              "item/started"
+            ],
+            "type": "string"
+          },
+          "params": {
+            "$ref": "#/definitions/ItemStartedNotification"
+          }
+        },
+        "required": [
+          "method",
+          "params"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "method": {
+            "enum": [
+              "item/completed"
+            ],
+            "type": "string"
+          },
+          "params": {
+            "$ref": "#/definitions/ItemCompletedNotification"
+          }
+        },
+        "required": [
+          "method",
+          "params"
+        ],
+        "type": "object"
+      }
+    ],
+    "properties": {
+      "emittedAtMs": {
+        "format": "int64",
+        "type": "integer"
+      }
+    }
+  },
+  "server_requests": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "definitions": {
+      "DynamicToolCallParams": {
+        "properties": {
+          "arguments": true,
+          "callId": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "threadId": {
+            "type": "string"
+          },
+          "tool": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "arguments",
+          "callId",
+          "threadId",
+          "tool",
+          "turnId"
+        ],
+        "type": "object"
+      },
+      "RequestId": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "format": "int64",
+            "type": "integer"
+          }
+        ]
+      }
+    },
+    "oneOf": [
+      {
+        "properties": {
+          "id": {
+            "$ref": "#/definitions/RequestId"
+          },
+          "method": {
+            "enum": [
+              "item/tool/call"
+            ],
+            "type": "string"
+          },
+          "params": {
+            "$ref": "#/definitions/DynamicToolCallParams"
+          }
+        },
+        "required": [
+          "id",
+          "method",
+          "params"
+        ],
+        "type": "object"
+      }
+    ]
+  },
+  "tool_response": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "definitions": {
+      "DynamicToolCallOutputContentItem": {
+        "oneOf": [
+          {
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "inputText"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "text",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "imageUrl": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "inputImage"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "imageUrl",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "audioUrl": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "inputAudio"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "audioUrl",
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      }
+    },
+    "properties": {
+      "contentItems": {
+        "items": {
+          "$ref": "#/definitions/DynamicToolCallOutputContentItem"
+        },
+        "type": "array"
+      },
+      "success": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "contentItems",
+      "success"
+    ],
+    "type": "object"
+  }
+}

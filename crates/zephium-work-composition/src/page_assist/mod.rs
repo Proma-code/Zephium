@@ -6,6 +6,8 @@
 
 mod agent;
 mod fault;
+mod native_browser;
+mod native_budget;
 pub mod port;
 pub use zephium_page_assist as core;
 mod readout;
@@ -118,6 +120,8 @@ type DecisionSender = oneshot::Sender<PageAssistDecisionV1>;
 
 struct Running {
     reply: u32,
+    profile: ProfileId,
+    native_browser: bool,
     cancel: Arc<Cancel>,
     /// A step's confirm, by its block.
     decision: Option<(u16, DecisionSender)>,
@@ -155,6 +159,8 @@ struct ReplyData {
     styles: HashMap<u16, PendingStyle>,
     handoffs: HashMap<u16, WorkStart>,
     credits: Option<String>,
+    /// Source-specific terminal fact; never an effect-admission capability.
+    native_outcome: Option<NativeConversationOutcome>,
     /// The tab the reply works in: the attached page, then wherever go_to went.
     working: Option<String>,
 }
@@ -182,6 +188,8 @@ struct State {
     /// Changes when a Space leaves/reopens a conversation, including A→B→A.
     current_epochs: HashMap<String, Arc<()>>,
     running: HashMap<String, Running>,
+    /// Entered native browser owners outlive cancelled/dropped UI waiters.
+    native_owners: HashMap<(String, u32), agent::BrowserOwner>,
     /// The structure of each tab's latest read, for suggestions.
     traits: HashMap<String, (u64, PageTraits)>,
     /// Which items block owns each tab's marks.
@@ -489,7 +497,7 @@ impl PageAssist {
                     name: choice.name,
                     hosted: false,
                     source: choice.source,
-                    capabilities: PageAssistCapabilitiesV1::TextOnly,
+                    capabilities: choice.capabilities,
                     effort: choice.effort,
                 },
             });
@@ -651,6 +659,16 @@ impl PageAssist {
         &self,
         request: PageAssistAskV1,
     ) -> Result<(u32, TurnTask), PageAssistFaultV1> {
+        self.ask_native_mode(request, true).await
+    }
+
+    /// Native Page uses only BrowserV1. The private false branch is retained for
+    /// historical text-contract fixtures; no public route falls back to it.
+    async fn ask_native_mode(
+        &self,
+        request: PageAssistAskV1,
+        browser: bool,
+    ) -> Result<(u32, TurnTask), PageAssistFaultV1> {
         if request.text.len() > PAGE_ASSIST_MAX_QUESTION_BYTES
             || request.attachments.len() > PAGE_ASSIST_MAX_ATTACHMENTS
         {
@@ -673,6 +691,14 @@ impl PageAssist {
                 live.conversation.messages().is_empty(),
             )
         };
+        if self
+            .state()
+            .native_owners
+            .values()
+            .any(|owner| owner.blocks(profile))
+        {
+            return Err(PageAssistFaultV1::Busy);
+        }
         if !self.ports().settings.ai_enabled(&profile) {
             return Err(PageAssistFaultV1::AiOff);
         }
@@ -684,7 +710,7 @@ impl PageAssist {
             .ok_or(PageAssistFaultV1::NoModel)?;
         let words = match &backend {
             PageBackendChoice::NativeConversation(_) => {
-                if request.suggestion.is_some() || !request.attachments.is_empty() {
+                if !browser && (request.suggestion.is_some() || !request.attachments.is_empty()) {
                     return Err(PageAssistFaultV1::NativeConversation {
                         fault: PageAssistNativeFaultV1::UnsupportedInput,
                     });
@@ -697,6 +723,19 @@ impl PageAssist {
             return Err(PageAssistFaultV1::Invalid);
         }
         let reservation = if let PageBackendChoice::NativeConversation(expected) = &backend {
+            let required = if browser {
+                PageAssistCapabilitiesV1::Page
+            } else {
+                PageAssistCapabilitiesV1::TextOnly
+            };
+            if expected.capabilities != required {
+                // No text fallback or renderer-selected escalation of a prior
+                // text-only durable conversation. Native reservation still joins
+                // the exact current policy/manifest/history after this projection.
+                return Err(PageAssistFaultV1::NativeConversation {
+                    fault: PageAssistNativeFaultV1::UnsupportedInput,
+                });
+            }
             {
                 let state = self.state();
                 if state.current.get(&space) != Some(&request.conversation)
@@ -722,10 +761,18 @@ impl PageAssist {
                 previous_reply,
                 text: words.clone(),
             };
-            let reserve = self
-                .ports()
-                .models
-                .reserve_native(&profile, expected.clone(), draft);
+            let reserve = if browser {
+                self.ports().models.reserve_native_browser(
+                    &profile,
+                    expected.clone(),
+                    draft,
+                    NativeBrowserManifest::page_v1(),
+                )
+            } else {
+                self.ports()
+                    .models
+                    .reserve_native(&profile, expected.clone(), draft)
+            };
             match tokio::time::timeout(NATIVE_RESERVE_TIMEOUT, reserve).await {
                 Ok(Ok(reservation)) => Some(reservation),
                 Ok(Err(PageBackendError::Busy)) => return Err(PageAssistFaultV1::Busy),
@@ -785,7 +832,16 @@ impl PageAssist {
                     .validate()
                     .map_err(|fault| PageAssistFaultV1::NativeConversation { fault })?;
             }
-            if state.running.contains_key(&conversation) {
+            if state.running.contains_key(&conversation)
+                || state
+                    .native_owners
+                    .values()
+                    .any(|owner| owner.blocks(profile))
+                || state
+                    .running
+                    .values()
+                    .any(|running| running.native_browser && running.profile == profile)
+            {
                 return Err(PageAssistFaultV1::Busy);
             }
             let Some(live) = state.live.get_mut(&conversation) else {
@@ -807,6 +863,8 @@ impl PageAssist {
                 conversation.clone(),
                 Running {
                     reply,
+                    profile,
+                    native_browser: browser && reservation.is_some(),
                     cancel: cancel.clone(),
                     decision: None,
                     resume: None,
@@ -829,9 +887,14 @@ impl PageAssist {
             conversation,
             space,
             profile,
+            current_epoch,
             reply,
             words,
             native: Mutex::new(None),
+            native_budget: (browser && reservation.is_some())
+                .then(native_budget::NativeBudget::new),
+            native_admission: (browser && reservation.is_some())
+                .then(|| Arc::new(native_browser::NativeBrowserAdmission::default())),
             backend,
             suggestion: request.suggestion,
             attachments: admitted,
@@ -841,7 +904,11 @@ impl PageAssist {
             glowing: Mutex::new(Vec::new()),
         };
         if let Some(reservation) = reservation {
-            agent::commit_native(&context, reservation);
+            if browser {
+                agent::commit_native_browser(&context, reservation);
+            } else {
+                agent::commit_native(&context, reservation);
+            }
         }
         Ok((reply, agent::task(context)))
     }

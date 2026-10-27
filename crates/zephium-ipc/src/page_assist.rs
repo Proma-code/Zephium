@@ -94,6 +94,8 @@ pub enum PageAssistNativeFaultV1 {
     Protocol,
     Limit,
     OutcomeUnknown,
+    /// Provider completion is known; local browser activity was interrupted.
+    LocalInterruption,
     /// Original terminal received, but the local history settlement was not confirmed.
     HistoryUncertain,
     /// Visible Page history differs from this original-client conversation.

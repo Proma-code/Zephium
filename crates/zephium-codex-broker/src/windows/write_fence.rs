@@ -9,6 +9,7 @@ pub(crate) struct WriteFence {
     cancel: Option<Arc<AtomicBool>>,
     revision: Option<(Arc<AtomicU64>, u64)>,
     additional: Option<(Arc<AtomicBool>, Arc<AtomicU64>, u64)>,
+    browser_budget: Option<Arc<dyn crate::browser_port::BrowserBudget>>,
 }
 impl WriteFence {
     pub(crate) fn login(cancel: Arc<AtomicBool>) -> Self {
@@ -16,6 +17,7 @@ impl WriteFence {
             cancel: Some(cancel),
             revision: None,
             additional: None,
+            browser_budget: None,
         }
     }
     pub(crate) fn text(cancel: Arc<AtomicBool>, revision: Arc<AtomicU64>, expected: u64) -> Self {
@@ -23,6 +25,7 @@ impl WriteFence {
             cancel: Some(cancel),
             revision: Some((revision, expected)),
             additional: None,
+            browser_budget: None,
         }
     }
     pub(crate) fn preparation(revision: Arc<AtomicU64>, expected: u64) -> Self {
@@ -30,7 +33,18 @@ impl WriteFence {
             cancel: None,
             revision: Some((revision, expected)),
             additional: None,
+            browser_budget: None,
         }
+    }
+    pub(crate) fn with_browser_budget(
+        mut self,
+        budget: Arc<dyn crate::browser_port::BrowserBudget>,
+    ) -> Option<Self> {
+        if self.browser_budget.is_some() {
+            return None;
+        }
+        self.browser_budget = Some(budget);
+        Some(self)
     }
     pub(crate) fn is_text(&self) -> bool {
         self.cancel.is_some() && self.revision.is_some()
@@ -38,7 +52,10 @@ impl WriteFence {
     /// Conjunction with a distinct native lifecycle action, never replacement
     /// of the already-owned call/profile fence. Exactly two gates are bounded.
     pub(crate) fn and_action(mut self, action: &Self) -> Option<Self> {
-        if self.additional.is_some() || action.additional.is_some() {
+        if self.additional.is_some()
+            || action.additional.is_some()
+            || action.browser_budget.is_some()
+        {
             return None;
         }
         let cancel = action.cancel.as_ref()?.clone();
@@ -47,7 +64,11 @@ impl WriteFence {
         Some(self)
     }
     pub(crate) fn same_action(&self, other: &Self) -> bool {
-        if self.additional.is_some() || other.additional.is_some() {
+        if self.additional.is_some()
+            || other.additional.is_some()
+            || self.browser_budget.is_some()
+            || other.browser_budget.is_some()
+        {
             return false;
         }
         match (&self.cancel, &other.cancel, &self.revision, &other.revision) {
@@ -58,7 +79,12 @@ impl WriteFence {
         }
     }
     pub(crate) fn current(&self) -> bool {
-        self.cancel
+        self.browser_budget.as_ref().is_none_or(|budget| {
+            budget
+                .deadline()
+                .is_ok_and(|deadline| std::time::Instant::now() < deadline)
+        }) && self
+            .cancel
             .as_ref()
             .is_none_or(|cancel| !cancel.load(Ordering::Acquire))
             && self

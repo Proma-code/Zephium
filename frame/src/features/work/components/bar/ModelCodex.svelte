@@ -6,6 +6,7 @@
     codexEffort,
     codexFault,
     codexStatus,
+    codexCapability,
     codexModelSelection,
     supportsCodexEffort,
     codexFavouriteKey,
@@ -73,7 +74,12 @@
   const card = $derived<NativeCardSubject | null>(
     current
       ? {
-          native: { id: current.id, name: current.name, source: m.codex_source() },
+          native: {
+            id: current.id,
+            name: current.name,
+            source: m.codex_source(),
+            detail: codexCapability(view),
+          },
           levels: current.efforts,
           effort:
             choice?.model === current.id
@@ -198,7 +204,7 @@
     </div>
   {/if}
 {:else}<p class="note" role="status">
-    {view?.state === "connected" ? m.codex_picker_text_only() : codexStatus(view)}
+    {codexCapability(view) ?? codexStatus(view)}
   </p>{/if}
 {#if loadFailed}<p class="note failure" role="alert">{m.codex_load_failed()}</p>{/if}
 {#if view?.error}<p class="note failure" role="alert">{codexFault(view.error)}</p>{/if}

@@ -293,3 +293,34 @@ pub fn qualify_compatibility(version: &str, path: &Path) -> Result<(), &'static 
     println!("codex-compatibility-{version}: native-code=0");
     Ok(())
 }
+
+/// Exact full-CLI experimental schema export only, in a fresh signed-out owned
+/// home. No app-server RPC, auth mutation, model request or Page effect.
+pub fn qualify_browser_schema(version: &str, path: &Path) -> Result<(), &'static str> {
+    let expected = crate::pin::ReviewedCli::parse(version).ok_or("browser-schema-version")?;
+    let cancel = AtomicBool::new(false);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let hashed = crate::image::CliCandidate::open(path)
+        .map_err(|_| "browser-schema-image-open")?
+        .hash(deadline, &cancel)
+        .map_err(|_| "browser-schema-image-hash")?;
+    if hashed.reference() != Some(expected) {
+        return Err("browser-schema-image-pin");
+    }
+    let image = Arc::new(
+        hashed
+            .admit_reference()
+            .map_err(|_| "browser-schema-image-admission")?,
+    );
+    if image.version() != version {
+        return Err("browser-schema-image-version");
+    }
+    let capability = crate::browser_capability::BrowserCapability::probe(image, deadline, &cancel)
+        .map_err(|_| "browser-schema-export-custody")?
+        .ok_or("browser-schema-unsupported")?;
+    // The constructor itself checked original physical exit/EOF/job/writer and
+    // disposable cleanup. This qualifier cannot turn the receipt into a thread.
+    drop(capability);
+    println!("codex-browser-schema-{version}: native-code=0");
+    Ok(())
+}

@@ -81,11 +81,16 @@ impl<'de> Deserialize<'de> for Unique {
         d.deserialize_any(V)
     }
 }
-pub(crate) fn decode(bytes: &[u8]) -> Result<Incoming, Fault> {
+/// Shared finite lexer only; does not admit a method, event, or server request.
+pub(crate) fn unique_value(bytes: &[u8]) -> Result<Value, Fault> {
     if bytes.is_empty() || bytes.len() > crate::protocol::MAX_REPLY_BYTES {
         return Err(Fault::Envelope);
     }
     let Unique(value) = serde_json::from_slice(bytes).map_err(|_| Fault::Envelope)?;
+    Ok(value)
+}
+pub(crate) fn decode(bytes: &[u8]) -> Result<Incoming, Fault> {
+    let value = unique_value(bytes)?;
     let o = value.as_object().ok_or(Fault::Envelope)?;
     if o.contains_key("id") {
         if o.contains_key("method") {

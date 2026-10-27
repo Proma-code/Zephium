@@ -274,10 +274,12 @@ export class AssistSession {
   /** True when Rust admitted the message; what it says arrives as events. */
   async ask(text: string, suggestion: PageAssistSuggestionV1 | null = null): Promise<boolean> {
     const native = this.status?.model?.source === "codex";
+    const nativePage = native && this.status?.model?.capabilities === "page";
     const words = native ? text : text.trim().slice(0, MESSAGE_LIMIT);
     if (
       native &&
-      (text.length > MESSAGE_LIMIT || suggestion !== null || this.attachments().length > 0)
+      (text.length > MESSAGE_LIMIT ||
+        (!nativePage && (suggestion !== null || this.attachments().length > 0)))
     ) {
       this.notice = {
         reason: "native_conversation",

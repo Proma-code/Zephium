@@ -1,7 +1,8 @@
 //! Serialized, profile-bound barriers for original Codex thread continuity.
 use super::*;
 use zephium_core::codex_store::{
-    Association, Call, Dispatch, Fault, Reply, Scope, Terminal, MAX_ASSOCIATIONS,
+    Association, Call, ConversationPolicy, Dispatch, Fault, Reply, Scope, Terminal,
+    MAX_ASSOCIATIONS,
 };
 
 impl Hub {
@@ -84,7 +85,7 @@ fn scope(conn: &Connection) -> rusqlite::Result<Option<Scope>> {
     .optional()
 }
 fn read(conn: &Connection, conversation: &str) -> rusqlite::Result<Option<Association>> {
-    conn.query_row("SELECT incarnation, grant_epoch, thread_id, revision, dispatch, reply, turn_id, outcome FROM codex_conversations WHERE conversation = ?1", [conversation], |row| {
+    conn.query_row("SELECT incarnation, grant_epoch, thread_id, revision, dispatch, reply, turn_id, outcome, policy_kind, tool_manifest_sha256, instruction_policy_sha256 FROM codex_conversations WHERE conversation = ?1", [conversation], |row| {
         let incarnation: Vec<u8> = row.get(0)?;
         let epoch: i64 = row.get(1)?;
         let thread_id: Option<String> = row.get(2)?;
@@ -93,6 +94,18 @@ fn read(conn: &Connection, conversation: &str) -> rusqlite::Result<Option<Associ
         let reply: i64 = row.get(5)?;
         let turn: Option<String> = row.get(6)?;
         let outcome: Option<i64> = row.get(7)?;
+        let kind: i64 = row.get(8)?;
+        let tools: Option<Vec<u8>> = row.get(9)?;
+        let instructions: Option<Vec<u8>> = row.get(10)?;
+        let policy = match (kind, tools, instructions) {
+            (0,None,None) => ConversationPolicy::TextOnlyLegacy,
+            (1,Some(tools),Some(instructions)) => ConversationPolicy::BrowserV1 {
+                tool_manifest_sha256: tools.try_into().map_err(|_|rusqlite::Error::InvalidQuery)?,
+                instruction_policy_sha256: instructions.try_into().map_err(|_|rusqlite::Error::InvalidQuery)?,
+            },
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        };
+        if !policy.valid() { return Err(rusqlite::Error::InvalidQuery); }
         let scope = Scope {incarnation: incarnation.try_into().map_err(|_|rusqlite::Error::InvalidQuery)?,grant_epoch:u64::try_from(epoch).map_err(|_|rusqlite::Error::InvalidQuery)?};
         if !scope.valid() || revision < 1 || thread_id.as_ref().is_some_and(|id| !zephium_core::codex_store::valid_provider_id(id))
             || turn.as_ref().is_some_and(|id| !zephium_core::codex_store::valid_provider_id(id)) { return Err(rusqlite::Error::InvalidQuery); }
@@ -103,7 +116,7 @@ fn read(conn: &Connection, conversation: &str) -> rusqlite::Result<Option<Associ
             (3,reply,None,None) if reply > 0 => Dispatch::Skipped {reply:reply as u64},
             _=>return Err(rusqlite::Error::InvalidQuery),
         };
-        Ok(Association {scope,conversation:conversation.into(),thread_id,revision:revision as u64,dispatch})
+        Ok(Association {scope,policy,conversation:conversation.into(),thread_id,revision:revision as u64,dispatch})
     }).optional()
 }
 fn put(conn: &Connection, value: &Association) -> rusqlite::Result<()> {
@@ -126,7 +139,21 @@ fn put(conn: &Connection, value: &Association) -> rusqlite::Result<()> {
             }),
         ),
     };
-    conn.execute("INSERT INTO codex_conversations(conversation,incarnation,grant_epoch,thread_id,revision,dispatch,reply,turn_id,outcome) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(conversation) DO UPDATE SET thread_id=excluded.thread_id,revision=excluded.revision,dispatch=excluded.dispatch,reply=excluded.reply,turn_id=excluded.turn_id,outcome=excluded.outcome", params![value.conversation,value.scope.incarnation.as_slice(),value.scope.grant_epoch as i64,value.thread_id,value.revision as i64,state,reply,turn,outcome])?;
+    let (kind, tools, instructions): (i64, Option<&[u8]>, Option<&[u8]>) = match &value.policy {
+        ConversationPolicy::TextOnlyLegacy => (0, None, None),
+        ConversationPolicy::BrowserV1 {
+            tool_manifest_sha256,
+            instruction_policy_sha256,
+        } => (
+            1,
+            Some(tool_manifest_sha256),
+            Some(instruction_policy_sha256),
+        ),
+    };
+    let changed = conn.execute("INSERT INTO codex_conversations(conversation,incarnation,grant_epoch,thread_id,revision,dispatch,reply,turn_id,outcome,policy_kind,tool_manifest_sha256,instruction_policy_sha256) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(conversation) DO UPDATE SET thread_id=excluded.thread_id,revision=excluded.revision,dispatch=excluded.dispatch,reply=excluded.reply,turn_id=excluded.turn_id,outcome=excluded.outcome WHERE codex_conversations.policy_kind=excluded.policy_kind AND codex_conversations.tool_manifest_sha256 IS excluded.tool_manifest_sha256 AND codex_conversations.instruction_policy_sha256 IS excluded.instruction_policy_sha256", params![value.conversation,value.scope.incarnation.as_slice(),value.scope.grant_epoch as i64,value.thread_id,value.revision as i64,state,reply,turn,outcome,kind,tools,instructions])?;
+    if changed != 1 {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
     Ok(())
 }
 fn has_room(conn: &Connection) -> rusqlite::Result<bool> {
@@ -248,9 +275,24 @@ fn execute(conn: &Connection, call: Call) -> rusqlite::Result<Reply> {
         | Call::Settle { conversation, .. } => conversation,
         _ => unreachable!(),
     };
+    let policy = match &call {
+        Call::Load { policy, .. }
+        | Call::Bind { policy, .. }
+        | Call::Skip { policy, .. }
+        | Call::Begin { policy, .. }
+        | Call::RecordTurn { policy, .. }
+        | Call::Settle { policy, .. } => *policy,
+        _ => unreachable!(),
+    };
     let existing = read(conn, conversation)?;
     if existing.as_ref().is_some_and(|a| a.scope != current) {
         return failed(Fault::StaleGrant);
+    }
+    if existing
+        .as_ref()
+        .is_some_and(|value| value.policy != policy)
+    {
+        return failed(Fault::PolicyMismatch);
     }
     if matches!(call, Call::Load { .. }) {
         return Ok(Reply::Association(existing));
@@ -277,6 +319,7 @@ fn execute(conn: &Connection, call: Call) -> rusqlite::Result<Reply> {
                 }
                 Association {
                     scope: current,
+                    policy,
                     conversation,
                     thread_id: Some(thread_id),
                     revision: 1,
@@ -314,6 +357,7 @@ fn execute(conn: &Connection, call: Call) -> rusqlite::Result<Reply> {
                 }
                 Association {
                     scope: current,
+                    policy,
                     conversation,
                     thread_id: None,
                     revision: 1,

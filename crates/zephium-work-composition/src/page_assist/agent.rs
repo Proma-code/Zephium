@@ -26,6 +26,10 @@ use super::port::{
     NativeConversationStatus, PageBackendChoice, PageBackendError, ReadFailure, ResolvedModel,
     ResolvedPageBackend, Role, StepEffect, StepFailure, StepRequest, WorkStart,
 };
+#[path = "native_driver.rs"]
+mod browser;
+pub(super) use browser::{commit_native_browser, BrowserOwner};
+
 use super::tools::{self, Call, ItemCall};
 use super::{
     fault, host_of, readout, site_of, Admitted, Cancel, CancelReason, PageAssist, PendingStyle,
@@ -54,9 +58,13 @@ pub(super) struct Reply {
     pub(super) conversation: String,
     pub(super) space: String,
     pub(super) profile: ProfileId,
+    /// Exact foreground lifetime captured before the native reservation.
+    pub(super) current_epoch: Option<Arc<()>>,
     pub(super) reply: u32,
     pub(super) words: String,
     pub(super) native: std::sync::Mutex<Option<NativeTurn>>,
+    pub(super) native_budget: Option<super::native_budget::NativeBudget>,
+    pub(super) native_admission: Option<Arc<super::native_browser::NativeBrowserAdmission>>,
     pub(super) backend: PageBackendChoice,
     pub(super) suggestion: Option<PageAssistSuggestionV1>,
     pub(super) attachments: Vec<Admitted>,
@@ -68,6 +76,8 @@ pub(super) struct Reply {
 }
 
 enum End {
+    /// An exact native result was already projected atomically.
+    NativeProjected,
     Done(Option<PageAssistCostV1>),
     Failed(PageAssistFaultV1),
     Cancelled(CancelReason),
@@ -98,11 +108,36 @@ type ToolOutcome = Result<String, String>;
 
 impl Reply {
     fn apply(&self, kind: PageAssistEventV1) -> bool {
+        if self.native_budget.is_some()
+            && self.cancel.reason().is_some()
+            && !matches!(
+                &kind,
+                PageAssistEventV1::Failed { .. }
+                    | PageAssistEventV1::Cancelled
+                    | PageAssistEventV1::Phase { phase: None }
+            )
+        {
+            return false;
+        }
         if !matches!(self.backend, PageBackendChoice::NativeConversation(_)) {
             return self.service.apply(&self.conversation, self.reply, kind);
         }
         let event = {
             let mut state = self.service.state();
+            if self.native_budget.is_some()
+                && (state.current.get(&self.space) != Some(&self.conversation)
+                    || self
+                        .current_epoch
+                        .as_ref()
+                        .zip(state.current_epochs.get(&self.space))
+                        .is_none_or(|(captured, current)| !Arc::ptr_eq(captured, current))
+                    || state
+                        .live
+                        .get(&self.conversation)
+                        .is_none_or(|live| live.profile != self.profile))
+            {
+                return false;
+            }
             if state.running.get(&self.conversation).is_none_or(|running| {
                 running.reply != self.reply || !Arc::ptr_eq(&running.cancel, &self.cancel)
             }) {
@@ -146,6 +181,61 @@ impl Reply {
 
     fn phase(&self, phase: Option<PageAssistPhaseV1>) {
         self.apply(PageAssistEventV1::Phase { phase });
+    }
+
+    /// Check again at every effect boundary, not just when a provider proposed it.
+    fn browser_admission(&self) -> Result<(), PageAssistNativeFaultV1> {
+        let Some(budget) = &self.native_budget else {
+            return Ok(());
+        };
+        if self.cancel.reason().is_some() || self.browser_closed() {
+            return Err(PageAssistNativeFaultV1::Cancelled);
+        }
+        if !self.service.ports().settings.ai_enabled(&self.profile) {
+            return Err(PageAssistNativeFaultV1::ScopeChanged);
+        }
+        let state = self.service.state();
+        if state.current.get(&self.space) != Some(&self.conversation)
+            || self
+                .current_epoch
+                .as_ref()
+                .zip(state.current_epochs.get(&self.space))
+                .is_none_or(|(captured, current)| !Arc::ptr_eq(captured, current))
+            || state
+                .live
+                .get(&self.conversation)
+                .is_none_or(|live| live.profile != self.profile)
+            || state.running.get(&self.conversation).is_none_or(|running| {
+                running.reply != self.reply || !Arc::ptr_eq(&running.cancel, &self.cancel)
+            })
+        {
+            return Err(PageAssistNativeFaultV1::ScopeChanged);
+        }
+        drop(state);
+        budget
+            .view()
+            .deadline()
+            .map(|_| ())
+            .map_err(|_| PageAssistNativeFaultV1::Timeout)
+    }
+
+    fn browser_closed(&self) -> bool {
+        self.native_admission
+            .as_ref()
+            .is_some_and(|admission| admission.is_closed())
+    }
+
+    async fn browser_closed_wait(&self) {
+        match &self.native_admission {
+            Some(admission) => admission.closed().await,
+            None => std::future::pending().await,
+        }
+    }
+
+    fn browser_effect(&self) -> ToolOutcome {
+        self.browser_admission()
+            .map(|_| String::new())
+            .map_err(|_| "This Page reply can no longer perform browser actions.".to_owned())
     }
 
     fn now(&self) -> u64 {
@@ -281,6 +371,8 @@ impl Reply {
     // ----------------------------------------------------------------- reads
 
     async fn read_tab(&self, tab: &str) -> Result<usize, PageAssistFaultV1> {
+        self.browser_admission()
+            .map_err(|fault| PageAssistFaultV1::NativeConversation { fault })?;
         let ports = self.service.ports();
         let facts = ports
             .page
@@ -304,6 +396,10 @@ impl Reply {
         let letters = refs::letters(u16::try_from(index).unwrap_or(u16::MAX))
             .ok_or(PageAssistFaultV1::TooLong)?;
         self.phase(Some(PageAssistPhaseV1::Reading { site: host.clone() }));
+        // Availability may await native model state; seal/cancel can arrive
+        // there, so the actual browser read has its own final admission check.
+        self.browser_admission()
+            .map_err(|fault| PageAssistFaultV1::NativeConversation { fault })?;
         let readout =
             match tokio::time::timeout(READ_TIMEOUT, ports.page.read(tab, facts.epoch)).await {
                 Ok(Ok(readout)) if readout.epoch == facts.epoch => readout,
@@ -315,6 +411,8 @@ impl Reply {
                     return Err(PageAssistFaultV1::Unreadable);
                 }
             };
+        self.browser_admission()
+            .map_err(|fault| PageAssistFaultV1::NativeConversation { fault })?;
         let page = readout::page_read(
             &letters,
             &site,
@@ -366,6 +464,7 @@ impl Reply {
     }
 
     async fn outline(&self, index: usize) -> Option<Outline> {
+        self.browser_admission().ok()?;
         if let Some(outline) = self
             .with_data(|data| data.outlines.get(&index).cloned())
             .flatten()
@@ -375,6 +474,7 @@ impl Reply {
         let read = self
             .with_data(|data| data.reads.get(index).cloned())
             .flatten()?;
+        self.browser_admission().ok()?;
         let outline = tokio::time::timeout(
             OUTLINE_TIMEOUT,
             self.service.ports().page.outline(&read.tab, read.epoch),
@@ -383,6 +483,7 @@ impl Reply {
         .ok()?
         .ok()
         .map(Outline::admit)?;
+        self.browser_admission().ok()?;
         self.with_data(|data| data.outlines.insert(index, outline.clone()));
         Some(outline)
     }
@@ -445,7 +546,13 @@ impl Reply {
                 parts.push(prompt::outline_block(&outline));
             }
         }
-        parts.push(prompt::request(&self.words, self.suggestion));
+        parts.push(
+            if self.native_budget.is_some() && !self.words.trim().is_empty() {
+                self.words.clone()
+            } else {
+                prompt::request(&self.words, self.suggestion)
+            },
+        );
         parts
     }
 
@@ -615,6 +722,9 @@ impl std::future::Future for NativeTask {
     }
 }
 pub(super) fn task(reply: Reply) -> super::TurnTask {
+    if reply.native_budget.is_some() {
+        return browser::task(reply);
+    }
     let callback_state = reply
         .native
         .lock()
@@ -643,22 +753,29 @@ pub(super) fn task(reply: Reply) -> super::TurnTask {
 
 /// Runs one admitted reply to its end.
 async fn run(reply: Reply) {
-    let end = tokio::select! {
-        biased;
-        reason = reply.cancel.cancelled() => End::Cancelled(reason),
-        end = body(&reply) => end,
+    let end = if reply.native_budget.is_some() {
+        // The browser owner drains an entered effect even after UI cancellation.
+        body(&reply).await
+    } else {
+        tokio::select! {
+            biased;
+            reason = reply.cancel.cancelled() => End::Cancelled(reason),
+            end = body(&reply) => end,
+        }
     };
     reply.leased.store(false, Ordering::Release);
     reply.unglow();
     reply.note(format_args!(
         "end {}",
         match &end {
+            End::NativeProjected => "native-projected".to_owned(),
             End::Done(_) => "done".to_owned(),
             End::Failed(fault) => format!("failed fault={fault:?}"),
             End::Cancelled(reason) => format!("cancelled reason={reason:?}"),
         }
     ));
     match end {
+        End::NativeProjected => {}
         End::Done(cost) => {
             reply.apply(PageAssistEventV1::Done { cost });
         }
@@ -703,14 +820,27 @@ impl Drop for NativeCallbackLease {
     }
 }
 
+pub(super) enum NativeTurnFuture {
+    Text(
+        super::port::BoxFuture<
+            'static,
+            Result<super::port::NativeConversationOutcome, PageAssistNativeFaultV1>,
+        >,
+    ),
+    Browser(
+        super::port::BoxFuture<
+            'static,
+            Result<super::port::NativeBrowserCompletion, PageAssistNativeFaultV1>,
+        >,
+    ),
+}
+
 pub(super) struct NativeTurn {
-    future: super::port::BoxFuture<
-        'static,
-        Result<super::port::NativeConversationOutcome, PageAssistNativeFaultV1>,
-    >,
+    future: NativeTurnFuture,
     callback_state: Arc<std::sync::Mutex<NativeCallbackState>>,
     _lease: NativeCallbackLease,
     deadline: tokio::time::Instant,
+    browser: Option<browser::Turn>,
 }
 /// Synchronous local handoff before a caller can drop an unpolled TurnTask.
 /// Native callbacks may arrive immediately; Page's running identity is installed.
@@ -766,10 +896,11 @@ pub(super) fn commit_native(reply: &Reply, native: Box<dyn NativeConversationRes
     });
     let future = native.commit(reply.reply, reply.cancel.native.clone(), events);
     *reply.native.lock().unwrap_or_else(|p| p.into_inner()) = Some(NativeTurn {
-        future,
+        future: NativeTurnFuture::Text(future),
         callback_state,
         _lease,
         deadline: tokio::time::Instant::now() + CALL_TIMEOUT,
+        browser: None,
     });
 }
 
@@ -779,7 +910,11 @@ async fn native_body(reply: &Reply, native: NativeTurn) -> End {
         callback_state,
         _lease,
         deadline,
+        browser: _,
     } = native;
+    let NativeTurnFuture::Text(future) = future else {
+        return native_fault(PageAssistNativeFaultV1::Protocol);
+    };
     let result = tokio::time::timeout_at(deadline, future).await;
     let callback_fault = {
         let mut state = callback_state.lock().unwrap_or_else(|p| p.into_inner());
@@ -833,6 +968,9 @@ async fn body(reply: &Reply) -> End {
             .unwrap_or_else(|p| p.into_inner())
             .take();
         return match reservation {
+            Some(reservation) if reservation.browser.is_some() => {
+                browser::body(reply, reservation).await
+            }
             Some(reservation) => native_body(reply, reservation).await,
             None => native_fault(PageAssistNativeFaultV1::ScopeChanged),
         };
@@ -1115,6 +1253,7 @@ async fn show_items(reply: &Reply, text: &mut Text, calls: Vec<ItemCall>) -> Too
             items.len()
         ));
     };
+    reply.browser_effect()?;
     let placed = reply
         .service
         .ports()
@@ -1203,6 +1342,7 @@ async fn open_tabs(reply: &Reply, text: &mut Text, targets: Vec<String>) -> Tool
         .with_data(|data| data.handles.first().cloned())
         .flatten();
     for index in 0..rows.len() {
+        reply.browser_effect()?;
         rows[index].state = PageAssistOpenStateV1::Opening;
         reply.set_block(block, PageAssistBlockV1::Opened { tabs: rows.clone() });
         let opened = ports
@@ -1324,6 +1464,7 @@ async fn move_tab(
             steps: vec![row.clone()],
         },
     );
+    reply.browser_effect()?;
     if !ports.tabs.navigate(&reply.profile, tab, url) {
         row.state = PageAssistStepStateV1::Failed;
         row.reason = Some(PageAssistStepReasonV1::Refused);
@@ -1374,6 +1515,7 @@ async fn open_in_front(
             tabs: vec![row.clone()],
         },
     );
+    reply.browser_effect()?;
     let Some(tab) = ports
         .tabs
         .open(&reply.profile, &reply.space, url, after.as_deref(), true)
@@ -1456,6 +1598,9 @@ async fn restyle(
     }
     reply.phase(Some(PageAssistPhaseV1::Styling));
     let outline = reply.outline(index).await;
+    // A returned outline cannot create a new actionable style proposal after
+    // the original turn closed this Page action admission.
+    reply.browser_effect()?;
     let validated = match css::validate(sheet) {
         Ok(validated) => validated,
         Err(rejection) => {
@@ -1788,22 +1933,39 @@ fn planned_label(step: &Step, record: &ReadRecord) -> String {
 }
 
 async fn decision(reply: &Reply, block: u16) -> Result<PageAssistDecisionV1, CancelReason> {
+    reply.browser_admission().map_err(|_| CancelReason::Gone)?;
     let (sender, receiver) = oneshot::channel();
     reply
         .service
         .running_reply(&reply.conversation, reply.reply, |running| {
             running.decision = Some((block, sender))
-        });
+        })
+        .ok_or(CancelReason::Gone)?;
     reply.apply(PageAssistEventV1::State {
         state: PageAssistReplyStateV1::Waiting,
     });
+    let human_wait = reply
+        .native_budget
+        .as_ref()
+        .map(|budget| budget.wait(super::native_budget::HumanWaitKind::Confirmation))
+        .transpose()
+        .map_err(|_| CancelReason::Gone)?;
     let decided = tokio::select! {
+        biased;
+        _ = reply.browser_closed_wait() => Err(CancelReason::Gone),
         reason = reply.cancel.cancelled() => Err(reason),
         decision = receiver => decision.map_err(|_| CancelReason::Gone),
     };
-    reply.apply(PageAssistEventV1::State {
-        state: PageAssistReplyStateV1::Working,
-    });
+    if let Some(wait) = human_wait {
+        if decided.is_ok() {
+            wait.finish().map_err(|_| CancelReason::Gone)?;
+        }
+    }
+    if !reply.browser_closed() {
+        reply.apply(PageAssistEventV1::State {
+            state: PageAssistReplyStateV1::Working,
+        });
+    }
     decided
 }
 
@@ -1898,6 +2060,9 @@ async fn act(reply: &Reply, text: &mut Text, steps: Vec<Step>) -> Result<ToolOut
 async fn run_steps(reply: &Reply, text: &mut Text, plan: &mut Plan) -> Result<(), Option<End>> {
     let page = reply.service.ports().page.clone();
     for index in 0..plan.requests.len() {
+        reply
+            .browser_admission()
+            .map_err(|fault| Some(native_fault(fault)))?;
         if reply.took_over.swap(false, Ordering::AcqRel) {
             take_over(reply, text, plan, index).await?;
         }
@@ -1942,6 +2107,9 @@ async fn run_steps(reply: &Reply, text: &mut Text, plan: &mut Plan) -> Result<()
             resolved.effect,
             PageAssistStepStateV1::Running,
         );
+        reply
+            .browser_admission()
+            .map_err(|fault| Some(native_fault(fault)))?;
         match page.act(&plan.tab, plan.epoch, &step).await {
             Ok(()) => plan.mark(
                 reply,
@@ -1967,6 +2135,9 @@ async fn take_over(
     plan: &mut Plan,
     from: usize,
 ) -> Result<(), Option<End>> {
+    reply
+        .browser_admission()
+        .map_err(|fault| Some(native_fault(fault)))?;
     reply.add_block(
         text,
         PageAssistBlockV1::Paused {
@@ -1982,11 +2153,27 @@ async fn take_over(
         .service
         .running_reply(&reply.conversation, reply.reply, |running| {
             running.resume = Some(sender)
-        });
+        })
+        .ok_or(Some(End::Cancelled(CancelReason::Gone)))?;
+    let human_wait = reply
+        .native_budget
+        .as_ref()
+        .map(|budget| budget.wait(super::native_budget::HumanWaitKind::Takeover))
+        .transpose()
+        .map_err(|_| Some(native_fault(PageAssistNativeFaultV1::Timeout)))?;
     tokio::select! {
+        biased;
+        _ = reply.browser_closed_wait() => return Err(Some(End::Cancelled(CancelReason::Gone))),
         reason = reply.cancel.cancelled() => return Err(Some(End::Cancelled(reason))),
         resumed = receiver => resumed.map_err(|_| Some(End::Cancelled(CancelReason::Gone)))?,
     }
+    if let Some(wait) = human_wait {
+        wait.finish()
+            .map_err(|_| Some(native_fault(PageAssistNativeFaultV1::Timeout)))?;
+    }
+    reply
+        .browser_admission()
+        .map_err(|fault| Some(native_fault(fault)))?;
     reply.glow(&plan.tab, Glow::Working);
     reply.apply(PageAssistEventV1::State {
         state: PageAssistReplyStateV1::Working,

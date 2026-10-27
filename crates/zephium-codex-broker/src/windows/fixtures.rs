@@ -20,6 +20,8 @@ const CONTROL_BUDGET: Duration = Duration::from_secs(10);
 #[derive(Clone, Copy)]
 pub(super) enum Mode {
     #[cfg(feature = "native-fixtures")]
+    Browser(crate::connection::browser_fixtures::Scenario),
+    #[cfg(feature = "native-fixtures")]
     Removal(crate::connection::removal_fixtures::Scenario),
     Nonzero,
     Truncated,
@@ -69,6 +71,8 @@ pub(super) enum Mode {
 impl Mode {
     pub(super) fn args(self) -> &'static [&'static str] {
         match self {
+            #[cfg(feature = "native-fixtures")]
+            Self::Browser(scenario) => scenario.args(),
             #[cfg(feature = "native-fixtures")]
             Self::Removal(scenario) => scenario.args(),
             Self::Nonzero => &["transport-child", "nonzero"],
@@ -353,6 +357,17 @@ fn descendant_pid(bytes: &[u8]) -> Option<u32> {
 /// Finite dispatcher for this program's synthetic helper child, never a shell.
 pub(crate) fn child(mode: &str) -> Result<(), &'static str> {
     match mode {
+        #[cfg(feature = "native-fixtures")]
+        mode @ ("browser-two-turns"
+        | "browser-cold-resume"
+        | "browser-cancel-input"
+        | "browser-terminal-revocation"
+        | "browser-local-lost"
+        | "browser-duplicate-call") => {
+            let scenario = crate::connection::browser_fixtures::Scenario::parse(mode)
+                .ok_or("browser-helper-mode")?;
+            crate::connection::fixture_peer::browser_child(scenario)?;
+        }
         "nonzero" => std::process::exit(7),
         "truncated" => {
             let mut output = std::io::stdout().lock();
@@ -461,6 +476,12 @@ pub(crate) fn removal_session(
     fresh_runtime(Mode::Removal(scenario), RuntimePaths::persistent(lease)?)
 }
 
+#[cfg(feature = "native-fixtures")]
+pub(crate) fn browser_session(
+    scenario: crate::connection::browser_fixtures::Scenario,
+) -> Result<(Session, Arc<RuntimePaths>), &'static str> {
+    fresh_runtime(Mode::Browser(scenario), RuntimePaths::fresh_managed()?)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

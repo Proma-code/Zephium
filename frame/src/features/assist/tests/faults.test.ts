@@ -335,3 +335,13 @@ test("a retired direct source is actionable without a retry, inferred send or bi
   expect(view.diagnostic).toEqual({ code: "CHATGPT/LEGACY/-/RETIRED", uncertain: false });
   expect(view.fix).not.toBeNull();
 });
+
+test("known Codex completion with interrupted browser activity retains a local-only warning", () => {
+  expect(faultView({ reason: "native_conversation", fault: "local_interruption" })).toEqual({
+    message:
+      "Codex finished this reply, but browser activity was interrupted. Check the page before continuing.",
+    fix: null,
+    retry: "no",
+    diagnostic: { code: "CODEX/LOCAL_INTERRUPTION", uncertain: false },
+  });
+});

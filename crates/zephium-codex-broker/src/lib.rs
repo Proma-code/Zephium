@@ -72,7 +72,7 @@ mod framing;
 #[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
 mod qualification;
 #[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
-pub use qualification::{qualify_compatibility, qualify_original};
+pub use qualification::{qualify_browser_schema, qualify_compatibility, qualify_original};
 
 #[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
 pub fn qualify_transport() -> Result<(), &'static str> {
@@ -251,3 +251,61 @@ mod transport_environment;
     )
 ))]
 mod preparation_budget;
+
+// Browser actor cohort remains closed at the Page entry point until the exact
+// native capability/dispatcher/local settlement join is qualified together.
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
+pub mod browser_port;
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
+mod dynamic_tools;
+
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
+#[path = "connection/browser.rs"]
+mod browser_owner;
+
+#[cfg(all(
+    windows,
+    any(feature = "native-fixtures", feature = "trial-integration")
+))]
+mod browser_capability;
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
+mod browser_schema;
+
+#[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
+pub fn qualify_browser_owner() -> Result<(), &'static str> {
+    connection::browser_fixtures::qualify()
+}
+
+#[cfg(any(
+    test,
+    all(
+        windows,
+        any(feature = "native-fixtures", feature = "trial-integration")
+    )
+))]
+#[path = "connection/events.rs"]
+mod connection_events;

@@ -43,6 +43,44 @@ impl Associations for MemoryAssociations {
         if requested.is_some() && requested != memory.scope {
             return durable::Reply::Failed(durable::Fault::StaleGrant);
         }
+        let policy_key = match &call {
+            durable::Call::Load {
+                policy,
+                conversation,
+                ..
+            }
+            | durable::Call::Bind {
+                policy,
+                conversation,
+                ..
+            }
+            | durable::Call::Skip {
+                policy,
+                conversation,
+                ..
+            }
+            | durable::Call::Begin {
+                policy,
+                conversation,
+                ..
+            }
+            | durable::Call::RecordTurn {
+                policy,
+                conversation,
+                ..
+            }
+            | durable::Call::Settle {
+                policy,
+                conversation,
+                ..
+            } => Some((*policy, conversation)),
+            _ => None,
+        };
+        if policy_key.is_some_and(|(policy, key)| {
+            memory.records.get(key).is_some_and(|r| r.policy != policy)
+        }) {
+            return durable::Reply::Failed(durable::Fault::PolicyMismatch);
+        }
         match call {
             durable::Call::InspectOwner => durable::Reply::Owner(memory.scope),
             durable::Call::Open { incarnation } => {
@@ -80,6 +118,7 @@ impl Associations for MemoryAssociations {
             }
             durable::Call::Bind {
                 scope,
+                policy,
                 conversation,
                 thread_id,
                 expected_revision,
@@ -98,6 +137,7 @@ impl Associations for MemoryAssociations {
                 };
                 let value = durable::Association {
                     scope,
+                    policy,
                     conversation: conversation.clone(),
                     thread_id: Some(thread_id),
                     revision,
@@ -114,6 +154,7 @@ impl Associations for MemoryAssociations {
             }
             durable::Call::Skip {
                 scope,
+                policy,
                 conversation,
                 expected_revision,
                 reply,
@@ -142,6 +183,7 @@ impl Associations for MemoryAssociations {
                 };
                 let value = durable::Association {
                     scope,
+                    policy,
                     conversation: conversation.clone(),
                     thread_id,
                     revision,
@@ -319,6 +361,7 @@ fn run(scenario: Scenario) -> Result<(), &'static str> {
             .insert(
                 "synthetic-page".into(),
                 durable::Association {
+                    policy: durable::ConversationPolicy::TextOnlyLegacy,
                     scope: association_scope,
                     conversation: "synthetic-page".into(),
                     thread_id: Some("synthetic-owned-thread".into()),

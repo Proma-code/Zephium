@@ -1,7 +1,11 @@
 //! Move-only original turn intent and exact pre-write evidence. These types prove
 //! no model-frame handoff, not thread/process settlement or durable Store commit.
 use super::write_fence::WriteFence;
-use crate::{catalog::EffortSelection, conversation::Scope};
+use crate::{browser_port::BrowserPolicy, catalog::EffortSelection, conversation::Scope};
+#[path = "write_receipt/browser.rs"]
+mod browser;
+#[cfg(windows)]
+pub(crate) use browser::BrowserInputIntent;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{io::Write, sync::Arc, time::Instant};
@@ -23,6 +27,17 @@ pub(crate) struct TurnOperation {
     history: TurnHistory,
     selection: EffortSelection,
     draft_digest: [u8; 32],
+    model: String,
+    input: InputBinding,
+}
+#[derive(Clone, Eq, PartialEq)]
+enum InputBinding {
+    TextOnly,
+    BrowserPending(BrowserPolicy),
+    BrowserPrepared {
+        policy: BrowserPolicy,
+        digest: [u8; 32],
+    },
 }
 impl TurnOperation {
     pub(crate) fn new(
@@ -31,6 +46,16 @@ impl TurnOperation {
         model: &str,
         selection: EffortSelection,
         text: &str,
+    ) -> Option<Self> {
+        Self::with_limit(scope, history, model, selection, text, 32 * 1024)
+    }
+    fn with_limit(
+        scope: Scope,
+        history: TurnHistory,
+        model: &str,
+        selection: EffortSelection,
+        text: &str,
+        maximum: usize,
     ) -> Option<Self> {
         if history.incarnation == [0; 16]
             || history.grant_epoch == 0
@@ -52,7 +77,7 @@ impl TurnOperation {
                 .as_deref()
                 .is_some_and(|thread| !identifier(thread))
             || !identifier(model)
-            || text.len() > 32 * 1024
+            || text.len() > maximum
         {
             return None;
         }
@@ -61,6 +86,8 @@ impl TurnOperation {
             history,
             selection,
             draft_digest: draft_digest(model, selection, text),
+            model: model.into(),
+            input: InputBinding::TextOnly,
         })
     }
 }
@@ -85,8 +112,13 @@ fn draft_digest(model: &str, selection: EffortSelection, text: &str) -> [u8; 32]
     hash.finalize().into()
 }
 #[derive(Clone)]
-pub(super) struct SessionStamp(Arc<()>);
+pub(crate) struct SessionStamp(Arc<()>);
 impl SessionStamp {
+    #[cfg(all(windows, debug_assertions, feature = "native-fixtures"))]
+    pub(super) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub(super) fn new() -> Self {
         Self(Arc::new(()))
     }
@@ -123,10 +155,11 @@ impl TurnIntent {
             return Err(self);
         };
         let inner = *self.0;
+        let digest = frame_digest(&inner.operation, &bytes);
         let binding = TurnBinding {
             operation: inner.operation,
             wire_id,
-            frame_digest: Sha256::digest(&bytes).into(),
+            frame_digest: digest,
         };
         Ok(TurnWrite {
             ticket: TurnTicket {
@@ -204,7 +237,56 @@ fn valid_turn_frame(
             .get("text_elements")
             .and_then(Value::as_array)
             .is_some_and(Vec::is_empty)
-        && operation.draft_digest == draft_digest(model, operation.selection, text)
+        && operation.model == model
+        && match operation.input {
+            InputBinding::TextOnly => {
+                operation.draft_digest == draft_digest(model, operation.selection, text)
+            }
+            InputBinding::BrowserPending(_) => false,
+            InputBinding::BrowserPrepared { digest, .. } => {
+                digest == browser::prepared_digest(text)
+            }
+        }
+}
+fn frame_digest(operation: &TurnOperation, bytes: &[u8]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"codex-original-turn-frame-v3");
+    hash.update(operation.scope.correlation_digest());
+    hash.update(operation.history.incarnation);
+    hash.update(operation.history.grant_epoch.to_le_bytes());
+    hash.update(operation.history.reply.to_le_bytes());
+    for number in [
+        operation.history.previous_reply,
+        operation.history.expected_revision,
+    ] {
+        hash.update([u8::from(number.is_some())]);
+        hash.update(number.unwrap_or(0).to_le_bytes());
+    }
+    for value in [
+        operation.history.conversation.as_str(),
+        operation.history.thread_id.as_deref().unwrap_or(""),
+    ] {
+        hash.update((value.len() as u64).to_le_bytes());
+        hash.update(value.as_bytes());
+    }
+    hash.update(operation.draft_digest);
+    match operation.input {
+        InputBinding::TextOnly => hash.update([0]),
+        InputBinding::BrowserPending(policy) => {
+            hash.update([1]);
+            hash.update(policy.tool_digest());
+            hash.update(policy.instruction_digest());
+        }
+        InputBinding::BrowserPrepared { policy, digest } => {
+            hash.update([2]);
+            hash.update(policy.tool_digest());
+            hash.update(policy.instruction_digest());
+            hash.update(digest);
+        }
+    }
+    hash.update((bytes.len() as u64).to_le_bytes());
+    hash.update(bytes);
+    hash.finalize().into()
 }
 #[derive(Clone, Eq, PartialEq)]
 pub(super) struct TurnBinding {
@@ -222,7 +304,7 @@ impl TurnTicket {
         Arc::ptr_eq(&self.stamp.0, &stamp.0)
     }
     pub(super) fn matches_bytes(&self, bytes: &[u8]) -> bool {
-        self.binding.frame_digest == <[u8; 32]>::from(Sha256::digest(bytes))
+        self.binding.frame_digest == frame_digest(&self.binding.operation, bytes)
     }
 }
 pub(crate) struct TurnWrite {
@@ -421,6 +503,43 @@ mod tests {
             binding.clone(),
             OwnedFrame::new(stamp.clone(), 1, Some(binding), bytes, deadline, fence),
         )
+    }
+    #[test]
+    fn queued_browser_write_rechecks_same_live_budget_after_wait_ends() {
+        struct Budget(std::sync::Mutex<Instant>);
+        impl crate::browser_port::BrowserBudget for Budget {
+            fn deadline(&self) -> Result<Instant, crate::browser_port::BrowserPortFault> {
+                Ok(*self.0.lock().unwrap())
+            }
+            fn hard_deadline(&self) -> Result<Instant, crate::browser_port::BrowserPortFault> {
+                self.deadline()
+            }
+        }
+        let budget = Arc::new(Budget(std::sync::Mutex::new(
+            Instant::now() + Duration::from_secs(300),
+        )));
+        let fence = WriteFence::text(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(1)),
+            1,
+        )
+        .with_browser_budget(budget.clone())
+        .unwrap();
+        let stamp = SessionStamp::new();
+        let op = operation();
+        let (_, queued) = frame(
+            &stamp,
+            &op,
+            Some(fence),
+            Instant::now() + Duration::from_secs(390),
+        );
+        *budget.0.lock().unwrap() = Instant::now() - Duration::from_millis(1);
+        let mut bytes = Vec::new();
+        assert!(matches!(
+            queued.write(&mut bytes),
+            WriteOutcome::Rejected(_)
+        ));
+        assert!(bytes.is_empty());
     }
     #[test]
     fn intent_is_same_session_and_operation_only_without_a_fake_rpc_id() {

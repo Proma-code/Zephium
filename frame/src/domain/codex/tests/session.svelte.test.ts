@@ -74,6 +74,17 @@ test("construction is inert; explicit observation never logs in, refreshes model
   for (const command of [native.check, native.connect, native.models, native.quota, native.select])
     expect(command).not.toHaveBeenCalled();
 });
+test("observing Browser capability preserves the native catalog without selecting or reconnecting", async () => {
+  native.read.mockResolvedValue({ ...connected(), text_only: false });
+  const s = owner();
+  await s.start();
+  expect(s.view?.state).toBe("connected");
+  expect(s.view?.text_only).toBe(false);
+  expect(s.view?.models[0]?.id).toBe(model.id);
+  expect(s.view?.selection).toBeNull();
+  for (const command of [native.check, native.connect, native.models, native.select, native.logout])
+    expect(command).not.toHaveBeenCalled();
+});
 test("preparing/sign-in polling observes native completion without a second login", async () => {
   native.read.mockResolvedValue(codexView(profile, { state: "preparing" }));
   const s = owner();

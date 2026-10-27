@@ -1898,6 +1898,8 @@ export type PageAssistModelSourceV1 = "model" | "codex";
 export type PageAssistCapabilitiesV1 = "page" | "text_only";
 
 export type PageAssistNativeFaultV1 = "unavailable" | "unsupported_input" | "scope_changed" | "protocol" | "limit" | "outcome_unknown" | 
+/**  Provider completion is known; local browser activity was interrupted. */
+"local_interruption" | 
 /**  Original terminal received, but the local history settlement was not confirmed. */
 "history_uncertain" | 
 /**  Visible Page history differs from this original-client conversation. */

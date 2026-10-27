@@ -947,7 +947,7 @@ impl Registry {
             // queue gate closes reserve/handoff -> retirement atomically.
             let existing = services
                 .get(&id)
-                .filter(|service| !service.done.load(Ordering::Acquire))
+                .filter(|service| !service.fully_settled())
                 .cloned();
             if let Some(service) = existing {
                 let result = service.queue.retire_if_idle(|| {
@@ -976,7 +976,9 @@ impl Registry {
                     // A stopping owner may be physically unsettled even with
                     // no turn. Wait for it; never attach a new action to its
                     // already-closing Connection or revive its revision.
-                    if !service.stop.load(Ordering::Acquire) {
+                    if !service.stop.load(Ordering::Acquire)
+                        && !service.done.load(Ordering::Acquire)
+                    {
                         *selected = Some(action);
                         service.account_revision.store(0, Ordering::Release);
                     }
@@ -1010,11 +1012,11 @@ impl Registry {
         }
         let existing = services
             .get(&id)
-            .filter(|value| !value.done.load(Ordering::Acquire))
+            .filter(|value| !value.fully_settled())
             .cloned();
         let mut absent = matches!(slot.custody, Custody::WaitingAbsent);
         let service = if let Some(service) = existing {
-            if service.stop.load(Ordering::Acquire) {
+            if service.stop.load(Ordering::Acquire) || service.done.load(Ordering::Acquire) {
                 return Err(app::Preparation::Pending(
                     app::RemovalStage::NativeSettlement,
                 ));
@@ -1045,7 +1047,7 @@ impl Registry {
                     return Ok(());
                 }
             }
-            services.retain(|_, value| !value.done.load(Ordering::Acquire));
+            services.retain(|_, value| !value.fully_settled());
             if services.len() >= 64 {
                 return Err(app::Preparation::Pending(app::RemovalStage::NativeIdle));
             }
@@ -1401,14 +1403,14 @@ impl Registry {
         }
         let service = if let Some(service) = services
             .get(&attempt.profile())
-            .filter(|service| !service.done.load(Ordering::Acquire))
+            .filter(|service| !service.fully_settled())
         {
-            if service.stop.load(Ordering::Acquire) {
+            if service.stop.load(Ordering::Acquire) || service.done.load(Ordering::Acquire) {
                 return pending;
             }
             service.clone()
         } else {
-            services.retain(|_, service| !service.done.load(Ordering::Acquire));
+            services.retain(|_, service| !service.fully_settled());
             if services.len() >= 64 {
                 return pending;
             }

@@ -16,6 +16,11 @@ const faults: Record<CodexFaultV1, () => string> = {
   unavailable: m.codex_unavailable,
 };
 export const codexFault = (fault: CodexFaultV1) => faults[fault]();
+/** Observed native capability, not a renderer permission or a connection-state guess. */
+export function codexCapability(view: CodexViewV1 | null): string | null {
+  if (view?.state !== "connected") return null;
+  return view.text_only ? m.codex_browser_unavailable() : m.codex_browser_ready();
+}
 export function codexStatus(view: CodexViewV1 | null): string {
   if (!view) return m.codex_loading();
   return {

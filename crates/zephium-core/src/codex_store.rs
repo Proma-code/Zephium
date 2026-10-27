@@ -16,6 +16,28 @@ impl Scope {
     }
 }
 
+/// Immutable original-thread contract, not a runtime/account grant. Legacy
+/// records carry no invented instruction digest and cannot become BrowserV1.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConversationPolicy {
+    TextOnlyLegacy,
+    BrowserV1 {
+        tool_manifest_sha256: [u8; 32],
+        instruction_policy_sha256: [u8; 32],
+    },
+}
+impl ConversationPolicy {
+    pub fn valid(self) -> bool {
+        match self {
+            Self::TextOnlyLegacy => true,
+            Self::BrowserV1 {
+                tool_manifest_sha256,
+                instruction_policy_sha256,
+            } => tool_manifest_sha256 != [0; 32] && instruction_policy_sha256 != [0; 32],
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Terminal {
     Completed,
@@ -48,6 +70,7 @@ pub enum Dispatch {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Association {
     pub scope: Scope,
+    pub policy: ConversationPolicy,
     pub conversation: String,
     /// None only for Skipped before any original thread receipt exists.
     pub thread_id: Option<String>,
@@ -62,21 +85,16 @@ pub enum Call {
     InspectOwner,
     /// Read-only saved-history metadata, including retired grant epochs. This
     /// is not a scope/receipt that permits native resume or dispatch.
-    History {
-        conversation: String,
-    },
+    History { conversation: String },
     /// First use records the independently validated home incarnation. Existing
     /// different incarnations are never adopted or overwritten.
-    Open {
-        incarnation: [u8; 16],
-    },
+    Open { incarnation: [u8; 16] },
     /// Invoke only at the admitted auth-mutating handoff, not a queued intent.
     /// A committed advance retires old mappings without deleting their history.
-    AdvanceGrant {
-        expected: Scope,
-    },
+    AdvanceGrant { expected: Scope },
     Load {
         scope: Scope,
+        policy: ConversationPolicy,
         conversation: String,
     },
     /// Persist the original thread receipt before admitting its first turn.
@@ -84,6 +102,7 @@ pub enum Call {
     /// preserving its visible unsent reply. Existing threads never remap.
     Bind {
         scope: Scope,
+        policy: ConversationPolicy,
         conversation: String,
         thread_id: String,
         expected_revision: Option<u64>,
@@ -93,6 +112,7 @@ pub enum Call {
     /// same reply and no original turn ID; generic transport/cancel is not proof.
     Skip {
         scope: Scope,
+        policy: ConversationPolicy,
         conversation: String,
         expected_revision: Option<u64>,
         reply: u64,
@@ -101,12 +121,14 @@ pub enum Call {
     /// and increasing Page reply prevent a duplicate/replayed write.
     Begin {
         scope: Scope,
+        policy: ConversationPolicy,
         conversation: String,
         expected_revision: u64,
         reply: u64,
     },
     RecordTurn {
         scope: Scope,
+        policy: ConversationPolicy,
         conversation: String,
         expected_revision: u64,
         reply: u64,
@@ -115,6 +137,7 @@ pub enum Call {
     /// The original terminal receipt, not optimistic UI text, permits this CAS.
     Settle {
         scope: Scope,
+        policy: ConversationPolicy,
         conversation: String,
         expected_revision: u64,
         reply: u64,
@@ -132,43 +155,51 @@ impl Call {
             Self::AdvanceGrant { expected } => expected.valid(),
             Self::Load {
                 scope,
+                policy,
                 conversation,
-            } => scope.valid() && valid_conversation(conversation),
+            } => scope.valid() && policy.valid() && valid_conversation(conversation),
             Self::Bind {
                 scope,
+                policy,
                 conversation,
                 thread_id,
                 expected_revision,
             } => {
                 scope.valid()
+                    && policy.valid()
                     && valid_conversation(conversation)
                     && valid_provider_id(thread_id)
                     && expected_revision.is_none_or(number)
             }
             Self::Skip {
                 scope,
+                policy,
                 conversation,
                 expected_revision,
                 reply,
             } => {
                 scope.valid()
+                    && policy.valid()
                     && valid_conversation(conversation)
                     && expected_revision.is_none_or(number)
                     && number(*reply)
             }
             Self::Begin {
                 scope,
+                policy,
                 conversation,
                 expected_revision,
                 reply,
             } => {
                 scope.valid()
+                    && policy.valid()
                     && valid_conversation(conversation)
                     && number(*expected_revision)
                     && number(*reply)
             }
             Self::RecordTurn {
                 scope,
+                policy,
                 conversation,
                 expected_revision,
                 reply,
@@ -176,6 +207,7 @@ impl Call {
             }
             | Self::Settle {
                 scope,
+                policy,
                 conversation,
                 expected_revision,
                 reply,
@@ -183,6 +215,7 @@ impl Call {
                 ..
             } => {
                 scope.valid()
+                    && policy.valid()
                     && valid_conversation(conversation)
                     && number(*expected_revision)
                     && number(*reply)
@@ -206,6 +239,9 @@ pub enum Fault {
     IncarnationMismatch,
     StaleGrant,
     Conflict,
+    /// The saved original thread belongs to a different immutable tool/policy
+    /// contract. Preserve it; do not resume/rebind or invalidate the account.
+    PolicyMismatch,
     Limit,
     Corrupt,
     /// The actor accepted the call but its durable answer was not observed.
@@ -238,12 +274,40 @@ pub fn valid_provider_id(value: &str) -> bool {
 mod tests {
     use super::*;
     #[test]
+    fn policy_binding_is_explicit_and_both_browser_digests_are_required() {
+        assert!(ConversationPolicy::TextOnlyLegacy.valid());
+        assert!(ConversationPolicy::BrowserV1 {
+            tool_manifest_sha256: [1; 32],
+            instruction_policy_sha256: [2; 32]
+        }
+        .valid());
+        for (tools, instructions) in [([0; 32], [2; 32]), ([1; 32], [0; 32]), ([0; 32], [0; 32])] {
+            let policy = ConversationPolicy::BrowserV1 {
+                tool_manifest_sha256: tools,
+                instruction_policy_sha256: instructions,
+            };
+            assert!(!policy.valid());
+            assert!(!Call::Skip {
+                scope: Scope {
+                    incarnation: [1; 16],
+                    grant_epoch: 1
+                },
+                policy,
+                conversation: "page-1".into(),
+                expected_revision: None,
+                reply: 1
+            }
+            .valid());
+        }
+    }
+    #[test]
     fn native_identity_and_counters_are_bounded_without_runtime_version() {
         let scope = Scope {
             incarnation: [1; 16],
             grant_epoch: 1,
         };
         assert!(Call::Bind {
+            policy: ConversationPolicy::TextOnlyLegacy,
             scope,
             conversation: "page-1".into(),
             thread_id: "thread-1".into(),
@@ -262,6 +326,7 @@ mod tests {
         }
         .valid());
         assert!(!Call::Begin {
+            policy: ConversationPolicy::TextOnlyLegacy,
             scope,
             conversation: "page-1".into(),
             expected_revision: 1,
@@ -274,6 +339,7 @@ mod tests {
         assert!(valid_provider_id("01234567-abcd_1234"));
         for revision in [None, Some(1)] {
             assert!(Call::Skip {
+                policy: ConversationPolicy::TextOnlyLegacy,
                 scope,
                 conversation: "page-1".into(),
                 expected_revision: revision,
@@ -288,6 +354,7 @@ mod tests {
             (None, u64::MAX),
         ] {
             assert!(!Call::Skip {
+                policy: ConversationPolicy::TextOnlyLegacy,
                 scope,
                 conversation: "page-1".into(),
                 expected_revision: revision,
@@ -296,6 +363,7 @@ mod tests {
             .valid());
         }
         assert!(!Call::Bind {
+            policy: ConversationPolicy::TextOnlyLegacy,
             scope,
             conversation: "page-1".into(),
             thread_id: "original".into(),

@@ -49,7 +49,7 @@ export function validCodexView(view: unknown): view is CodexViewV1 {
     !bounded(view.profile, 128) ||
     typeof view.state !== "string" ||
     !states.includes(view.state) ||
-    view.text_only !== true ||
+    typeof view.text_only !== "boolean" ||
     typeof view.page_selected !== "boolean" ||
     !Array.isArray(view.models) ||
     view.models.length > 256 ||
