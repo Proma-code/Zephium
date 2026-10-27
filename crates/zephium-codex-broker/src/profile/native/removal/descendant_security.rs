@@ -2,6 +2,7 @@
 //! inherit the owned parent's owner/SYSTEM grants and need not be PROTECTED.
 //! Fixed root, journal and lease still use the exact original verifier.
 use super::*;
+use windows::Win32::Security::{TokenOwner, TOKEN_OWNER};
 
 // Instrumentation exists only in explicit synthetic Windows fixture builds.
 // It neither substitutes a security decision nor exposes a path/SID/ACL string.
@@ -54,14 +55,75 @@ pub(super) fn verify(file: &File, owner: &str, volume: u64) -> Result<bool, Remo
     .map_err(|_| RemovalFault::Scope)?;
     let descriptor = Descriptor(descriptor);
     diagnostic_stage!(7);
-    if sid(actual_owner).map_err(|_| RemovalFault::Scope)? != owner {
-        return Err(RemovalFault::Scope);
-    }
+    validate_owner(actual_owner, owner)?;
     diagnostic_stage!(8);
     let bytes = acl_bytes(descriptor.0).map_err(|_| RemovalFault::Scope)?;
     validate_acl(&bytes, owner)?;
     diagnostic_stage!(255);
     Ok(metadata.is_dir())
+}
+// A normal child object uses the creator token's default owner, which need
+// not be its TokenUser. This is a cleanup-only mapping of the current process
+// token, never an arbitrary group/admin allowlist. The same queried token must
+// first join the profile user. DACL trustees remain only that user and SYSTEM;
+// fixed metadata still uses the original exact-owner verifier. A different
+// historical default owner after a token/elevation change is not inferred.
+fn current_default_owner(owner: &str) -> Result<String, RemovalFault> {
+    let mut raw = HANDLE::default();
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) }
+        .map_err(|_| RemovalFault::Scope)?;
+    let token = unsafe { OwnedHandle::from_raw_handle(raw.0) };
+    let handle = HANDLE(token.as_raw_handle());
+    let mut user_buffer = [0usize; 128];
+    let mut user_length = 0;
+    unsafe {
+        GetTokenInformation(
+            handle,
+            TokenUser,
+            Some(user_buffer.as_mut_ptr().cast()),
+            size_of_val(&user_buffer) as u32,
+            &mut user_length,
+        )
+    }
+    .map_err(|_| RemovalFault::Scope)?;
+    if user_length < size_of::<TOKEN_USER>() as u32
+        || user_length as usize > size_of_val(&user_buffer)
+        || sid(unsafe { (*user_buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid })
+            .map_err(|_| RemovalFault::Scope)?
+            != owner
+    {
+        return Err(RemovalFault::Scope);
+    }
+    let mut owner_buffer = [0usize; 128];
+    let mut owner_length = 0;
+    unsafe {
+        GetTokenInformation(
+            handle,
+            TokenOwner,
+            Some(owner_buffer.as_mut_ptr().cast()),
+            size_of_val(&owner_buffer) as u32,
+            &mut owner_length,
+        )
+    }
+    .map_err(|_| RemovalFault::Scope)?;
+    if owner_length < size_of::<TOKEN_OWNER>() as u32
+        || owner_length as usize > size_of_val(&owner_buffer)
+    {
+        return Err(RemovalFault::Scope);
+    }
+    sid(unsafe { (*owner_buffer.as_ptr().cast::<TOKEN_OWNER>()).Owner })
+        .map_err(|_| RemovalFault::Scope)
+}
+fn validate_owner(actual: PSID, owner: &str) -> Result<(), RemovalFault> {
+    if actual.0.is_null() {
+        return Err(RemovalFault::Scope);
+    }
+    let actual = sid(actual).map_err(|_| RemovalFault::Scope)?;
+    let default_owner = current_default_owner(owner)?;
+    if actual != owner && actual != default_owner {
+        return Err(RemovalFault::Scope);
+    }
+    Ok(())
 }
 fn validate_acl(bytes: &[u8], owner: &str) -> Result<(), RemovalFault> {
     diagnostic_stage!(9);
@@ -134,7 +196,6 @@ fn validate_acl(bytes: &[u8], owner: &str) -> Result<(), RemovalFault> {
 mod diagnostic {
     use super::*;
     use std::cell::Cell;
-    use windows::Win32::Security::{TokenOwner, TOKEN_OWNER};
 
     thread_local! {
         static STAGE: Cell<u8> = const { Cell::new(0) };
@@ -411,6 +472,43 @@ mod tests {
         std::fs::write(&file, b"synthetic").unwrap();
         assert_eq!(verify(&held(&nested), &owner, volume), Ok(true));
         assert_eq!(verify(&held(&file), &owner, volume), Ok(false));
+        // Descriptor-only owner logic controls: no ownership-changing privilege
+        // is enabled and no filesystem owner is rewritten for these negatives.
+        let default_owner = current_default_owner(&owner).unwrap();
+        let foreign = ["S-1-0-0", "S-1-5-7", "S-1-5-32-546"]
+            .into_iter()
+            .find(|candidate| *candidate != owner && *candidate != default_owner)
+            .unwrap();
+        let foreign_descriptor =
+            descriptor(&format!("O:{foreign}D:P(A;;FA;;;{owner})(A;;FA;;;SY)"));
+        let mut foreign_owner = PSID::default();
+        let mut defaulted = BOOL::default();
+        unsafe {
+            windows::Win32::Security::GetSecurityDescriptorOwner(
+                foreign_descriptor.0,
+                &mut foreign_owner,
+                &mut defaulted,
+            )
+        }
+        .unwrap();
+        assert_eq!(
+            validate_acl(&acl_bytes(foreign_descriptor.0).unwrap(), &owner),
+            Ok(())
+        );
+        assert_eq!(
+            validate_owner(foreign_owner, &owner),
+            Err(RemovalFault::Scope)
+        );
+        assert_eq!(current_default_owner(foreign), Err(RemovalFault::Scope));
+        assert_eq!(
+            validate_owner(PSID::default(), &owner),
+            Err(RemovalFault::Scope)
+        );
+        let mut malformed = [0u32; 20];
+        assert_eq!(
+            validate_owner(PSID(malformed.as_mut_ptr().cast()), &owner),
+            Err(RemovalFault::Scope)
+        );
         let broad = new_file(
             &parent.join("broad-nonsecret"),
             &descriptor(&format!(

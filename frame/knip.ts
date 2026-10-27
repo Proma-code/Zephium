@@ -14,7 +14,13 @@ export default {
     "*.config.{js,ts}",
     "bootstrap-report.ts",
   ],
-  ignoreIssues: migrationIssues,
+  ignoreIssues: {
+    ...migrationIssues,
+    // Native-generated DTOs are transitively referenced protocol types; Rust
+    // regeneration checks their complete shape. Keep value/export checks.
+    "src/shared/ipc/chatgpt-bindings.ts": ["types"],
+    "src/shared/ipc/codex-bindings.ts": ["types"],
+  },
   project: ["src/**/*.{ts,svelte,css}", "*.{js,ts}", "scripts/**/*.mjs"],
   ignore: ["src/shared/ipc/bindings.ts"],
   // Compile the template too: extracting only <script> imports misclassifies

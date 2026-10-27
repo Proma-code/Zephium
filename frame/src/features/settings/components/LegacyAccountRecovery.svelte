@@ -67,6 +67,7 @@
   .legacy-recovery {
     margin-block: 8px 24px;
   }
+
   summary {
     padding-block: 6px;
     padding-inline: 16px;
@@ -74,14 +75,17 @@
     font-size: var(--text-label);
     cursor: pointer;
   }
+
   summary:focus-visible {
     outline: 2px solid var(--color-ring);
     outline-offset: 2px;
   }
+
   .content {
     padding-block: 8px;
     padding-inline: 16px;
   }
+
   p {
     margin: 0;
     color: var(--color-muted);
@@ -89,15 +93,18 @@
     line-height: 1.5;
     overflow-wrap: anywhere;
   }
+
   p + p {
     margin-block-start: 8px;
   }
+
   .actions {
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
     margin-block-start: 12px;
   }
+
   .fault {
     margin-block-start: 8px;
     color: var(--color-danger);

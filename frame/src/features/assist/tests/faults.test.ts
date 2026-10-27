@@ -328,7 +328,6 @@ test("native proven not-sent is distinct from uncertain output and never auto-re
   ).toBe(true);
 });
 
-
 test("a retired direct source is actionable without a retry, inferred send or billing fallback", () => {
   const view = faultView({ reason: "chat_gpt", fault: "retired" });
   expect(view.message).toContain("retired");

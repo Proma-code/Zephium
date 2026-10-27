@@ -152,7 +152,10 @@ function chatGptFault(fault: ChatGptModelFault): FaultView {
     message: classification.message(),
     retry: classification.retry,
     fix:
-      knownIssue === "retired" || knownIssue === "signed_out" || knownIssue === "not_eligible" || knownIssue === "unsupported"
+      knownIssue === "retired" ||
+      knownIssue === "signed_out" ||
+      knownIssue === "not_eligible" ||
+      knownIssue === "unsupported"
         ? models(m.assist_fix_open_models())
         : null,
     diagnostic: {
