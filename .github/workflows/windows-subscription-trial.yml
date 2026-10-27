@@ -257,3 +257,41 @@ jobs:
           path: target/windows-trial-regressions/
           if-no-files-found: warn
           retention-days: 14
+
+  windows_desktop_source:
+    name: Independent Windows Desktop compile and lint
+    if: github.repository == 'Proma-code/Zephium'
+    runs-on: windows-2025
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: windows-subscription-trial
+          cache-on-failure: true
+      - run: pnpm install --frozen-lockfile
+      # Trial configuration intentionally has no devUrl. Compile against real
+      # bundled frame assets, independently of the delivery job's UI test order.
+      - name: Build real frame prerequisites and verify emitted styles
+        run: |
+          pnpm --dir frame run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm --dir frame run check:styles
+      - name: Compile and lint the Windows trial including test targets
+        run: |
+          $env:TAURI_CONFIG = Get-Content desktop/tauri.windows-subscription-trial.conf.json -Raw
+          # The config packages this file; the release build regenerates notices.
+          python scripts/release/third_party_notices.py target/THIRD_PARTY_NOTICES.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy -p zephium-desktop --all-targets --locked --features windows-subscription-trial -- -D warnings
