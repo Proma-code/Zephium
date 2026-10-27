@@ -3,6 +3,7 @@ import { loadCodexSession, type CodexSession } from "$domain/codex";
 import type { CodexSelectionV1, CodexViewV1 } from "$shared/ipc/codex-bindings";
 import { codexView } from "$shared/testing/codex";
 import { CodexEffortIntent } from "../lib/codex-effort.svelte";
+import { CodexPickerObservation } from "../lib/codex-picker";
 
 const native = vi.hoisted(() => ({ read: vi.fn(), select: vi.fn() }));
 vi.mock("$shared/ipc/codex-bindings", () => ({
@@ -120,7 +121,7 @@ test("catalog replacement fences later effort even when first commit succeeded",
   expect(confirmed).not.toHaveBeenCalled();
 });
 
-test("close drops unsent intent but does not cancel or hide admitted native commit", async () => {
+test("disposing the interaction drops unsent intent without canceling the admitted native commit", async () => {
   intent.request(choice("medium"));
   await flush();
   intent.request(choice("high"));
@@ -171,4 +172,64 @@ test("disconnect while a write is outstanding cannot carry its queue into a new 
   expect(native.select).toHaveBeenCalledTimes(1);
   expect(intent.desired).toBeNull();
   expect(confirmed).not.toHaveBeenCalled();
+});
+
+test("ordinary pane close detaches UI callbacks but commits the latest desired effort", async () => {
+  const closedPane = vi.fn();
+  const detach = intent.attach(closedPane);
+  intent.request(choice("medium"));
+  await flush();
+  intent.request(choice("high"));
+  detach();
+  finish(view(choice("medium")));
+  await flush();
+  expect(native.select).toHaveBeenCalledTimes(2);
+  expect(native.select).toHaveBeenLastCalledWith(
+    "profile",
+    choice("high"),
+    "test-catalog-generation",
+  );
+  finish(view(choice("high")));
+  await flush();
+  expect(owner.view?.selection).toEqual(choice("high"));
+  expect(intent.desired).toBeNull();
+  expect(closedPane).not.toHaveBeenCalled();
+  expect(confirmed).not.toHaveBeenCalled();
+});
+
+test("a reopened pane shares the sending lane without reviving its detached predecessor", async () => {
+  const closedPane = vi.fn();
+  const reopenedPane = vi.fn();
+  const detach = intent.attach(closedPane);
+  intent.request(choice("medium"));
+  await flush();
+  intent.request(choice("high"));
+  detach();
+  intent.attach(reopenedPane);
+  // A late cleanup from an older pane must not detach its replacement.
+  detach();
+  finish(view(choice("medium")));
+  await flush();
+  expect(native.select).toHaveBeenCalledTimes(2);
+  finish(view(choice("high")));
+  await flush();
+  expect(closedPane).not.toHaveBeenCalled();
+  expect(reopenedPane).toHaveBeenCalledTimes(1);
+});
+
+test("whole picker disposal aborts its observer and discards its queued effort", async () => {
+  const scope = new CodexPickerObservation("profile");
+  const session = (await scope.acquire())!;
+  await session.start();
+  const queue = scope.effort!;
+  queue.request(choice("medium"));
+  await flush();
+  queue.request(choice("high"));
+  scope.dispose();
+  finish(view(choice("medium")));
+  await flush();
+  expect(native.select).toHaveBeenCalledTimes(1);
+  expect(session.view).toBeNull();
+  expect(scope.effort).toBeNull();
+  expect(queue.desired).toBeNull();
 });

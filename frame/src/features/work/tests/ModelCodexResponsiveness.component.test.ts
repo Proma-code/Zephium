@@ -164,20 +164,41 @@ test("reopening retains rows immediately, reconciles passively and never multipl
   expect(native.stop).toHaveBeenCalledTimes(1);
 });
 
-test("closing cancels only queued effort, and remount shows actual admitted completion", async () => {
+test("ordinary close preserves latest effort without calling the detached pane", async () => {
   const first = await render(ModelCodex, props());
   await openEffort();
   await userEvent.keyboard("{ArrowRight}{ArrowRight}");
   expect(native.select).toHaveBeenCalledTimes(1);
   await first.unmount();
   finish(catalog(choice("medium")));
-  native.read.mockResolvedValue(catalog(choice("medium")));
+  await expect.poll(() => native.select.mock.calls.length).toBe(2);
+  expect(native.select).toHaveBeenLastCalledWith(
+    "profile",
+    choice("high"),
+    "test-catalog-generation",
+  );
+  finish(catalog(choice("high")));
+  native.read.mockResolvedValue(catalog(choice("high")));
   await render(ModelCodex, props());
   await expect
-    .element(page.getByRole("button", { name: "Effort: Medium", exact: true }))
+    .element(page.getByRole("button", { name: "Effort: High", exact: true }))
     .toBeVisible();
-  expect(native.select).toHaveBeenCalledTimes(1);
+  expect(native.select).toHaveBeenCalledTimes(2);
   expect(onchosen).not.toHaveBeenCalled();
+});
+
+test("explicit pointer cancellation drops unsent effort rather than acting like ordinary close", async () => {
+  await render(ModelCodex, props());
+  const slider = await openEffort();
+  await userEvent.keyboard("{ArrowRight}{ArrowRight}");
+  expect(native.select).toHaveBeenCalledTimes(1);
+  slider
+    .element()
+    .dispatchEvent(new PointerEvent("pointercancel", { bubbles: true, pointerId: 4 }));
+  finish(catalog(choice("medium")));
+  await expect.element(slider).toHaveAttribute("aria-valuetext", "Medium");
+  expect(native.select).toHaveBeenCalledTimes(1);
+  expect(page.getByText("Applying effort…", { exact: true }).query()).toBeNull();
 });
 
 test("profile replacement cannot display old rows or adopt its late read", async () => {
@@ -232,6 +253,10 @@ test("real captured drag, keyboard repeats and close/reopen preserve first-and-l
   );
   expect(screen.container.querySelector(".pill-label")?.textContent).toBe("Low");
   await expect.element(page.getByText("Applying effort…", { exact: true })).toBeVisible();
+  // Ordinary closing before the first acknowledgement preserves the final drag
+  // intent, just like the existing API-key effort control.
+  await page.getByRole("button", { name: "Close picker", exact: true }).click();
+  expect(slider.query()).toBeNull();
   finish(catalog(choice("medium")));
   await expect.poll(() => native.select.mock.calls.length).toBe(2);
   expect(native.select).toHaveBeenLastCalledWith(
@@ -240,10 +265,17 @@ test("real captured drag, keyboard repeats and close/reopen preserve first-and-l
     "test-catalog-generation",
   );
   finish(catalog(choice("high")));
-  await expect.poll(() => screen.container.querySelector(".pill-label")?.textContent).toBe("High");
+  native.read.mockResolvedValue(catalog(choice("high")));
+  await page.getByRole("button", { name: "Open picker", exact: true }).click();
+  await page.getByRole("button", { name: "Effort: High", exact: true }).click();
+  slider = page.getByRole("slider", { name: "Effort", exact: true });
+  await expect.element(slider).toHaveAttribute("aria-valuetext", "High");
+  expect(native.select).toHaveBeenCalledTimes(2);
+  expect(native.listen).toHaveBeenCalledTimes(1);
+  expect(native.read).toHaveBeenCalledTimes(2);
 
-  // Real keyboard input starts another unresolved write and changes the desired
-  // detent again. Closing cancels only the second, still-unsent intent.
+  // Collapsing only the effort face is also presentation-only: it must not
+  // discard the last keyboard detent while an earlier commit is pending.
   await userEvent.keyboard("{ArrowLeft}{ArrowLeft}");
   await expect.element(slider).toHaveAttribute("aria-valuetext", "Low");
   expect(native.select).toHaveBeenCalledTimes(3);
@@ -253,16 +285,20 @@ test("real captured drag, keyboard repeats and close/reopen preserve first-and-l
     "test-catalog-generation",
   );
   expect(screen.container.querySelector(".pill-label")?.textContent).toBe("High");
-  await page.getByRole("button", { name: "Close picker", exact: true }).click();
-  expect(slider.query()).toBeNull();
+  await page.getByRole("button", { name: "Collapse effort", exact: true }).click();
+  await expect
+    .element(page.getByRole("button", { name: "Effort: High", exact: true }))
+    .toBeVisible();
   finish(catalog(choice("medium")));
-  native.read.mockResolvedValue(catalog(choice("medium")));
-  await page.getByRole("button", { name: "Open picker", exact: true }).click();
-  await page.getByRole("button", { name: "Effort: Medium", exact: true }).click();
-  slider = page.getByRole("slider", { name: "Effort", exact: true });
-  await expect.element(slider).toHaveAttribute("aria-valuetext", "Medium");
-  expect(native.select).toHaveBeenCalledTimes(3);
-  expect(native.listen).toHaveBeenCalledTimes(1);
-  expect(native.read).toHaveBeenCalledTimes(2);
+  await expect.poll(() => native.select.mock.calls.length).toBe(4);
+  expect(native.select).toHaveBeenLastCalledWith(
+    "profile",
+    choice("low"),
+    "test-catalog-generation",
+  );
+  finish(catalog(choice("low")));
+  await expect
+    .element(page.getByRole("button", { name: "Effort: Low", exact: true }))
+    .toBeVisible();
   expect(page.getByText("Applying effort…", { exact: true }).query()).toBeNull();
 });

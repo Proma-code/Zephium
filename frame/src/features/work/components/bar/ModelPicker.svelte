@@ -407,6 +407,7 @@
   async function choose(entry: WorkModelEntry) {
     if (locked(models, entry.id)) return upgrade();
     if (session?.busy) return;
+    codexObservation?.cancelEffort();
     if ((entry.id !== chosen || nativeSelected) && !(await session?.choose(role, entry.id))) return;
     close();
   }
@@ -465,6 +466,7 @@
   }
 
   async function pick(view: View | null) {
+    if (view !== "open_ai" && view !== "favourites") codexObservation?.cancelEffort();
     picked = view;
     query = "";
     searchOpen = false;
@@ -828,6 +830,7 @@
               type="button"
               aria-pressed={source === "api"}
               onclick={() => {
+                codexObservation?.cancelEffort();
                 sourcePick = "api";
                 active = null;
               }}>{m.model_source_api()}</button

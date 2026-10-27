@@ -10,8 +10,16 @@ export class CodexEffortIntent {
 
   constructor(
     private readonly owner: CodexSession,
-    private readonly confirmed: () => void,
+    private confirmed?: () => void,
   ) {}
+
+  /** Only the currently mounted pane may react to a confirmed preference. */
+  attach(confirmed: () => void) {
+    this.confirmed = confirmed;
+    return () => {
+      if (this.confirmed === confirmed) this.confirmed = undefined;
+    };
+  }
 
   request(selection: CodexSelectionV1) {
     const view = this.owner.view;
@@ -47,7 +55,7 @@ export class CodexEffortIntent {
       }
       if (this.desired === selected) {
         this.desired = null;
-        this.confirmed();
+        this.confirmed?.();
       }
     }
     this.sending = false;
@@ -60,6 +68,7 @@ export class CodexEffortIntent {
   cancel() {
     // This drops only unsent intent; an admitted native commit is not canceled.
     this.live = false;
+    this.confirmed = undefined;
     this.desired = null;
   }
 }

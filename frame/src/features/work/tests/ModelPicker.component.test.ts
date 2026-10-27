@@ -1234,3 +1234,94 @@ test("native Codex search and source-prefixed favourites never become Work choic
   expect(native.choose).not.toHaveBeenCalledWith(PROFILE, "page", "codex/native%2Fsol");
   await screen.unmount();
 });
+
+test.each(["ordinary close", "API source change"] as const)(
+  "%s preserves or cancels queued Codex effort according to explicit intent",
+  async (action) => {
+    native.read.mockResolvedValue(view("openai/gpt-6-sol"));
+    const catalog = codexView(PROFILE, {
+      state: "connected",
+      page_selected: true,
+      selection: { model: "original", effort: { kind: "explicit", effort: "low" } },
+      models: [
+        {
+          id: "original",
+          name: "Original Native Name",
+          efforts: ["low", "medium", "high"],
+          default_effort: "low",
+        },
+      ],
+    });
+    codex.read.mockResolvedValue(catalog);
+    let finish!: (value: typeof catalog) => void;
+    codex.select.mockImplementation(
+      () =>
+        new Promise<typeof catalog>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const screen = await render(ModelPicker, {
+      profile: PROFILE,
+      role: "page",
+      nativeModel: {
+        id: "original",
+        name: "Original Native Name",
+        source: "codex",
+        capabilities: "text_only",
+        hosted: false,
+        effort: "low",
+      },
+    });
+    const trigger = screen.getByRole("button", { name: /Original Native Name · Codex/u });
+    await trigger.click();
+    await page.getByRole("button", { name: "Effort: Low", exact: true }).click();
+    const slider = page.getByRole("slider", { name: "Effort", exact: true });
+    await expect.element(slider).toHaveFocus();
+    await userEvent.keyboard("{ArrowRight}{ArrowRight}");
+    await expect.element(slider).toHaveAttribute("aria-valuetext", "High");
+    expect(codex.select).toHaveBeenCalledTimes(1);
+    if (action === "ordinary close") {
+      await trigger.click();
+      await expect.element(slider).not.toBeInTheDocument();
+    } else {
+      await page.getByRole("button", { name: "API key", exact: true }).click();
+      await expect
+        .element(page.getByRole("button", { name: "API key", exact: true }))
+        .toHaveAttribute("aria-pressed", "true");
+    }
+    const medium = {
+      ...catalog,
+      selection: { model: "original", effort: { kind: "explicit", effort: "medium" } },
+    } as const;
+    finish(medium);
+    const finalEffort = action === "ordinary close" ? "high" : "medium";
+    const committed = {
+      ...catalog,
+      selection: { model: "original", effort: { kind: "explicit", effort: finalEffort } },
+    } as const;
+    if (action === "ordinary close") {
+      await expect.poll(() => codex.select.mock.calls.length).toBe(2);
+      finish(committed);
+    }
+    codex.read.mockResolvedValue(committed);
+    if (action === "ordinary close") await trigger.click();
+    else await page.getByRole("button", { name: "Codex", exact: true }).click();
+    await expect
+      .element(
+        page.getByRole("button", {
+          name: action === "ordinary close" ? "Effort: High" : "Effort: Medium",
+          exact: true,
+        }),
+      )
+      .toBeVisible();
+    await expect.poll(() => codex.read.mock.calls.length).toBe(2);
+    expect(codex.select.mock.calls).toEqual(
+      (action === "ordinary close" ? ["medium", "high"] : ["medium"]).map((effort) => [
+        PROFILE,
+        { model: "original", effort: { kind: "explicit", effort } },
+        "test-catalog-generation",
+      ]),
+    );
+    expect(native.choose).not.toHaveBeenCalled();
+  },
+);

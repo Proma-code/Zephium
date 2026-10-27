@@ -11,7 +11,7 @@
     codexFavouriteKey,
     filterCodexCatalog,
   } from "$domain/codex";
-  import { CodexEffortIntent } from "../../lib/codex-effort.svelte";
+  import type { CodexEffortIntent } from "../../lib/codex-effort.svelte";
   import type { CodexPickerObservation } from "../../lib/codex-picker";
   import type { CodexEffortSelectionV1, CodexModelV1 } from "$shared/ipc/codex-bindings";
   import { favourites, toggleFavourite } from "$domain/ai";
@@ -43,19 +43,14 @@
   let session = $state.raw<CodexSession | null>(null);
   let effortIntent = $state.raw<CodexEffortIntent | null>(null);
   $effect(() => {
-    const owner = session;
-    if (!owner) return;
-    const intent = new CodexEffortIntent(owner, () => {
+    const intent = effortIntent;
+    if (!intent) return;
+    return intent.attach(() => {
       const wasPending = pending !== null;
       pending = null;
       rest(1600);
       if (wasPending) onchosen();
     });
-    effortIntent = intent;
-    return () => {
-      intent.cancel();
-      if (effortIntent === intent) effortIntent = null;
-    };
   });
   let loadFailed = $state(false);
   $effect(() => {
@@ -67,6 +62,7 @@
       .then(async (owner) => {
         if (disposed || !owner) return;
         session = owner;
+        effortIntent = source.effort;
         const started = await owner.start();
         if (!disposed && !started) owner.reconcile();
       })
@@ -76,6 +72,7 @@
     return () => {
       disposed = true;
       session = null;
+      effortIntent = null;
     };
   });
   const view = $derived(session?.view ?? null);
@@ -124,7 +121,6 @@
     clearTimeout(fold);
     if (!expanded) return false;
     expanded = false;
-    effortIntent?.cancelPending();
     void tick().then(() => pill?.focus({ preventScroll: true }));
     return true;
   }
@@ -139,13 +135,13 @@
   }
   function toggle() {
     expanded = !expanded;
-    if (!expanded) effortIntent?.cancelPending();
     rest();
   }
   onDestroy(() => clearTimeout(fold));
   async function choose(row: CodexModelV1) {
     const owner = session;
     if (!owner || owner.busy) return;
+    if (row.id !== choice?.model) effortIntent?.cancelPending();
     const selection = codexModelSelection(row, choice);
     if (!selection) {
       pending = row.id;

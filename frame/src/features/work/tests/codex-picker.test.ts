@@ -22,6 +22,10 @@ test("repeated pane acquisition shares only its picker/profile owner", async () 
   const first = new CodexPickerObservation("first");
   const [a, b] = await Promise.all([first.acquire(), first.acquire()]);
   expect(a).toBe(b);
+  const intent = first.effort;
+  expect(intent).not.toBeNull();
+  await first.acquire();
+  expect(first.effort).toBe(intent);
   expect(a?.profile).toBe("first");
   expect(mock.create).toHaveBeenCalledTimes(1);
   const second = new CodexPickerObservation("second");
