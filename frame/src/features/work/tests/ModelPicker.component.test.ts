@@ -1237,7 +1237,11 @@ test("Codex uses the existing effort pill and slider with only original advertis
     effort: { kind: "explicit", effort: "minimal" },
   });
   await expect.element(slider).toHaveAttribute("aria-valuetext", "Minimal");
-  expect(page.getByRole("combobox").query()).toBeNull();
+  // Search remains a legitimate combobox; the effort surface must not add a
+  // second selection form beside its existing slider.
+  const effortCard = page.getByRole("region", { name: "Original Native Name", exact: true });
+  await expect.element(effortCard).toBeVisible();
+  expect(effortCard.getByRole("combobox").query()).toBeNull();
   expect(codex.connect).not.toHaveBeenCalled();
   await userEvent.keyboard("{Escape}");
   await expect

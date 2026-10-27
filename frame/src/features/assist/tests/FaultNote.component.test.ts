@@ -179,7 +179,12 @@ test("closing while copying cleans up observation without touching the next faul
       .toBeEnabled();
     await expect.element(next.getByRole("status")).not.toBeInTheDocument();
     await expect
-      .element(next.getByText("This direct ChatGPT connection is retired.", { exact: false }))
+      .element(
+        next.getByText(
+          "This legacy ChatGPT account needs attention. Open advanced account recovery in AI settings, or explicitly choose Codex for a new conversation.",
+          { exact: true },
+        ),
+      )
       .toBeVisible();
   } finally {
     vi.useRealTimers();

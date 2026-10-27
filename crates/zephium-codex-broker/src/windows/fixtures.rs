@@ -356,6 +356,12 @@ fn descendant_pid(bytes: &[u8]) -> Option<u32> {
 
 /// Finite dispatcher for this program's synthetic helper child, never a shell.
 pub(crate) fn child(mode: &str) -> Result<(), &'static str> {
+    // The same closed enum emits and parses ALL removal child selectors. Keep
+    // no second literal inventory here that can omit a newly qualified case.
+    #[cfg(feature = "native-fixtures")]
+    if let Some(scenario) = crate::connection::removal_fixtures::Scenario::parse(mode) {
+        return crate::connection::fixture_peer::removal_child(scenario);
+    }
     match mode {
         #[cfg(feature = "native-fixtures")]
         mode @ ("browser-two-turns"
@@ -419,18 +425,6 @@ pub(crate) fn child(mode: &str) -> Result<(), &'static str> {
                 crate::connection::fixture_peer::Scenario::parse(mode).ok_or("helper-mode")?;
             crate::connection::fixture_peer::child(scenario)?;
         }
-        #[cfg(feature = "native-fixtures")]
-        mode @ ("removal-pending-quota"
-        | "removal-signed-out"
-        | "removal-no-notification"
-        | "removal-invalidated-read"
-        | "removal-late-invalidation"
-        | "removal-nonzero"
-        | "removal-cancel-finish") => {
-            let scenario = crate::connection::removal_fixtures::Scenario::parse(mode)
-                .ok_or("removal-helper-mode")?;
-            crate::connection::fixture_peer::removal_child(scenario)?;
-        }
         _ => return Err("helper-mode"),
     }
     Ok(())
@@ -485,6 +479,37 @@ pub(crate) fn browser_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "native-fixtures")]
+    #[test]
+    fn every_fixed_removal_selector_uses_the_same_closed_dispatch_parser() {
+        use crate::connection::removal_fixtures::Scenario;
+        for scenario in [
+            Scenario::PendingCatalog,
+            Scenario::PendingQuota,
+            Scenario::SignedOut,
+            Scenario::MissingNotification,
+            Scenario::InvalidatedRead,
+            Scenario::LateInvalidation,
+            Scenario::NonzeroExit,
+            Scenario::CancelDuringFinish,
+        ] {
+            let args = Mode::Removal(scenario).args();
+            assert_eq!(args.len(), 2);
+            assert_eq!(args[0], "transport-child");
+            assert_eq!(Scenario::parse(args[1]).unwrap().args(), scenario.args());
+        }
+        for unknown in [
+            "",
+            "removal-unknown",
+            "removal-pending-catalog-extra",
+            "removal-pending-catalog\n",
+            "Removal-pending-catalog",
+            "removal-*",
+        ] {
+            assert!(Scenario::parse(unknown).is_none());
+            assert_eq!(child(unknown), Err("helper-mode"));
+        }
+    }
     #[test]
     fn descendant_receipt_is_one_fixed_bounded_nonzero_pid() {
         assert_eq!(descendant_pid(br#"{"descendant":1}"#), Some(1));
