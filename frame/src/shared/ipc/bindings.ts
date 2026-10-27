@@ -1175,22 +1175,22 @@ export type ChatGptFailureIssue = "retired" | "invalid_request" | "signed_out" |
 export type ChatGptFailureStage = "request" | "credential" | "send" | "http" | "stream" | "complete";
 
 /**  Closed direct ChatGPT errors. No provider-authored text or account data. */
-export type ChatGptModelFault = 
+export type ChatGptModelFault =
 /**
  *  The removed direct subscription source remains stored only for recovery.
  *  No model request was admitted and no other source may stand in for it.
  */
-"retired" | 
+"retired" |
 /**  The selected local grant is missing, expired, or was refused. */
-"signed_out" | 
+"signed_out" |
 /**  A ChatGPT plan-sharing limit was reached; its scope/reset are unknown. */
-"usage_limit" | 
+"usage_limit" |
 /**  Account or usage admission is temporarily unavailable. */
-"unavailable" | 
+"unavailable" |
 /**  The account, workspace, region or grant policy does not permit this call. */
-"not_eligible" | 
+"not_eligible" |
 /**  This route does not support the requested capability or body. */
-"unsupported" | 
+"unsupported" |
 /**  Bounded native evidence, not a provider message or request identifier. */
 { diagnostic: {
 	stage: ChatGptFailureStage,
@@ -1893,20 +1893,6 @@ export type OperationReason = "mutation_applied" | "state_unchanged" | "invalid_
 export type OperationStatus = { state: "unknown" } | { state: "pending" } | { state: "processed"; disposition: OperationDisposition };
 
 /**  Admission only: the reply arrives as events. */
-export type PageAssistModelSourceV1 = "model" | "codex";
-
-export type PageAssistCapabilitiesV1 = "page" | "text_only";
-
-export type PageAssistNativeFaultV1 = "unavailable" | "unsupported_input" | "scope_changed" | "protocol" | "limit" | "outcome_unknown" | 
-/**  Provider completion is known; local browser activity was interrupted. */
-"local_interruption" | 
-/**  Original terminal received, but the local history settlement was not confirmed. */
-"history_uncertain" | 
-/**  Visible Page history differs from this original-client conversation. */
-"history_diverged" | 
-/**  Native non-dispatch proof and exact durable skipped-attempt acknowledgement. */
-"not_sent" | "upstream" | "timeout" | "cancelled";
-
 export type PageAssistAskResponseV1 = {
 	reply: number | null,
 	fault: PageAssistFaultV1 | null,
@@ -1935,26 +1921,26 @@ export type PageAssistAttachmentV1 =
 { kind: "selection"; tab: string; excerpt: string; host: string };
 
 /**
- *  Whether the page in front can be read now. Anything but `ready` means the
- *  page is not attached; the conversation itself still works.
+ *  Whether local page context is available. `dormant` retains local draft context
+ *  but requires fresh original-runtime admission before any model dispatch.
  */
-export type PageAssistAvailabilityV1 = "ready" | 
+export type PageAssistAvailabilityV1 = "ready" |
 /**  Local draft context is available; the original client must be freshly admitted on send. */
-"dormant" | 
+"dormant" |
 /**  AI is switched off in Settings. */
-"ai_off" | 
+"ai_off" |
 /**  Private windows never send pages to a model. */
-"private" | 
+"private" |
 /**  Not a web page: internal pages, new tab, files, extension pages, PDFs. */
-"not_web" | 
+"not_web" |
 /**  Banks, payments, health and government sites are never read. */
-"sensitive" | 
+"sensitive" |
 /**  No model is set up: no Zephium account and no key. */
-"no_model" | 
+"no_model" |
 /**  The page is still loading; ask again when it settles. */
-"loading" | 
+"loading" |
 /**  This platform cannot read pages yet. */
-"unsupported" | 
+"unsupported" |
 /**  The tab is gone or the service is not running. */
 "unavailable";
 
@@ -1988,6 +1974,9 @@ export type PageAssistBringV1 = {
 	/**  A tab item, for its icon. */
 	tab: string | null,
 };
+
+/**  Capability freshly observed from the selected backend, not a renderer grant. */
+export type PageAssistCapabilitiesV1 = "page" | "text_only";
 
 /**  One change to an assistant conversation. */
 export type PageAssistChanged = PageAssistChangedV1;
@@ -2054,55 +2043,55 @@ export type PageAssistDecisionV1 = "approve" | "decline";
  *  One change to a conversation, in `seq` order. On `invalidated`, read
  *  `page_assist_status` again.
  */
-export type PageAssistEventV1 = 
+export type PageAssistEventV1 =
 /**
  *  A message joined the conversation: the person's, then the reply's
  *  starting snapshot.
  */
-{ type: "message"; message: PageAssistMessageV1 } | { type: "phase"; phase: PageAssistPhaseV1 | null } | 
+{ type: "message"; message: PageAssistMessageV1 } | { type: "phase"; phase: PageAssistPhaseV1 | null } |
 /**  Appends to the text block at `block`, creating it when it is next. */
-{ type: "text"; block: number; delta: string } | 
+{ type: "text"; block: number; delta: string } |
 /**  Replaces native conversation text, including a corrected or empty final. */
-{ type: "text_snapshot"; block: number; text: string } | 
+{ type: "text_snapshot"; block: number; text: string } |
 /**  The text block's cites so far. */
-{ type: "cites"; block: number; cites: PageAssistCiteV1[] } | 
+{ type: "cites"; block: number; cites: PageAssistCiteV1[] } |
 /**  Sets the block at `block`: replaces it, or appends it when it is next. */
-{ type: "block"; block: number; value: PageAssistBlockV1 } | { type: "state"; state: PageAssistReplyStateV1 } | 
+{ type: "block"; block: number; value: PageAssistBlockV1 } | { type: "state"; state: PageAssistReplyStateV1 } |
 /**
  *  The reply finished. `cost` may still be confirming; a later `cost`
  *  event replaces it.
  */
-{ type: "done"; cost: PageAssistCostV1 | null } | { type: "cost"; cost: PageAssistCostV1 } | { type: "failed"; fault: PageAssistFaultV1 } | { type: "cancelled" } | 
+{ type: "done"; cost: PageAssistCostV1 | null } | { type: "cost"; cost: PageAssistCostV1 } | { type: "failed"; fault: PageAssistFaultV1 } | { type: "cancelled" } |
 /**  Replies up to and including `reply` no longer jump to their pages. */
-{ type: "inert" } | 
+{ type: "inert" } |
 /**  The conversation was titled from its first message. */
-{ type: "titled"; title: string } | 
+{ type: "titled"; title: string } |
 /**  The conversation changed shape (new, opened, deleted, AI off). */
 { type: "invalidated" };
 
 /**  Why a message could not start or finish. Closed; never provider or page text. */
-export type PageAssistFaultV1 = { reason: "ai_off" } | { reason: "private" } | { reason: "not_web" } | { reason: "sensitive" } | { reason: "no_model" } | { reason: "loading" } | { reason: "unsupported" } | 
+export type PageAssistFaultV1 = { reason: "ai_off" } | { reason: "private" } | { reason: "not_web" } | { reason: "sensitive" } | { reason: "no_model" } | { reason: "loading" } | { reason: "unsupported" } |
 /**  The conversation is still answering. */
-{ reason: "busy" } | 
+{ reason: "busy" } |
 /**  The message is empty, too long, or names something that is gone. */
-{ reason: "invalid" } | 
+{ reason: "invalid" } |
 /**  Nothing is selected on the page. */
-{ reason: "no_selection" } | 
+{ reason: "no_selection" } |
 /**  The page could not be read. */
-{ reason: "unreadable" } | 
+{ reason: "unreadable" } |
 /**  The page navigated or closed while the reply needed it. */
-{ reason: "page_changed" } | 
+{ reason: "page_changed" } |
 /**  The model answered with nothing usable. */
-{ reason: "no_answer" } | 
+{ reason: "no_answer" } |
 /**  A page step did not take effect as expected. */
-{ reason: "step_failed" } | 
+{ reason: "step_failed" } |
 /**  The reply reached its limit of steps or time. */
-{ reason: "too_long" } | 
+{ reason: "too_long" } |
 /**
  *  The model call failed. `retry_after_ms` is set for `rate_limited`
  *  (and hosted limits) when the provider or server said when to retry.
  */
-{ reason: "model"; fault: WorkModelFaultV1; retry_after_ms: number | null } | 
+{ reason: "model"; fault: WorkModelFaultV1; retry_after_ms: number | null } |
 /**  The selected ChatGPT connection failed; only closed native diagnostics cross. */
 { reason: "chat_gpt"; fault: ChatGptModelFault } | { reason: "native_conversation"; fault: PageAssistNativeFaultV1 } | { reason: "unavailable" };
 
@@ -2151,6 +2140,9 @@ export type PageAssistMessageV1 = { kind: "person"; id: number; text: string; su
 /**  The pages it read changed since; its cites no longer jump. */
 inert: boolean };
 
+/**  Provider protocol identity, separate from its original model name. */
+export type PageAssistModelSourceV1 = "model" | "codex";
+
 /**  The model the conversation uses, as the composer names it. */
 export type PageAssistModelV1 = {
 	/**  Catalog id, for the model picker. */
@@ -2169,6 +2161,17 @@ export type PageAssistModelV1 = {
 	/**  The effort it runs at, such as "high"; null when it has none. */
 	effort: string | null,
 };
+
+/**  Closed original-client faults; never upstream messages or request content. */
+export type PageAssistNativeFaultV1 = "unavailable" | "unsupported_input" | "scope_changed" | "protocol" | "limit" | "outcome_unknown" |
+/**  Provider completion is known; local browser activity was interrupted. */
+"local_interruption" |
+/**  Original terminal received, but the local history settlement was not confirmed. */
+"history_uncertain" |
+/**  Visible Page history differs from this original-client conversation. */
+"history_diverged" |
+/**  Native non-dispatch proof and exact durable skipped-attempt acknowledgement. */
+"not_sent" | "upstream" | "timeout" | "cancelled";
 
 export type PageAssistOpenStateV1 = "queued" | "opening" | "opened" | "failed";
 
