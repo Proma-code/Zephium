@@ -1247,7 +1247,7 @@ test("Codex uses the existing effort pill and slider with only original advertis
   await expect
     .element(page.getByRole("button", { name: "Effort: Minimal", exact: true }))
     .toHaveFocus();
-  expect(slider.query()).toBeNull();
+  await expect.element(slider).not.toBeInTheDocument();
 }, 20_000);
 
 test("a held Codex effort pointer is not dismissed while focus moves within the picker", async () => {
