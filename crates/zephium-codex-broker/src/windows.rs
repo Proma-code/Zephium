@@ -56,22 +56,22 @@ pub(crate) use write_receipt::{
 };
 use write_receipt::{OwnedFrame, SessionStamp, TurnBinding, TurnTicket, WriteOutcome};
 
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, feature = "native-fixtures"))]
 pub(crate) mod fixtures;
 
-// Fixture admission remains a separate, debug-only type. Production image
+// Fixture admission remains a separate, debug-only, feature-gated type. Production image
 // constructors and digests cannot be substituted by test executable paths.
 enum Image {
     Original(Arc<PinnedImage>),
     SchemaExport(Arc<PinnedImage>),
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, feature = "native-fixtures"))]
     Fixture(Arc<fixtures::FixtureImage>, fixtures::Mode),
 }
 impl Image {
     fn path(&self) -> &Path {
         match self {
             Self::Original(image) | Self::SchemaExport(image) => image.path(),
-            #[cfg(debug_assertions)]
+            #[cfg(all(debug_assertions, feature = "native-fixtures"))]
             Self::Fixture(image, _) => image.path(),
         }
     }
@@ -85,7 +85,7 @@ impl Image {
                 "--out",
                 "schema-output",
             ],
-            #[cfg(debug_assertions)]
+            #[cfg(all(debug_assertions, feature = "native-fixtures"))]
             Self::Fixture(_, mode) => mode.args(),
         }
     }
@@ -278,7 +278,7 @@ pub(crate) enum QuotaWrite {
 struct WriteRequest {
     frame: OwnedFrame,
     completed: mpsc::SyncSender<WriteOutcome>,
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, feature = "native-fixtures"))]
     started: Arc<AtomicBool>,
 }
 
@@ -300,7 +300,7 @@ pub(crate) struct Session {
     stderr_bytes: u64,
     settled: bool,
     runtime_admitted: bool,
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, feature = "native-fixtures"))]
     observed_pending_write: bool,
 }
 
@@ -331,7 +331,7 @@ impl Session {
         match &self._image {
             Image::Original(image) => Arc::ptr_eq(image, expected),
             Image::SchemaExport(_) => false,
-            #[cfg(debug_assertions)]
+            #[cfg(all(debug_assertions, feature = "native-fixtures"))]
             Image::Fixture(..) => false,
         }
     }
@@ -432,7 +432,7 @@ impl Session {
             stderr_bytes: 0,
             settled: false,
             runtime_admitted: false,
-            #[cfg(debug_assertions)]
+            #[cfg(all(debug_assertions, feature = "native-fixtures"))]
             observed_pending_write: false,
         };
         session
@@ -498,7 +498,7 @@ impl Session {
                 .spawn(move || {
                     let mut stdin = File::from(stdin_write);
                     while let Ok(request) = receiver.recv() {
-                        #[cfg(debug_assertions)]
+                        #[cfg(all(debug_assertions, feature = "native-fixtures"))]
                         request.started.store(true, Ordering::Release);
                         let outcome = request.frame.write(&mut stdin);
                         let entered_failure = matches!(outcome, WriteOutcome::EnteredFailure);
@@ -684,9 +684,9 @@ impl Session {
             return Err(self.unsent_failure(fault, sequence, binding.as_ref(), receipt));
         }
         let (completed, result) = mpsc::sync_channel(1);
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, feature = "native-fixtures"))]
         let started = Arc::new(AtomicBool::new(false));
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, feature = "native-fixtures"))]
         {
             self.observed_pending_write = false;
         }
@@ -702,7 +702,7 @@ impl Session {
         if let Err(rejected) = stdin.try_send(WriteRequest {
             frame,
             completed,
-            #[cfg(debug_assertions)]
+            #[cfg(all(debug_assertions, feature = "native-fixtures"))]
             started: started.clone(),
         }) {
             // try_send returns ownership of the entire never-enqueued frame.
@@ -752,7 +752,7 @@ impl Session {
                 }
                 Err(mpsc::TryRecvError::Empty) =>
                 {
-                    #[cfg(debug_assertions)]
+                    #[cfg(all(debug_assertions, feature = "native-fixtures"))]
                     if started.load(Ordering::Acquire) {
                         self.observed_pending_write = true;
                     }

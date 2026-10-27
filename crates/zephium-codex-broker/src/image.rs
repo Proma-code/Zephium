@@ -15,6 +15,7 @@ use std::{
 };
 
 const REPARSE: u32 = 0x400;
+#[cfg(all(debug_assertions, feature = "native-fixtures"))]
 const DIRECTORY: u32 = 0x10;
 const OPEN_NOFOLLOW: u32 = 0x0020_0000;
 const OPEN_DIRECTORY: u32 = 0x0200_0000;
@@ -30,10 +31,12 @@ pub(crate) struct PinnedImage {
 }
 enum Provenance {
     Reference(crate::pin::ReviewedCli),
+    #[cfg(all(debug_assertions, feature = "native-fixtures"))]
     StandaloneReference,
     Official(crate::release_admission::OriginalCliArtifact),
 }
 impl PinnedImage {
+    #[cfg(all(debug_assertions, feature = "native-fixtures"))]
     pub(crate) fn open(path: &Path, kind: crate::pin::ImageKind) -> Result<Self, &'static str> {
         require_absolute_local(path)?;
         let mut ancestors = Vec::new();
@@ -100,9 +103,9 @@ impl PinnedImage {
             Provenance::Reference(crate::pin::ReviewedCli::V163) => {
                 crate::compatibility::ConfigProjection::V163
             }
-            Provenance::Reference(_) | Provenance::StandaloneReference => {
-                crate::compatibility::ConfigProjection::V164Plus
-            }
+            Provenance::Reference(_) => crate::compatibility::ConfigProjection::V164Plus,
+            #[cfg(all(debug_assertions, feature = "native-fixtures"))]
+            Provenance::StandaloneReference => crate::compatibility::ConfigProjection::V164Plus,
             Provenance::Official(artifact) => {
                 crate::compatibility::ConfigProjection::for_artifact(artifact)
             }
@@ -111,6 +114,7 @@ impl PinnedImage {
     pub(crate) fn version(&self) -> &str {
         match &self.provenance {
             Provenance::Reference(pin) => pin.version(),
+            #[cfg(all(debug_assertions, feature = "native-fixtures"))]
             Provenance::StandaloneReference => crate::RELEASE,
             Provenance::Official(artifact) => artifact.version(),
         }

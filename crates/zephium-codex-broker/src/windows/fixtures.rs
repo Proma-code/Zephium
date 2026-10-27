@@ -370,23 +370,13 @@ pub(crate) fn child(mode: &str) -> Result<(), &'static str> {
     if let Some(scenario) = crate::connection::removal_fixtures::Scenario::parse(mode) {
         return crate::connection::fixture_peer::removal_child(scenario);
     }
+    // Dormant helper admission uses the same finite parser as its fixed argv.
+    // A second literal inventory can silently omit a declared scenario.
+    #[cfg(feature = "native-fixtures")]
+    if let Some(scenario) = crate::connection::dormant::fixtures::Scenario::parse(mode) {
+        return crate::connection::fixture_peer::dormant_child(scenario);
+    }
     match mode {
-        #[cfg(feature = "native-fixtures")]
-        mode @ ("dormant-first"
-        | "dormant-resume"
-        | "dormant-idle"
-        | "dormant-nonzero"
-        | "dormant-late-frame"
-        | "dormant-blocked"
-        | "dormant-pending-quota"
-        | "dormant-quota-no-reply"
-        | "dormant-quota-duplicate"
-        | "dormant-quota-foreign"
-        | "dormant-quota-account") => {
-            let scenario = crate::connection::dormant::fixtures::Scenario::parse(mode)
-                .ok_or("dormant-helper-mode")?;
-            crate::connection::fixture_peer::dormant_child(scenario)?;
-        }
         #[cfg(feature = "native-fixtures")]
         mode @ ("browser-two-turns"
         | "browser-cold-resume"
@@ -550,6 +540,41 @@ mod tests {
             "removal-pending-catalog\n",
             "Removal-pending-catalog",
             "removal-*",
+        ] {
+            assert!(Scenario::parse(unknown).is_none());
+            assert_eq!(child(unknown), Err("helper-mode"));
+        }
+    }
+    #[cfg(feature = "native-fixtures")]
+    #[test]
+    fn every_fixed_dormant_selector_uses_the_same_closed_dispatch_parser() {
+        use crate::connection::dormant::fixtures::Scenario;
+        for scenario in [
+            Scenario::First,
+            Scenario::Resume,
+            Scenario::Idle,
+            Scenario::WakeReadInvalid,
+            Scenario::Nonzero,
+            Scenario::LateFrame,
+            Scenario::Blocked,
+            Scenario::PendingQuota,
+            Scenario::QuotaNoReply,
+            Scenario::QuotaDuplicate,
+            Scenario::QuotaForeign,
+            Scenario::QuotaAccount,
+        ] {
+            let args = Mode::Dormant(scenario).args();
+            assert_eq!(args.len(), 2);
+            assert_eq!(args[0], "transport-child");
+            assert_eq!(Scenario::parse(args[1]).unwrap().args(), scenario.args());
+        }
+        for unknown in [
+            "",
+            "dormant-unknown",
+            "dormant-wake-read-invalid-extra",
+            "dormant-wake-read-invalid\n",
+            "Dormant-wake-read-invalid",
+            "dormant-*",
         ] {
             assert!(Scenario::parse(unknown).is_none());
             assert_eq!(child(unknown), Err("helper-mode"));

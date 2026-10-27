@@ -34,6 +34,7 @@ pub(crate) fn reply(bytes: &[u8], expected: u64) -> Result<Value, Fault> {
     }
     Ok(reply.result)
 }
+#[cfg(any(test, all(debug_assertions, feature = "native-fixtures")))]
 pub(crate) fn initialize() -> Vec<u8> {
     encoded(json!({"id":1,"method":"initialize","params":{
         "clientInfo":{"name":"zephium_subscription_trial_qualification","title":"Zephium Subscription Trial Qualification","version":"0.1.0"},
@@ -43,6 +44,7 @@ pub(crate) fn initialize() -> Vec<u8> {
 pub(crate) fn initialized() -> Vec<u8> {
     encoded(json!({"method":"initialized"}))
 }
+#[cfg(any(test, all(debug_assertions, feature = "native-fixtures")))]
 pub(crate) fn account() -> Vec<u8> {
     encoded(json!({"id":2,"method":"account/read","params":{"refreshToken":false}}))
 }

@@ -7,11 +7,14 @@
 //! In particular, disabling skill instructions is not a global host-skill
 //! discovery switch. Later turn admission needs its own reviewed boundary.
 
+#[cfg(any(test, all(debug_assertions, feature = "native-fixtures")))]
 use serde_json::Value;
+#[cfg(any(test, all(debug_assertions, feature = "native-fixtures")))]
 use sha2::{Digest, Sha256};
 
 /// Standalone app-server arguments; no shell, listener socket or config override.
 /// app-server/src/main.rs:42–65 supports these exact spellings.
+#[cfg(any(test, all(debug_assertions, feature = "native-fixtures")))]
 pub const APP_SERVER_ARGS: &[&str] = &["--strict-config", "--listen", "stdio://"];
 
 /// Owned-home configuration. Keyring failure must remain failure: no file fallback.
@@ -108,6 +111,7 @@ pub const CONFIG_REQUIRED_STRING_PAIRS: &[(&str, &str)] = &[
 ];
 
 /// Closed diagnostics only; never echo config values, paths or server text.
+#[cfg(any(test, all(debug_assertions, feature = "native-fixtures")))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigReadbackError {
     /// The RPC result has no ordinary `config` object.
@@ -125,6 +129,7 @@ pub enum ConfigReadbackError {
 /// Validate only the result body of `config/read`, not a whole JSON-RPC envelope.
 /// The protocol owner separately validates the reply ID/error and config layers,
 /// managed requirements, owned paths and future empty environment selections.
+#[cfg(any(test, all(debug_assertions, feature = "native-fixtures")))]
 pub fn validate_config_readback(result: &Value) -> Result<(), ConfigReadbackError> {
     let config = result
         .get("config")
@@ -164,6 +169,7 @@ pub fn validate_config_readback(result: &Value) -> Result<(), ConfigReadbackErro
 
 // ConfigToml serializes these optional overrides as null when absent. Map-valued
 // provider definitions default to empty; no built-in endpoint is injected here.
+#[cfg(any(test, all(debug_assertions, feature = "native-fixtures")))]
 fn validate_fixture_services(config: &Value) -> Result<(), ConfigReadbackError> {
     // The exact pinned config/defaults.toml supplies this value; its packaged
     // layer/origin is intentionally omitted by the upstream config/read API.
@@ -216,6 +222,7 @@ fn validate_fixture_services(config: &Value) -> Result<(), ConfigReadbackError> 
     Ok(())
 }
 
+#[cfg(any(test, all(debug_assertions, feature = "native-fixtures")))]
 fn fixed_layer_config() -> Value {
     let mut config = serde_json::json!({"notify": [], "mcp_servers": {}});
     for path in CONFIG_REQUIRED_FALSE_PATHS {
@@ -235,6 +242,7 @@ fn fixed_layer_config() -> Value {
     config
 }
 
+#[cfg(any(test, all(debug_assertions, feature = "native-fixtures")))]
 fn insert_fixed(config: &mut Value, path: &[&str], value: Value) {
     if let Some((key, rest)) = path.split_first() {
         if rest.is_empty() {
@@ -246,6 +254,7 @@ fn insert_fixed(config: &mut Value, path: &[&str], value: Value) {
 }
 
 // Matches pinned config/src/fingerprint.rs:54–65, not raw file-byte hashing.
+#[cfg(any(test, all(debug_assertions, feature = "native-fixtures")))]
 fn layer_version(config: &Value) -> String {
     let mut sorted = config.clone();
     sorted.sort_all_objects();
@@ -261,6 +270,7 @@ fn layer_version(config: &Value) -> String {
 /// `expected_user_config` comes from the held native fixture layout, never IPC.
 /// Pinned config_manager_service.rs filters packagedDefaults out of both lists.
 /// Only one exact User layer and an optional empty System layer are admitted.
+#[cfg(any(test, all(debug_assertions, feature = "native-fixtures")))]
 pub fn validate_fixture_layers(
     result: &Value,
     expected_user_config: &str,
@@ -330,6 +340,7 @@ pub fn validate_fixture_layers(
 
 // Pinned protocol/v2/config.rs:413–459. These are explicit nulls in the
 // effective owned-login-only projection, not omitted fields or defaults.
+#[cfg(any(test, all(debug_assertions, feature = "native-fixtures")))]
 const OWNED_LOGIN_NULL_REQUIREMENTS: &[&str] = &[
     "modelProvider",
     "modelProviders",
@@ -370,6 +381,7 @@ const OWNED_LOGIN_NULL_REQUIREMENTS: &[&str] = &[
 /// requirements when the owned forced-login setting restricts methods to ChatGPT.
 /// Call only alongside the owned config/layer checks. This response has no
 /// origins and is not independent proof of every restriction's provenance.
+#[cfg(any(test, all(debug_assertions, feature = "native-fixtures")))]
 pub fn validate_fixture_requirements(result: &Value) -> Result<(), ConfigReadbackError> {
     let fail = ConfigReadbackError::Requirements;
     let object = result.as_object().ok_or(fail)?;

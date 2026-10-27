@@ -3,9 +3,11 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ImageKind {
     Cli,
+    #[cfg(any(test, all(debug_assertions, feature = "native-fixtures")))]
     Standalone,
 }
 impl ImageKind {
+    #[cfg(any(test, all(debug_assertions, feature = "native-fixtures")))]
     pub(crate) fn bytes(self) -> u64 {
         match self {
             Self::Cli => 354_558_768,
@@ -15,12 +17,14 @@ impl ImageKind {
     pub(crate) fn sha256(self) -> &'static str {
         match self {
             Self::Cli => "6f267830b029ee25d9339864aa867cd45de9f8fd4c5ea007d2e63c13a0c66d36",
+            #[cfg(any(test, all(debug_assertions, feature = "native-fixtures")))]
             Self::Standalone => crate::IMAGE_SHA256,
         }
     }
     pub(crate) fn args(self) -> &'static [&'static str] {
         match self {
             Self::Cli => &["app-server", "--strict-config", "--listen", "stdio://"],
+            #[cfg(any(test, all(debug_assertions, feature = "native-fixtures")))]
             Self::Standalone => crate::config::APP_SERVER_ARGS,
         }
     }
