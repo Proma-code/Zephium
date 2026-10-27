@@ -180,7 +180,10 @@ mod tests {
         });
         service.done.store(true, Ordering::Release);
         dormant::publish_returned(&service, false);
-        let store = zephium_store::SqliteStore::open(root.path().join("selection-store")).unwrap();
+        // Store pins an existing application-data directory; it does not create it.
+        let store_dir = root.path().join("selection-store");
+        std::fs::create_dir(&store_dir).unwrap();
+        let store = zephium_store::SqliteStore::open(&store_dir).unwrap();
         store.save_session(SessionState {
             profiles: vec![PersistedProfile {
                 id: service.profile,
